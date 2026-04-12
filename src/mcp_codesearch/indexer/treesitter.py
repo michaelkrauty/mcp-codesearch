@@ -281,67 +281,65 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
     tree = parser.parse(source)
 
     definition_types = set(DEFINITION_TYPES.get(language, []))
-    chunks = []
+    chunks: list[Chunk] = []
 
-    def extract_chunks(node: Any, context_parts: list[str] | None = None) -> None:
-        """Recursively extract definition chunks with hierarchical context."""
-        context_parts = context_parts or []
+    # Iterative DFS over the AST. A recursive walker blows Python's default
+    # recursion limit (1000) on files with deeply nested expressions —
+    # heavily-parenthesized math, long method chains, large template trees, etc.
+    # Children are pushed in reverse so they pop in source order.
+    stack: list[tuple[Any, list[str]]] = [(tree.root_node, [])]
+    while stack:
+        node, context_parts = stack.pop()
 
-        if node.type in definition_types:
-            # Get the text for this node
-            text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
-            name = _get_node_name(node, source)
+        if node.type not in definition_types:
+            for child in reversed(node.children):
+                stack.append((child, context_parts))
+            continue
 
-            # Handle decorated definitions (Python)
-            if node.type == "decorated_definition":
-                for child in node.children:
-                    if child.type in definition_types:
-                        name = _get_node_name(child, source)
-                        break
+        text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+        name = _get_node_name(node, source)
 
-            # Build context path for this chunk
-            chunk_type = _node_to_chunk_type(node.type)
-            full_context = _build_context_path(context_parts)
-
-            # For class/struct/impl nodes, check if we should use overview
-            is_container = "class" in node.type or "struct" in node.type or "impl" in node.type
-            lines = node.end_point[0] - node.start_point[0] + 1
-
-            if is_container and lines > settings.class_split_threshold:
-                # Large class: generate overview instead of full content
-                overview_content = _generate_class_overview(node, source, name, language)
-                chunk = Chunk(
-                    content=overview_content,
-                    chunk_type="class_overview",
-                    name=name,
-                    start_line=node.start_point[0] + 1,
-                    end_line=node.end_point[0] + 1,
-                    context=full_context,
-                )
-            else:
-                # Small class or non-class: use full content
-                chunk = Chunk(
-                    content=text,
-                    chunk_type=chunk_type,
-                    name=name,
-                    start_line=node.start_point[0] + 1,  # 1-indexed
-                    end_line=node.end_point[0] + 1,
-                    context=full_context,
-                )
-            chunks.append(chunk)
-
-            # For class/struct/impl nodes, recurse with accumulated context
-            if is_container:
-                type_prefix = "class" if "class" in node.type else chunk_type
-                new_context = context_parts + [f"{type_prefix}:{name}"] if name else context_parts
-                for child in node.children:
-                    extract_chunks(child, new_context)
-        else:
-            # Recurse into children
+        # Handle decorated definitions (Python)
+        if node.type == "decorated_definition":
             for child in node.children:
-                extract_chunks(child, context_parts)
+                if child.type in definition_types:
+                    name = _get_node_name(child, source)
+                    break
 
-    extract_chunks(tree.root_node)
+        chunk_type = _node_to_chunk_type(node.type)
+        full_context = _build_context_path(context_parts)
+
+        is_container = "class" in node.type or "struct" in node.type or "impl" in node.type
+        lines = node.end_point[0] - node.start_point[0] + 1
+
+        if is_container and lines > settings.class_split_threshold:
+            overview_content = _generate_class_overview(node, source, name, language)
+            chunks.append(Chunk(
+                content=overview_content,
+                chunk_type="class_overview",
+                name=name,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                context=full_context,
+            ))
+        else:
+            chunks.append(Chunk(
+                content=text,
+                chunk_type=chunk_type,
+                name=name,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                context=full_context,
+            ))
+
+        if is_container:
+            type_prefix = "class" if "class" in node.type else chunk_type
+            new_context = (
+                context_parts + [f"{type_prefix}:{name}"] if name else context_parts
+            )
+            for child in reversed(node.children):
+                stack.append((child, new_context))
+
     return chunks
 
 
