@@ -551,7 +551,7 @@ requires-dist = [
     { name = "qdrant-client", specifier = "~=1.16.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "tree-sitter-language-pack", specifier = ">=0.13.0" },
-    { name = "vector-core", git = "https://github.com/michaelkrauty/vector-core?tag=v1.0.0" },
+    { name = "vector-core", git = "https://github.com/michaelkrauty/vector-core?tag=v1.0.1" },
 ]
 provides-extras = ["dev"]
 
@@ -1246,8 +1246,8 @@ wheels = [
 
 [[package]]
 name = "vector-core"
-version = "1.0.0"
-source = { git = "https://github.com/michaelkrauty/vector-core?tag=v1.0.0#b857cf05b26ed03099afc339a2be79e35bcfb83c" }
+version = "1.0.1"
+source = { git = "https://github.com/michaelkrauty/vector-core?tag=v1.0.1#c837bb451f7392c0bec743c293b48d15c5b252d3" }
 dependencies = [
     { name = "httpx" },
     { name = "pathspec" },
