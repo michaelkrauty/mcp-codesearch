@@ -237,6 +237,36 @@ func helper() int {
         names = [c.name for c in chunks if c.name]
         assert "main" in names or "helper" in names
 
+    def test_deeply_nested_does_not_recurse(self):
+        """Files with deeply nested ASTs must not blow Python's recursion limit.
+
+        Regression: the AST walker used to recurse per node, so a file with
+        AST depth > sys.getrecursionlimit() (default 1000) raised RecursionError
+        and aborted the entire indexing run. A few thousand parentheses produce
+        such a tree, as do large generated sources, long method chains, and
+        deeply nested templates.
+        """
+        # ~3000 parens → AST depth well past the default 1000 limit.
+        depth = 3000
+        code = "x = " + "(" * depth + "1" + ")" * depth + "\n"
+        chunks = chunk_with_treesitter(code, "python")
+        assert isinstance(chunks, list)
+
+    def test_chunks_preserve_source_order(self):
+        """Iterative walker must yield chunks in source order (top-to-bottom)."""
+        code = '''def first():
+    pass
+
+def second():
+    pass
+
+def third():
+    pass
+'''
+        chunks = chunk_with_treesitter(code, "python")
+        names = [c.name for c in chunks if c.name in {"first", "second", "third"}]
+        assert names == ["first", "second", "third"]
+
 
 class TestExtractDocstring:
     """Tests for _extract_docstring."""
