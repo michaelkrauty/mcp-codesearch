@@ -38,9 +38,11 @@ from mcp_codesearch.singletons import (
     get_search_service,
     get_storage,
 )
+from mcp_codesearch.tools._errors import tool_error_handler
 
 
 @mcp.tool()
+@tool_error_handler
 async def code_search(  # noqa: PLR0911
     query: str,
     path: str = ".",
@@ -140,6 +142,7 @@ Consider using Grep/Glob for exact text searches until the service is restored."
 
 
 @mcp.tool()
+@tool_error_handler
 async def search_multiple(
     query: str,
     paths: list[str],
@@ -236,6 +239,7 @@ async def search_multiple(
 
 
 @mcp.tool()
+@tool_error_handler
 async def search_changed(  # noqa: PLR0911
     query: str,
     path: str = ".",

@@ -27,11 +27,13 @@ from mcp_codesearch.singletons import (
     get_storage,
 )
 from mcp_codesearch.storage.qdrant import collection_name
+from mcp_codesearch.tools._errors import tool_error_handler
 
 logger = logging.getLogger(__name__)
 
 
 @mcp.tool()
+@tool_error_handler
 async def find_similar(
     code: str,
     path: str = ".",
@@ -118,6 +120,7 @@ async def find_similar(
 
 
 @mcp.tool()
+@tool_error_handler
 async def find_references(
     symbol: str,
     path: str = ".",
