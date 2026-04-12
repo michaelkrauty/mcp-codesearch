@@ -326,18 +326,21 @@ class QdrantStorage:
         try:
             async with asyncio.timeout(settings.upsert_batch_timeout):
                 await asyncio.gather(*tasks)
-        except TimeoutError:
+        except TimeoutError as e:
             # Cancel all pending tasks to prevent resource leak
             for task in tasks:
                 if not task.done():
                     task.cancel()
             # Wait for cancellations to complete (suppress CancelledError)
             await asyncio.gather(*tasks, return_exceptions=True)
-            logger.error(
+            msg = (
                 f"Batch upsert timed out after {settings.upsert_batch_timeout}s "
                 f"({len(batches)} batches, {len(points)} points)"
             )
-            raise
+            logger.error(msg)
+            # Raise with a message so the MCP tool layer doesn't surface an
+            # empty-string TimeoutError to the client.
+            raise TimeoutError(msg) from e
 
     async def delete_by_path(self, collection: str, path: str) -> None:
         """Delete all points for a file path."""

@@ -20,9 +20,11 @@ from vector_core import (
 from mcp_codesearch.app import mcp
 from mcp_codesearch.indexer.discovery import EXTENSION_TO_LANGUAGE, scan_file_metadata
 from mcp_codesearch.singletons import get_indexing_service, get_search_service
+from mcp_codesearch.tools._errors import tool_error_handler
 
 
 @mcp.tool()
+@tool_error_handler
 async def index_status(path: str = ".") -> str:
     """
     Check indexing status for a codebase.
@@ -64,6 +66,7 @@ async def index_status(path: str = ".") -> str:
 
 
 @mcp.tool()
+@tool_error_handler
 async def force_reindex(path: str = ".") -> str:
     """
     Force complete re-indexing of a codebase.
@@ -107,6 +110,7 @@ Cannot re-index without the embedding service. Ensure your OpenAI-compatible emb
 
 
 @mcp.tool()
+@tool_error_handler
 async def preview_index(
     path: str = ".",
     show_files: bool = False,

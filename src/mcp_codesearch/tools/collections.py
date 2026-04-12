@@ -12,18 +12,20 @@ import re
 from pathlib import Path
 
 from mcp_codesearch.app import mcp
-
-# Strict regex for collection ID validation (prevents injection attacks)
-_COLLECTION_ID_PATTERN = re.compile(r"^codesearch_[a-f0-9]{12}$")
 from mcp_codesearch.helpers import to_abs_path
 from mcp_codesearch.singletons import (
     get_indexing_service,
     get_search_service,
     get_storage,
 )
+from mcp_codesearch.tools._errors import tool_error_handler
+
+# Strict regex for collection ID validation (prevents injection attacks)
+_COLLECTION_ID_PATTERN = re.compile(r"^codesearch_[a-f0-9]{12}$")
 
 
 @mcp.tool()
+@tool_error_handler
 async def list_collections() -> str:
     """
     List all indexed codebases.
@@ -71,6 +73,7 @@ async def list_collections() -> str:
 
 
 @mcp.tool()
+@tool_error_handler
 async def delete_collection(path: str = "", collection_id: str = "") -> str:
     """
     Delete index for a codebase.
@@ -117,6 +120,7 @@ async def delete_collection(path: str = "", collection_id: str = "") -> str:
 
 
 @mcp.tool()
+@tool_error_handler
 async def cleanup_orphans() -> str:
     """
     Find and delete orphaned collections (where codebase path is unknown/deleted).
