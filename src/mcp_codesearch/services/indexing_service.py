@@ -411,11 +411,19 @@ class IndexingService:
         tokens_per_doc: list[set[str]] = []
 
         for f in files:
-            chunks = chunk_file(f.content, f.language)
-            summary = generate_file_summary(f.content, chunks, f.language)
-
-            # Pre-compute chunk embedding texts (avoids recomputation in _process_batch)
-            chunk_texts = [self._chunk_embedding_text(chunk) for chunk in chunks]
+            try:
+                chunks = chunk_file(f.content, f.language)
+                summary = generate_file_summary(f.content, chunks, f.language)
+                # Pre-compute chunk embedding texts (avoids recomputation in _process_batch)
+                chunk_texts = [self._chunk_embedding_text(chunk) for chunk in chunks]
+            except Exception as e:
+                # Chunking operates on arbitrary untrusted source; one pathological
+                # file (malformed encoding, parser crash, etc.) must not abort the
+                # whole indexing run. Log and skip.
+                logger.warning(
+                    f"Failed to chunk {f.rel_path}: {type(e).__name__}: {e}"
+                )
+                continue
 
             prepared_files.append(PreparedFile(
                 file_info=f,
