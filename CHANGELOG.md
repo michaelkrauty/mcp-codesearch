@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.2] - 2026-05-25
+
+### Changed
+
+- Bumped `vector-core` dependency to the reachable `v1.0.4` tag, aligning with corrected Vector Core release metadata.
+
+## [1.0.1] - 2026-05-23
+
+### Changed
+
+- Tagged the first reproducible consumer release after pinning `vector-core` to `v1.0.3`.
+
 ## [1.0.0] - 2026-03-20
 
 Initial public release.
