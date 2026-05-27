@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3] - 2026-05-27
+
+### Fixed
+
+- Aligned the runtime package `__version__` constant, project metadata, lockfile package entry, and version regression test.
+- Bumped the `vector-core` dependency to `v1.0.5`, where `vector_core.__version__` matches package metadata.
+
 ## [1.0.2] - 2026-05-25
 
 ### Changed
