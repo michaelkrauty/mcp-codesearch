@@ -1,9 +1,11 @@
 """Tests for file discovery in mcp-codesearch."""
 
+import sys
 from pathlib import Path
 
 from vector_core.utils.hashing import hash_content
 
+import mcp_codesearch.indexer.discovery as discovery_module
 from mcp_codesearch.indexer.discovery import (
     EXTENSION_TO_LANGUAGE,
     FileInfo,
@@ -413,8 +415,6 @@ class TestDiscoverFilesEdgeCases:
 
     def test_read_error_skip(self, tmp_path, monkeypatch):
         """Files that raise Exception on read are skipped (lines 180-181)."""
-        import sys
-
         (tmp_path / "good.py").write_text("good content")
         (tmp_path / "bad.py").write_text("bad content")
 
@@ -430,8 +430,6 @@ class TestDiscoverFilesEdgeCases:
             monkeypatch.setattr(Path, "read_text", mock_read_text)
         else:
             # Unix uses os.fdopen - mock _safe_read_file directly
-            import mcp_codesearch.indexer.discovery as discovery_module
-
             original_safe_read = discovery_module._safe_read_file
 
             def mock_safe_read(file_path):
@@ -525,3 +523,210 @@ class TestScanFileMetadataEdgeCases:
         rel_paths = [r[0] for r in results]
         assert "good.py" in rel_paths
         assert "bad.py" not in rel_paths
+
+
+class TestNestedGitignore:
+    """Tests for nested .gitignore support (rules accumulate down the tree)."""
+
+    def test_subdir_gitignore_excludes_its_files(self, tmp_path):
+        """A .gitignore in a subdirectory excludes matching files there."""
+        (tmp_path / "keep.py").write_text("keep")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("*.generated.py\n")
+        (sub / "real.py").write_text("real")
+        (sub / "thing.generated.py").write_text("generated")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "keep.py" in rels
+        assert "sub/real.py" in rels
+        assert "sub/thing.generated.py" not in rels
+
+    def test_subdir_gitignore_scoped_to_its_subtree(self, tmp_path):
+        """A subdir .gitignore must not affect siblings with the same filename."""
+        a = tmp_path / "a"
+        a.mkdir()
+        b = tmp_path / "b"
+        b.mkdir()
+        (a / ".gitignore").write_text("secret.py\n")
+        (a / "secret.py").write_text("x")
+        (b / "secret.py").write_text("y")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "a/secret.py" not in rels
+        assert "b/secret.py" in rels
+
+    def test_nested_gitignore_prunes_directory(self, tmp_path):
+        """A directory-only pattern in a nested .gitignore prunes that directory."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("generated/\n")
+        gen = sub / "generated"
+        gen.mkdir()
+        (gen / "out.py").write_text("x")
+        (sub / "keep.py").write_text("y")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "sub/keep.py" in rels
+        assert not any("generated" in r for r in rels)
+
+    def test_gitignore_files_not_indexed(self, tmp_path):
+        """The ignore files themselves are never indexed."""
+        (tmp_path / ".gitignore").write_text("*.log\n")
+        (tmp_path / ".codesearchignore").write_text("*.bak\n")
+        (tmp_path / "main.py").write_text("x")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert rels == {"main.py"}
+
+
+class TestCodesearchignore:
+    """Tests for .codesearchignore (index-only excludes, gitignore syntax)."""
+
+    def test_root_codesearchignore_respected(self, tmp_path):
+        """Root .codesearchignore excludes matching files from indexing."""
+        (tmp_path / ".codesearchignore").write_text("vendored.py\n*.gen.py\n")
+        (tmp_path / "vendored.py").write_text("x")
+        (tmp_path / "a.gen.py").write_text("y")
+        (tmp_path / "main.py").write_text("z")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert rels == {"main.py"}
+
+    def test_nested_codesearchignore_respected(self, tmp_path):
+        """.codesearchignore is honored at every directory level, like .gitignore."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".codesearchignore").write_text("*.big.py\n")
+        (sub / "data.big.py").write_text("x")
+        (sub / "code.py").write_text("y")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "sub/data.big.py" not in rels
+        assert "sub/code.py" in rels
+
+    def test_codesearchignore_does_not_require_gitignore(self, tmp_path):
+        """.codesearchignore works on its own (no .gitignore present)."""
+        (tmp_path / ".codesearchignore").write_text("skip_me.py\n")
+        (tmp_path / "skip_me.py").write_text("x")
+        (tmp_path / "keep_me.py").write_text("y")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "skip_me.py" not in rels
+        assert "keep_me.py" in rels
+
+
+class TestGitInfoExclude:
+    """Tests for repo-local .git/info/exclude support."""
+
+    def test_git_info_exclude_respected(self, tmp_path):
+        """Patterns in .git/info/exclude are honored (repo-local, not committed)."""
+        info = tmp_path / ".git" / "info"
+        info.mkdir(parents=True)
+        (info / "exclude").write_text("info_ignored.py\n")
+        (tmp_path / "info_ignored.py").write_text("x")
+        (tmp_path / "kept.py").write_text("y")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "info_ignored.py" not in rels
+        assert "kept.py" in rels
+
+
+class TestIgnorePrecedence:
+    """Tests for ignore precedence: negation and deeper-overrides-shallower."""
+
+    def test_negation_reincludes_within_one_file(self, tmp_path):
+        """A '!' pattern re-includes a file excluded by an earlier pattern."""
+        (tmp_path / ".gitignore").write_text("gen_*.py\n!gen_keep.py\n")
+        (tmp_path / "gen_a.py").write_text("x")
+        (tmp_path / "gen_keep.py").write_text("y")
+        (tmp_path / "main.py").write_text("z")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "gen_a.py" not in rels
+        assert "gen_keep.py" in rels
+        assert "main.py" in rels
+
+    def test_deeper_negation_overrides_parent_ignore(self, tmp_path):
+        """A child .gitignore '!' re-includes a file ignored by a parent pattern."""
+        (tmp_path / ".gitignore").write_text("*.tmp.py\n")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("!important.tmp.py\n")
+        (sub / "important.tmp.py").write_text("keep")
+        (sub / "other.tmp.py").write_text("drop")
+        (tmp_path / "root.tmp.py").write_text("drop")
+
+        rels = {f.rel_path for f in discover_files(tmp_path)}
+
+        assert "root.tmp.py" not in rels  # parent rule applies at root
+        assert "sub/other.tmp.py" not in rels  # parent rule still applies in subtree
+        assert "sub/important.tmp.py" in rels  # child negation wins
+
+    def test_exclude_patterns_stay_file_level(self, tmp_path):
+        """exclude_patterns match at file level only (backwards compatible).
+
+        Unlike .gitignore, the programmatic exclude_patterns must not prune
+        directories, so a later "!dir/keep.py" can still re-include a child of
+        an otherwise-excluded directory.
+        """
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "keep.py").write_text("keep")
+        (sub / "drop.py").write_text("drop")
+
+        rels = {
+            f.rel_path
+            for f in discover_files(tmp_path, exclude_patterns=["sub/", "!sub/keep.py"])
+        }
+
+        assert "sub/keep.py" in rels
+        assert "sub/drop.py" not in rels
+
+
+class TestDiscoverScanConsistency:
+    """discover_files and scan_file_metadata must agree on indexable files."""
+
+    def test_scan_respects_nested_and_codesearchignore(self, tmp_path):
+        """scan_file_metadata honors the same nested/.codesearchignore rules."""
+        (tmp_path / ".codesearchignore").write_text("ignored.py\n")
+        (tmp_path / "ignored.py").write_text("x")
+        (tmp_path / "main.py").write_text("y")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("*.gen.py\n")
+        (sub / "real.py").write_text("r")
+        (sub / "x.gen.py").write_text("g")
+
+        rels = {r[0] for r in scan_file_metadata(tmp_path)}
+
+        assert "main.py" in rels
+        assert "sub/real.py" in rels
+        assert "ignored.py" not in rels
+        assert "sub/x.gen.py" not in rels
+
+    def test_discover_and_scan_return_same_paths(self, tmp_path):
+        """The full-index walk and the fast metadata scan select identical files."""
+        (tmp_path / ".gitignore").write_text("*.log\n")
+        (tmp_path / "main.py").write_text("m")
+        (tmp_path / "skip.log").write_text("l")
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / ".codesearchignore").write_text("vendor_*.py\n")
+        (pkg / "vendor_lib.py").write_text("v")
+        (pkg / "app.py").write_text("a")
+
+        discovered = {f.rel_path for f in discover_files(tmp_path)}
+        scanned = {r[0] for r in scan_file_metadata(tmp_path)}
+
+        assert discovered == scanned
+        assert discovered == {"main.py", "pkg/app.py"}

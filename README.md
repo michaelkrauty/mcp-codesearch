@@ -57,6 +57,7 @@ claude mcp add codesearch -- mcp-codesearch
 - **Query Syntax**: `function:name`, `class:name`, `path:prefix`, `-path:exclude`
 - **Incremental Indexing**: Change detection via mtime+size before hashing
 - **Query Preprocessing**: Synonym expansion (`fn` → `function`, `db` → `database`)
+- **Flexible Ignores**: Nested `.gitignore`, `.git/info/exclude`, and `.codesearchignore` (gitignore syntax) honored at every directory level
 
 ## Tools (11 total)
 
@@ -211,6 +212,16 @@ Fast incremental updates:
 
 Avoids full re-embedding on every search.
 
+## Ignoring files
+
+File discovery honors gitignore-syntax exclude rules at **every** directory level:
+
+- **`.gitignore`** — nested `.gitignore` files are respected, matching git semantics (deeper files override shallower, `!` negations re-include).
+- **`.git/info/exclude`** — repo-local excludes that are not committed to git.
+- **`.codesearchignore`** — exclude paths from indexing *without* changing git's behavior. Same syntax as `.gitignore`; useful for vendored code, generated files, or large data you want tracked by git but kept out of the index.
+
+Ignored directories are pruned during traversal, so excluded subtrees cost nothing. The global `core.excludesFile` is intentionally not consulted, so indexing stays reproducible regardless of per-machine git configuration.
+
 ## Storage
 
 | Data | Location |
@@ -235,4 +246,4 @@ Requires vector-core components:
 
 External libraries:
 - tree-sitter-language-pack (AST parsing)
-- pathspec (.gitignore support)
+- pathspec (.gitignore / .codesearchignore support)
