@@ -393,21 +393,29 @@ async def _search_multiple_global(
     # Phase 1 — index everything (concurrent; the vocabulary's cross-process lock
     # serializes the actual writes).
     indexed = await asyncio.gather(*(_index_one(path) for path in paths))
-    errors: list[tuple[str, str]] = [(p, reason) for p, _ap, reason in indexed if reason]
-    searchable = [(p, ap) for p, ap, reason in indexed if not reason]
 
-    # Phase 2 — search the successfully-indexed codebases against the settled vocabulary.
+    # Phase 2 — search the successfully-indexed codebases against the now-settled
+    # vocabulary. ``searchable`` keeps each codebase's index into ``paths`` so the
+    # outcomes can be reassembled in input order regardless of which phase failed.
+    searchable = [(i, p, ap) for i, (p, ap, reason) in enumerate(indexed) if not reason]
     searched = await asyncio.gather(
         *(
             _search_one(p, ap, query, mode, limit, language, storage, embedder, global_vocab)
-            for p, ap in searchable
+            for _i, p, ap in searchable
         )
     )
+    search_by_index = {searchable[k][0]: searched[k] for k in range(len(searched))}
 
+    # Reassemble in input order: errors and result lists both follow ``paths``.
+    errors: list[tuple[str, str]] = []
     sourced_lists: list[list[_SourcedResult]] = []
-    for path, abs_path, results, error in searched:
-        if error:
-            errors.append((path, error))
+    for i, (path, abs_path, reason) in enumerate(indexed):
+        if reason:
+            errors.append((path, reason))
+            continue
+        _p, _ap, results, search_error = search_by_index[i]
+        if search_error:
+            errors.append((path, search_error))
         elif results:
             sourced_lists.append(
                 [_SourcedResult(source=path, abs_source=abs_path, result=r) for r in results]

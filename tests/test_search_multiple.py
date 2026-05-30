@@ -14,6 +14,8 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from vector_core import EmbeddingServiceError
+
 from mcp_codesearch.services.search_service import SearchResponse
 from mcp_codesearch.storage.qdrant import SearchResult
 from mcp_codesearch.tools.search import (
@@ -334,6 +336,37 @@ async def test_global_ranking_all_codebases_failed(tmp_path):
     assert "No results found" in out
     assert "Skipped 2 codebase(s)" in out
     assert a in out and b in out
+
+
+async def test_global_ranking_skipped_order_and_no_leak(tmp_path):
+    """Skipped errors follow input path order across phases, and raw detail is hidden.
+
+    ``a`` indexes fine but fails in the search phase; ``b`` fails in the index phase.
+    The footer must still list ``a`` before ``b`` (input order), and the raw embedding
+    exception text must not reach the output.
+    """
+    a, b = _two_codebases(tmp_path)
+
+    async def fake_index(path):
+        if "repo_b" in path:
+            return (0, 0, None, "Error: index boom")  # b fails in phase 1
+        return (0, 0, _stats(), "")
+
+    async def fake_codebase(query, codebase_path, **kwargs):
+        raise EmbeddingServiceError("http://secret-embedder:9999 is down")  # a fails phase 2
+
+    with _boundaries(
+        auto_index=AsyncMock(side_effect=fake_index),
+        search_codebase=AsyncMock(side_effect=fake_codebase),
+    ):
+        out = await search_multiple(
+            query="anything", paths=[a, b], global_ranking=True, output_format="json"
+        )
+
+    data = json.loads(out)
+    assert [s["path"] for s in data["skipped"]] == [a, b]  # input order, not phase order
+    assert "secret-embedder" not in out  # raw exception detail not leaked
+    assert data["skipped"][0]["error"] == "embedding service unavailable"
 
 
 # --------------------------------------------------------------------------- #
