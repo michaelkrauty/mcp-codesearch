@@ -8,13 +8,14 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
-
-logger = logging.getLogger(__name__)
+from typing import TYPE_CHECKING, Literal
 
 from vector_core import (
     EmbeddingServiceError,
@@ -22,6 +23,7 @@ from vector_core import (
     validate_limit,
 )
 from vector_core.errors import format_error
+from vector_core.search import reciprocal_rank_fusion
 
 from mcp_codesearch.app import mcp
 from mcp_codesearch.helpers import (
@@ -39,6 +41,16 @@ from mcp_codesearch.singletons import (
     get_storage,
 )
 from mcp_codesearch.tools._errors import tool_error_handler
+
+if TYPE_CHECKING:
+    from vector_core import EmbeddingClient, GlobalVocabulary
+    from vector_core.search import RankFusionResult
+
+    from mcp_codesearch.search.query import SearchResult
+    from mcp_codesearch.services.search_service import SearchService
+    from mcp_codesearch.storage.qdrant import QdrantStorage
+
+logger = logging.getLogger(__name__)
 
 
 @mcp.tool()
@@ -150,20 +162,32 @@ async def search_multiple(
     limit: int = 10,
     language: str | None = None,
     output_format: Literal["text", "json", "markdown"] = "text",
+    global_ranking: bool = False,
 ) -> str:
     """
-    Search across multiple codebases simultaneously.
+    Search across multiple codebases concurrently.
+
+    Each codebase is indexed (incrementally, when needed) and searched in parallel, so
+    overall latency is bounded by the slowest codebase rather than the sum of them all.
 
     Args:
         query: Natural language description of what you're looking for
         paths: List of codebase paths to search (e.g., ["./repo1", "./repo2"])
         mode: "file" for file-level, "chunk" for function/class level, "both" for combined
-        limit: Max results per codebase (default 10)
+        limit: Max results per codebase (also the cap on fused results when
+            global_ranking is True)
         language: Filter by language (python, typescript, etc.)
         output_format: Output format - "text", "json", or "markdown"
+        global_ranking: When False (default), results are grouped under one
+            "=== path ===" section per codebase. When True, results from every codebase
+            are merged into a single list ranked across codebases with Reciprocal Rank
+            Fusion and tagged by their source codebase — answering "across all my repos,
+            where is the best match?". RRF fuses by rank position, so it is robust to the
+            fact that raw similarity scores from different collections are not directly
+            comparable.
 
     Returns:
-        Combined results from all codebases, grouped by codebase
+        Results grouped per codebase (default) or a single globally-ranked list.
     """
     if not query or not query.strip():
         return "Error: Query cannot be empty."
@@ -184,58 +208,326 @@ async def search_multiple(
     if invalid_paths:
         return "Error: Invalid paths:\n  • " + "\n  • ".join(invalid_paths)
 
+    if global_ranking:
+        return await _search_multiple_global(
+            query, paths, mode, limit, language, output_format
+        )
+    return await _search_multiple_grouped(
+        query, paths, mode, limit, language, output_format
+    )
+
+
+async def _grouped_section(
+    path: str,
+    query: str,
+    mode: Literal["file", "chunk", "both"],
+    limit: int,
+    language: str | None,
+    output_format: Literal["text", "json", "markdown"],
+    search_svc: SearchService,
+) -> str:
+    """Index and search one codebase, returning its ``=== path ===`` section.
+
+    Never raises: any failure is captured and rendered as an error section so that one
+    failing codebase cannot abort the others when these run under ``asyncio.gather``.
+    """
+    abs_path = to_abs_path(path)
+    try:
+        files_indexed, chunks_indexed, stats, error = await auto_index(abs_path)
+        if error:
+            return f"=== {path} ===\n{error}\n"
+
+        files_deleted = getattr(stats, "files_deleted", 0) if stats else 0
+        index_changed = files_indexed > 0 or files_deleted > 0
+
+        response = await search_svc.search(
+            SearchQuery(
+                query=query,
+                path=abs_path,
+                mode=mode,
+                limit=limit,
+                language=language,
+                output_format=output_format,
+            ),
+            skip_cache=index_changed,
+        )
+
+        section = f"=== {path} ==="
+        if index_changed and stats:
+            section += (
+                f" [Indexed {files_indexed} files, {chunks_indexed} chunks "
+                f"in {stats.indexing_time_ms}ms]"
+            )
+        section += "\n"
+        # ``formatted_output`` already reads "No results found." for an empty result set
+        # and — unlike ``results_count`` — is populated for cache hits too, so it is the
+        # source of truth for what to display (a cache hit leaves results_count at 0).
+        section += response.formatted_output
+        return section
+    except Exception as e:
+        # Log full details but don't leak to user (could contain sensitive paths)
+        logger.error(f"Search failed for {path}: {type(e).__name__}: {e}")
+        return f"=== {path} ===\nError: Search failed. Check server logs for details.\n"
+
+
+async def _search_multiple_grouped(
+    query: str,
+    paths: list[str],
+    mode: Literal["file", "chunk", "both"],
+    limit: int,
+    language: str | None,
+    output_format: Literal["text", "json", "markdown"],
+) -> str:
+    """Search every codebase concurrently, grouping results per codebase (input order)."""
     search_svc = await get_search_service()
-    all_results = []
+    sections = await asyncio.gather(
+        *(
+            _grouped_section(path, query, mode, limit, language, output_format, search_svc)
+            for path in paths
+        )
+    )
+    return "\n\n".join(sections)
 
-    for path in paths:
-        abs_path = to_abs_path(path)
 
-        try:
-            # Auto-index if needed
-            files_indexed, chunks_indexed, stats, error = await auto_index(abs_path)
-            if error:
-                all_results.append(f"=== {path} ===\n{error}\n")
-                continue
+@dataclass
+class _SourcedResult:
+    """A search result paired with the codebase it came from (for global ranking)."""
 
-            # Check if any indexing activity occurred (including deletions)
-            files_deleted = getattr(stats, "files_deleted", 0) if stats else 0
-            index_changed = files_indexed > 0 or files_deleted > 0
+    source: str  # Codebase path exactly as supplied by the caller (for display)
+    abs_source: str  # Resolved codebase root, used to derive a stable file identity
+    result: SearchResult
 
-            # Search
-            response = await search_svc.search(
-                SearchQuery(
-                    query=query,
-                    path=abs_path,
-                    mode=mode,
-                    limit=limit,
-                    language=language,
-                    output_format=output_format,
-                ),
-                skip_cache=index_changed,
+
+def _global_key(sourced: _SourcedResult) -> tuple[str, str, int, int]:
+    """Identity for de-duplicating a result across codebases.
+
+    A nested repository indexed both on its own and as part of its parent yields the same
+    file under two collections; keying on the absolute file location and span collapses
+    those into a single fused entry.
+    """
+    r = sourced.result
+    abs_file = str(Path(sourced.abs_source) / r.path)
+    return (abs_file, r.point_type, r.start_line or -1, r.end_line or -1)
+
+
+def _first_line(text: str) -> str:
+    """First non-empty line of a (possibly multi-line) message, for compact summaries."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return text.strip()
+
+
+async def _index_one(path: str) -> tuple[str, str, str]:
+    """Auto-index one codebase, returning ``(path, abs_path, error_reason)``.
+
+    ``error_reason`` is empty on success. Never raises (see :func:`_grouped_section`).
+    """
+    abs_path = to_abs_path(path)
+    try:
+        _files, _chunks, _stats, error = await auto_index(abs_path)
+        return path, abs_path, _first_line(error) if error else ""
+    except Exception as e:
+        logger.error(f"Global index failed for {path}: {type(e).__name__}: {e}")
+        return path, abs_path, "indexing failed (see server logs)"
+
+
+async def _search_one(
+    path: str,
+    abs_path: str,
+    query: str,
+    mode: Literal["file", "chunk", "both"],
+    limit: int,
+    language: str | None,
+    storage: QdrantStorage,
+    embedder: EmbeddingClient,
+    global_vocab: GlobalVocabulary,
+) -> tuple[str, str, list[SearchResult], str]:
+    """Search one already-indexed codebase for raw ranked results.
+
+    Returns ``(path, abs_path, results, error_reason)``. Failures are logged in full and
+    reduced to a generic reason so internal detail never reaches the caller.
+    """
+    try:
+        results = await search_codebase(
+            query=query,
+            codebase_path=abs_path,
+            storage=storage,
+            embedder=embedder,
+            global_vocab=global_vocab,
+            mode=mode,
+            language=language,
+            limit=limit,
+        )
+        return path, abs_path, results, ""
+    except EmbeddingServiceError as e:
+        logger.error(f"Global search failed for {path}: embedding service: {e}")
+        return path, abs_path, [], "embedding service unavailable"
+    except Exception as e:
+        logger.error(f"Global search failed for {path}: {type(e).__name__}: {e}")
+        return path, abs_path, [], "search failed (see server logs)"
+
+
+async def _search_multiple_global(
+    query: str,
+    paths: list[str],
+    mode: Literal["file", "chunk", "both"],
+    limit: int,
+    language: str | None,
+    output_format: Literal["text", "json", "markdown"],
+) -> str:
+    """Fuse results from every codebase into a single global ranking.
+
+    Indexing and searching run in two phases on purpose: every codebase is indexed
+    first, then all searches run against the now-settled GlobalVocabulary. The
+    vocabulary supplies the IDF weights shared across collections, so scoring every
+    codebase against the same snapshot keeps the cross-codebase ordering consistent
+    rather than letting a fast codebase rank against a vocabulary another codebase is
+    still updating.
+    """
+    storage = await get_storage()
+    embedder = await get_embedder()
+    global_vocab = await get_global_vocab()
+
+    # Phase 1 — index everything (concurrent; the vocabulary's cross-process lock
+    # serializes the actual writes).
+    indexed = await asyncio.gather(*(_index_one(path) for path in paths))
+
+    # Phase 2 — search the successfully-indexed codebases against the now-settled
+    # vocabulary. ``searchable`` keeps each codebase's index into ``paths`` so the
+    # outcomes can be reassembled in input order regardless of which phase failed.
+    searchable = [(i, p, ap) for i, (p, ap, reason) in enumerate(indexed) if not reason]
+    searched = await asyncio.gather(
+        *(
+            _search_one(p, ap, query, mode, limit, language, storage, embedder, global_vocab)
+            for _i, p, ap in searchable
+        )
+    )
+    search_by_index = {searchable[k][0]: searched[k] for k in range(len(searched))}
+
+    # Reassemble in input order: errors and result lists both follow ``paths``.
+    errors: list[tuple[str, str]] = []
+    sourced_lists: list[list[_SourcedResult]] = []
+    for i, (path, abs_path, reason) in enumerate(indexed):
+        if reason:
+            errors.append((path, reason))
+            continue
+        _p, _ap, results, search_error = search_by_index[i]
+        if search_error:
+            errors.append((path, search_error))
+        elif results:
+            sourced_lists.append(
+                [_SourcedResult(source=path, abs_source=abs_path, result=r) for r in results]
             )
 
-            # Format results for this codebase
-            section = f"=== {path} ==="
-            if index_changed and stats:
-                section += (
-                    f" [Indexed {files_indexed} files, {chunks_indexed} chunks "
-                    f"in {stats.indexing_time_ms}ms]"
-                )
-            section += "\n"
+    fused = reciprocal_rank_fusion(sourced_lists, key=_global_key, limit=limit)
+    return _format_global(fused, output_format, errors)
 
-            if response.results_count > 0:
-                section += response.formatted_output
-            else:
-                section += "No results found.\n"
 
-        except Exception as e:
-            # Log full details but don't leak to user (could contain sensitive paths)
-            logger.error(f"Search failed for {path}: {type(e).__name__}: {e}")
-            section = f"=== {path} ===\nError: Search failed. Check server logs for details.\n"
+def _format_global(
+    fused: list[RankFusionResult[_SourcedResult, tuple[str, str, int, int]]],
+    output_format: str,
+    errors: list[tuple[str, str]],
+) -> str:
+    """Render globally-ranked results, each tagged with its source codebase."""
+    if output_format == "json":
+        return _format_global_json(fused, errors)
 
-        all_results.append(section)
+    if not fused:
+        body = "No results found."
+    elif output_format == "markdown":
+        body = _format_global_markdown(fused)
+    else:
+        body = _format_global_text(fused)
 
-    return "\n\n".join(all_results)
+    if errors:
+        skipped = "\n".join(f"  • {path}: {reason}" for path, reason in errors)
+        body += f"\n\n[Skipped {len(errors)} codebase(s):\n{skipped}\n]"
+    return body
+
+
+def _format_global_json(
+    fused: list[RankFusionResult[_SourcedResult, tuple[str, str, int, int]]],
+    errors: list[tuple[str, str]],
+) -> str:
+    payload: dict[str, object] = {
+        "results": [
+            {
+                "rank": rank,
+                "source": f.item.source,
+                "path": f.item.result.path,
+                "score": round(f.item.result.score, 4),
+                "rrf_score": round(f.score, 6),
+                "type": f.item.result.point_type,
+                "language": f.item.result.language,
+                "name": f.item.result.name,
+                "start_line": f.item.result.start_line,
+                "end_line": f.item.result.end_line,
+                "content": f.item.result.content,
+            }
+            for rank, f in enumerate(fused, 1)
+        ]
+    }
+    if errors:
+        payload["skipped"] = [{"path": path, "error": reason} for path, reason in errors]
+    return json.dumps(payload, indent=2)
+
+
+def _format_global_text(
+    fused: list[RankFusionResult[_SourcedResult, tuple[str, str, int, int]]],
+    summary_length: int = 150,
+    content_length: int = 300,
+) -> str:
+    lines: list[str] = []
+    for rank, f in enumerate(fused, 1):
+        r = f.item.result
+        src = f.item.source
+        if r.point_type == "file":
+            lines.append(f"{rank}. [{r.language}] ({src}) {r.path}")
+            if r.summary:
+                lines.append(f"   {r.summary[:summary_length]}...")
+            if r.line_count is not None:
+                lines.append(f"   ({r.line_count} lines)")
+        else:
+            name = r.name or "unnamed"
+            lines.append(
+                f"{rank}. [{r.language}] ({src}) {r.path}:{r.start_line}-{r.end_line}"
+            )
+            lines.append(f"   {r.chunk_type}: {name}")
+            if r.content:
+                preview = r.content[:content_length].replace("\n", " ")
+                lines.append(f"   {preview}...")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _format_global_markdown(
+    fused: list[RankFusionResult[_SourcedResult, tuple[str, str, int, int]]],
+    summary_length: int = 150,
+    content_length: int = 300,
+) -> str:
+    lines: list[str] = []
+    for rank, f in enumerate(fused, 1):
+        r = f.item.result
+        src = f.item.source
+        if r.point_type == "file":
+            lines.append(f"### {rank}. `{r.path}` [{r.language}] — _{src}_")
+            if r.summary:
+                lines.append(f"> {r.summary[:summary_length]}...")
+            if r.line_count is not None:
+                lines.append(f"*{r.line_count} lines*")
+        else:
+            name = r.name or "unnamed"
+            lines.append(
+                f"### {rank}. `{r.path}:{r.start_line}-{r.end_line}` [{r.language}] — _{src}_"
+            )
+            lines.append(f"**{r.chunk_type}**: `{name}`")
+            if r.content:
+                preview = r.content[:content_length].replace("\n", "\n> ")
+                lines.append(f"```{r.language}\n{preview}\n```")
+        lines.append("")
+    return "\n".join(lines)
 
 
 @mcp.tool()
