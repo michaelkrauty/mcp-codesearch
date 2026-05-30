@@ -319,8 +319,23 @@ def _first_line(text: str) -> str:
     return text.strip()
 
 
-async def _collect_ranked(
+async def _index_one(path: str) -> tuple[str, str, str]:
+    """Auto-index one codebase, returning ``(path, abs_path, error_reason)``.
+
+    ``error_reason`` is empty on success. Never raises (see :func:`_grouped_section`).
+    """
+    abs_path = to_abs_path(path)
+    try:
+        _files, _chunks, _stats, error = await auto_index(abs_path)
+        return path, abs_path, _first_line(error) if error else ""
+    except Exception as e:
+        logger.error(f"Global index failed for {path}: {type(e).__name__}: {e}")
+        return path, abs_path, "indexing failed (see server logs)"
+
+
+async def _search_one(
     path: str,
+    abs_path: str,
     query: str,
     mode: Literal["file", "chunk", "both"],
     limit: int,
@@ -329,16 +344,12 @@ async def _collect_ranked(
     embedder: EmbeddingClient,
     global_vocab: GlobalVocabulary,
 ) -> tuple[str, str, list[SearchResult], str]:
-    """Index and search one codebase, returning raw ranked results for global fusion.
+    """Search one already-indexed codebase for raw ranked results.
 
-    Returns ``(path, abs_path, results, error)`` where ``error`` is a short reason when
-    the codebase could not be searched. Never raises (see :func:`_grouped_section`).
+    Returns ``(path, abs_path, results, error_reason)``. Failures are logged in full and
+    reduced to a generic reason so internal detail never reaches the caller.
     """
-    abs_path = to_abs_path(path)
     try:
-        _files, _chunks, _stats, error = await auto_index(abs_path)
-        if error:
-            return path, abs_path, [], _first_line(error)
         results = await search_codebase(
             query=query,
             codebase_path=abs_path,
@@ -351,7 +362,8 @@ async def _collect_ranked(
         )
         return path, abs_path, results, ""
     except EmbeddingServiceError as e:
-        return path, abs_path, [], f"embedding service unavailable: {e}"
+        logger.error(f"Global search failed for {path}: embedding service: {e}")
+        return path, abs_path, [], "embedding service unavailable"
     except Exception as e:
         logger.error(f"Global search failed for {path}: {type(e).__name__}: {e}")
         return path, abs_path, [], "search failed (see server logs)"
@@ -365,27 +377,38 @@ async def _search_multiple_global(
     language: str | None,
     output_format: Literal["text", "json", "markdown"],
 ) -> str:
-    """Search every codebase concurrently and fuse the results into one global ranking."""
+    """Fuse results from every codebase into a single global ranking.
+
+    Indexing and searching run in two phases on purpose: every codebase is indexed
+    first, then all searches run against the now-settled GlobalVocabulary. The
+    vocabulary supplies the IDF weights shared across collections, so scoring every
+    codebase against the same snapshot keeps the cross-codebase ordering consistent
+    rather than letting a fast codebase rank against a vocabulary another codebase is
+    still updating.
+    """
     storage = await get_storage()
     embedder = await get_embedder()
     global_vocab = await get_global_vocab()
 
-    collected = await asyncio.gather(
+    # Phase 1 — index everything (concurrent; the vocabulary's cross-process lock
+    # serializes the actual writes).
+    indexed = await asyncio.gather(*(_index_one(path) for path in paths))
+    errors: list[tuple[str, str]] = [(p, reason) for p, _ap, reason in indexed if reason]
+    searchable = [(p, ap) for p, ap, reason in indexed if not reason]
+
+    # Phase 2 — search the successfully-indexed codebases against the settled vocabulary.
+    searched = await asyncio.gather(
         *(
-            _collect_ranked(
-                path, query, mode, limit, language, storage, embedder, global_vocab
-            )
-            for path in paths
+            _search_one(p, ap, query, mode, limit, language, storage, embedder, global_vocab)
+            for p, ap in searchable
         )
     )
 
     sourced_lists: list[list[_SourcedResult]] = []
-    errors: list[tuple[str, str]] = []
-    for path, abs_path, results, error in collected:
+    for path, abs_path, results, error in searched:
         if error:
             errors.append((path, error))
-            continue
-        if results:
+        elif results:
             sourced_lists.append(
                 [_SourcedResult(source=path, abs_source=abs_path, result=r) for r in results]
             )

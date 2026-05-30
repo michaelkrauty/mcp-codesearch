@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -126,16 +125,29 @@ async def test_grouped_preserves_input_order_under_concurrency(tmp_path):
 
 
 async def test_grouped_runs_concurrently(tmp_path):
-    """Five codebases that each take 0.1s complete in ~0.1s, not ~0.5s."""
+    """Searches overlap: peak in-flight count equals the number of codebases.
+
+    Structural rather than wall-clock based — each search holds its slot across an
+    ``await`` while siblings start, so a sequential implementation would peak at 1.
+    """
     paths = []
     for i in range(5):
         d = tmp_path / f"r{i}"
         d.mkdir()
         paths.append(str(d))
 
+    active = 0
+    peak = 0
+
     async def fake_search(query, skip_cache=False):
-        await asyncio.sleep(0.1)
-        return SearchResponse(formatted_output="HIT\n", results_count=1)
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.02)  # hold the slot so siblings overlap
+            return SearchResponse(formatted_output="HIT\n", results_count=1)
+        finally:
+            active -= 1
 
     svc = MagicMock()
     svc.search = AsyncMock(side_effect=fake_search)
@@ -144,12 +156,10 @@ async def test_grouped_runs_concurrently(tmp_path):
         auto_index=AsyncMock(return_value=(0, 0, _stats(), "")),
         get_search_service=AsyncMock(return_value=svc),
     ):
-        start = time.monotonic()
         out = await search_multiple(query="anything", paths=paths)
-        elapsed = time.monotonic() - start
 
     assert out.count("HIT") == 5
-    assert elapsed < 0.4, f"expected concurrent execution (~0.1s), took {elapsed:.2f}s"
+    assert peak == 5, f"expected all 5 searches in flight at once, peak was {peak}"
 
 
 async def test_grouped_error_in_one_codebase_isolated(tmp_path):
