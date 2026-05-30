@@ -257,9 +257,12 @@ def _walk_codebase(  # noqa: PLR0912
             dir_path = root_path / d
             if dir_path.is_symlink():
                 continue
-            if _is_ignored(
-                dir_path, str(rel_root / d), current_specs, exclude_spec, is_dir=True
-            ):
+            # exclude_spec (the programmatic exclude_patterns) is intentionally NOT
+            # applied to directory pruning: historically it matched at file level only,
+            # so pruning here would change behavior (e.g. a later "!dir/keep.py" could no
+            # longer re-include a child). Nested .gitignore / .codesearchignore specs DO
+            # prune directories, matching git's non-recursion into excluded subtrees.
+            if _is_ignored(dir_path, str(rel_root / d), current_specs, None, is_dir=True):
                 continue
             kept_dirs.append(d)
         dirs[:] = kept_dirs

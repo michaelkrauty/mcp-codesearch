@@ -672,6 +672,26 @@ class TestIgnorePrecedence:
         assert "sub/other.tmp.py" not in rels  # parent rule still applies in subtree
         assert "sub/important.tmp.py" in rels  # child negation wins
 
+    def test_exclude_patterns_stay_file_level(self, tmp_path):
+        """exclude_patterns match at file level only (backwards compatible).
+
+        Unlike .gitignore, the programmatic exclude_patterns must not prune
+        directories, so a later "!dir/keep.py" can still re-include a child of
+        an otherwise-excluded directory.
+        """
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "keep.py").write_text("keep")
+        (sub / "drop.py").write_text("drop")
+
+        rels = {
+            f.rel_path
+            for f in discover_files(tmp_path, exclude_patterns=["sub/", "!sub/keep.py"])
+        }
+
+        assert "sub/keep.py" in rels
+        assert "sub/drop.py" not in rels
+
 
 class TestDiscoverScanConsistency:
     """discover_files and scan_file_metadata must agree on indexable files."""
