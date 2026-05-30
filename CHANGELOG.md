@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0] - 2026-05-30
+
+### Added
+
+- **Nested `.gitignore` support** — ignore rules are now honored at every directory level, matching git's "deeper files override shallower" semantics (including `!` re-include negations), instead of only the repository-root `.gitignore`.
+- **`.codesearchignore` files** — exclude paths from indexing using gitignore syntax without affecting git's own behavior. Honored at any directory level. Useful for vendored code, generated files, or large data that should stay tracked by git but out of the index.
+- **`.git/info/exclude` support** — repo-local (uncommitted) excludes are now respected. The user's global `core.excludesFile` is intentionally not consulted, keeping indexing reproducible across machines.
+
+### Changed
+
+- File discovery now prunes ignored directories during traversal (git does not descend into them), avoiding wasted work on excluded subtrees.
+- `discover_files()` and `scan_file_metadata()` now share a single traversal, so full indexing and incremental change detection always agree on which files are indexable.
+
 ## [1.0.3] - 2026-05-27
 
 ### Fixed
