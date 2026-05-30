@@ -1,4 +1,4 @@
-"""File discovery with .gitignore support."""
+"""File discovery with nested .gitignore and .codesearchignore support."""
 
 from __future__ import annotations
 
@@ -97,6 +97,22 @@ EXTENSION_TO_LANGUAGE = {
 }
 
 
+# Directories never traversed during discovery (VCS internals, dependencies,
+# build artifacts, caches). These are pruned regardless of ignore files.
+_ALWAYS_EXCLUDE_DIRS: frozenset[str] = frozenset(
+    {
+        ".git", ".svn", ".hg", "node_modules", "__pycache__",
+        ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache",
+        "dist", "build", ".next", ".nuxt", "target", "coverage",
+    }
+)
+
+# Ignore files honored at every directory level, using gitignore syntax.
+# ".codesearchignore" lets a project exclude paths from indexing without
+# changing git's behavior (which editing ".gitignore" would).
+_IGNORE_FILENAMES: tuple[str, ...] = (".gitignore", ".codesearchignore")
+
+
 class FileInfo(BaseModel):
     """Information about a discovered file."""
 
@@ -121,16 +137,42 @@ class FileMetadata(BaseModel):
     content_hash: str
 
 
-def _load_gitignore(codebase_path: Path) -> pathspec.PathSpec | None:
-    """Load .gitignore patterns from codebase root."""
-    gitignore_path = codebase_path / ".gitignore"
-    if not gitignore_path.exists():
+def _load_ignore_spec(path: Path) -> pathspec.GitIgnoreSpec | None:
+    """Parse a gitignore-syntax file into a spec, or None if absent/unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return pathspec.GitIgnoreSpec.from_lines(f.read().splitlines())
+    except OSError:
         return None
 
-    with open(gitignore_path, encoding="utf-8", errors="ignore") as f:
-        patterns = f.read().splitlines()
 
-    return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+def _load_gitignore(codebase_path: Path) -> pathspec.GitIgnoreSpec | None:
+    """Load root-level .gitignore patterns (kept for backwards compatibility)."""
+    return _load_ignore_spec(codebase_path / ".gitignore")
+
+
+def _dir_ignore_specs(directory: Path) -> list[tuple[Path, pathspec.GitIgnoreSpec]]:
+    """Ignore specs defined directly in ``directory`` (e.g. its own .gitignore)."""
+    specs: list[tuple[Path, pathspec.GitIgnoreSpec]] = []
+    for name in _IGNORE_FILENAMES:
+        spec = _load_ignore_spec(directory / name)
+        if spec is not None:
+            specs.append((directory, spec))
+    return specs
+
+
+def _root_ignore_specs(root: Path) -> list[tuple[Path, pathspec.GitIgnoreSpec]]:
+    """Root-level specs: ``.git/info/exclude`` (lowest precedence), then ignore files.
+
+    The user's global ``core.excludesFile`` is intentionally not consulted, so that
+    indexing stays reproducible and independent of per-machine git configuration.
+    """
+    specs: list[tuple[Path, pathspec.GitIgnoreSpec]] = []
+    info_exclude = _load_ignore_spec(root / ".git" / "info" / "exclude")
+    if info_exclude is not None:
+        specs.append((root, info_exclude))
+    specs.extend(_dir_ignore_specs(root))
+    return specs
 
 
 def _detect_language(path: Path) -> str | None:
@@ -138,7 +180,112 @@ def _detect_language(path: Path) -> str | None:
     return EXTENSION_TO_LANGUAGE.get(path.suffix.lower())
 
 
-def discover_files(  # noqa: PLR0912
+def _is_ignored(
+    abs_path: Path,
+    rel_to_root: str,
+    specs: list[tuple[Path, pathspec.GitIgnoreSpec]],
+    exclude_spec: pathspec.GitIgnoreSpec | None,
+    *,
+    is_dir: bool,
+) -> bool:
+    """Decide whether a path is excluded by the accumulated ignore specs.
+
+    Mirrors git precedence: the programmatic ``exclude_spec`` wins outright, then
+    the deepest matching ignore file decides (``!`` negations re-include the path),
+    falling back to shallower files and finally ``.git/info/exclude``.
+
+    ``specs`` are ordered root -> deep; each is matched relative to its own base
+    directory. A trailing slash is appended for directories so that directory-only
+    patterns such as ``build/`` match.
+    """
+    suffix = "/" if is_dir else ""
+    if exclude_spec is not None and exclude_spec.match_file(rel_to_root + suffix):
+        return True
+    # Deepest spec first: the most specific ignore file takes precedence.
+    for base, spec in reversed(specs):
+        try:
+            rel = str(abs_path.relative_to(base))
+        except ValueError:
+            continue
+        result = spec.check_file(rel + suffix)
+        if result.include is not None:
+            # include=True  -> matched an ignore pattern  -> excluded
+            # include=False -> matched a negation pattern  -> re-included
+            return result.include
+    return False
+
+
+def _walk_codebase(  # noqa: PLR0912
+    codebase_path: Path,
+    extensions: set[str],
+    max_size: int,
+    exclude_spec: pathspec.GitIgnoreSpec | None = None,
+) -> Iterator[tuple[Path, str, os.stat_result]]:
+    """Walk a codebase, yielding ``(abs_path, rel_path, stat)`` for indexable files.
+
+    This is the single traversal shared by :func:`discover_files` and
+    :func:`scan_file_metadata` so the two cannot drift apart. It handles directory
+    pruning (always-excluded dirs, dot directories, symlinks, ignored directories),
+    nested ``.gitignore`` / ``.codesearchignore`` accumulation plus
+    ``.git/info/exclude``, symlink and hidden-file skipping, extension filtering,
+    and size limits. Ignore files are honored at every directory level, matching
+    git's "deeper files override shallower" semantics.
+    """
+    # Accumulated specs per directory, ordered root -> deep. Parent lists are
+    # shared by reference when a directory adds no specs of its own.
+    specs_by_dir: dict[Path, list[tuple[Path, pathspec.GitIgnoreSpec]]] = {}
+
+    # followlinks=False prevents infinite loops from symlinks pointing to parents.
+    for root, dirs, files in os.walk(codebase_path, followlinks=False):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(codebase_path)
+
+        if root_path == codebase_path:
+            current_specs = _root_ignore_specs(codebase_path)
+        else:
+            parent_specs = specs_by_dir.get(root_path.parent, [])
+            local_specs = _dir_ignore_specs(root_path)
+            current_specs = parent_specs + local_specs if local_specs else parent_specs
+        specs_by_dir[root_path] = current_specs
+
+        # Prune directories in place: never-traversed dirs, dot dirs, symlinks, and
+        # directories excluded by ignore rules (git does not descend into them).
+        kept_dirs = []
+        for d in dirs:
+            if d in _ALWAYS_EXCLUDE_DIRS or d.startswith("."):
+                continue
+            dir_path = root_path / d
+            if dir_path.is_symlink():
+                continue
+            if _is_ignored(
+                dir_path, str(rel_root / d), current_specs, exclude_spec, is_dir=True
+            ):
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
+
+        for filename in files:
+            if filename.startswith("."):
+                continue
+            file_path = root_path / filename
+            if file_path.is_symlink():
+                continue
+            if file_path.suffix.lower() not in extensions:
+                continue
+            rel_path = str(rel_root / filename)
+            if _is_ignored(file_path, rel_path, current_specs, exclude_spec, is_dir=False):
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError as e:
+                logger.warning(f"Failed to stat file {rel_path}: {e}")
+                continue
+            if stat.st_size == 0 or stat.st_size > max_size:
+                continue
+            yield file_path, rel_path, stat
+
+
+def discover_files(
     codebase_path: str | Path,
     include_extensions: set[str] | None = None,
     exclude_patterns: list[str] | None = None,
@@ -150,7 +297,7 @@ def discover_files(  # noqa: PLR0912
     Args:
         codebase_path: Root path of codebase
         include_extensions: Extensions to include (default: from settings)
-        exclude_patterns: Additional patterns to exclude
+        exclude_patterns: Additional gitignore-style patterns to exclude
         max_file_size_kb: Max file size in KB (default: from settings)
 
     Yields:
@@ -159,94 +306,39 @@ def discover_files(  # noqa: PLR0912
     codebase_path = Path(codebase_path).resolve()
     extensions = include_extensions or settings.code_extensions
     max_size = (max_file_size_kb or settings.max_file_size_kb) * 1024
+    exclude_spec = (
+        pathspec.GitIgnoreSpec.from_lines(exclude_patterns) if exclude_patterns else None
+    )
 
-    # Load .gitignore
-    gitignore = _load_gitignore(codebase_path)
-
-    # Build additional exclude spec
-    exclude_spec = None
-    if exclude_patterns:
-        exclude_spec = pathspec.PathSpec.from_lines("gitwildmatch", exclude_patterns)
-
-    # Always exclude these directories
-    always_exclude = {
-        ".git", ".svn", ".hg", "node_modules", "__pycache__",
-        ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache",
-        "dist", "build", ".next", ".nuxt", "target", "coverage",
-    }
-
-    # followlinks=False prevents infinite loops from symlinks pointing to parent directories
-    for root, dirs, files in os.walk(codebase_path, followlinks=False):
-        root_path = Path(root)
-        rel_root = root_path.relative_to(codebase_path)
-
-        # Filter directories in-place (also skip symlinked directories)
-        dirs[:] = [
-            d for d in dirs
-            if d not in always_exclude
-            and not d.startswith(".")
-            and not (root_path / d).is_symlink()
-        ]
-
-        for filename in files:
-            file_path = root_path / filename
-            rel_path = str(rel_root / filename)
-
-            # Skip hidden files and symlinks
-            if filename.startswith("."):
-                continue
-            if file_path.is_symlink():
-                continue
-
-            # Check extension
-            if file_path.suffix.lower() not in extensions:
-                continue
-
-            # Check gitignore
-            if gitignore and gitignore.match_file(rel_path):
-                continue
-
-            # Check exclude patterns
-            if exclude_spec and exclude_spec.match_file(rel_path):
-                continue
-
-            # Check file size
-            try:
-                stat = file_path.stat()
-                if stat.st_size > max_size:
-                    continue
-                if stat.st_size == 0:
-                    continue
-            except OSError as e:
-                logger.warning(f"Failed to stat file {rel_path}: {e}")
-                continue
-
-            # Read content (TOCTOU-safe)
-            content = _safe_read_file(file_path)
-            if content is None:
-                logger.debug(f"Skipping file {rel_path}: could not read (symlink or permission issue)")
-                continue
-            # Check if content had encoding issues (replacement chars present)
-            if "\ufffd" in content:
-                logger.debug(
-                    f"File {rel_path} has encoding issues (non-UTF-8 characters replaced)"
-                )
-
-            # Detect language
-            language = _detect_language(file_path)
-            if not language:
-                continue
-
-            yield FileInfo(
-                path=file_path,
-                rel_path=rel_path,
-                language=language,
-                size_bytes=stat.st_size,
-                content=content,
-                content_hash=hash_content(content),
-                line_count=content.count("\n") + 1,
-                mtime=stat.st_mtime,
+    for file_path, rel_path, stat in _walk_codebase(
+        codebase_path, extensions, max_size, exclude_spec
+    ):
+        # Read content (TOCTOU-safe)
+        content = _safe_read_file(file_path)
+        if content is None:
+            logger.debug(f"Skipping file {rel_path}: could not read (symlink or permission issue)")
+            continue
+        # Check if content had encoding issues (replacement chars present)
+        if "\ufffd" in content:
+            logger.debug(
+                f"File {rel_path} has encoding issues (non-UTF-8 characters replaced)"
             )
+
+        # Detect language
+        language = _detect_language(file_path)
+        if not language:
+            continue
+
+        yield FileInfo(
+            path=file_path,
+            rel_path=rel_path,
+            language=language,
+            size_bytes=stat.st_size,
+            content=content,
+            content_hash=hash_content(content),
+            line_count=content.count("\n") + 1,
+            mtime=stat.st_mtime,
+        )
 
 
 def get_file_hash(file_path: Path) -> str | None:
@@ -345,7 +437,9 @@ def scan_file_metadata(
     Fast scan returning only (rel_path, mtime, size) for each file.
 
     This is much faster than discover_files() as it doesn't read file content.
-    Use for quick change detection before committing to full file reads.
+    Use for quick change detection before committing to full file reads. Honors
+    the same directory pruning and ignore rules as discover_files(), so change
+    detection and full indexing agree on which files are indexable.
 
     Yields:
         Tuple of (rel_path, mtime, size_bytes)
@@ -354,53 +448,5 @@ def scan_file_metadata(
     extensions = include_extensions or settings.code_extensions
     max_size = (max_file_size_kb or settings.max_file_size_kb) * 1024
 
-    # Load .gitignore
-    gitignore = _load_gitignore(codebase_path)
-
-    # Always exclude these directories
-    always_exclude = {
-        ".git", ".svn", ".hg", "node_modules", "__pycache__",
-        ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache",
-        "dist", "build", ".next", ".nuxt", "target", "coverage",
-    }
-
-    # followlinks=False prevents infinite loops from symlinks pointing to parent directories
-    for root, dirs, files in os.walk(codebase_path, followlinks=False):
-        root_path = Path(root)
-        rel_root = root_path.relative_to(codebase_path)
-
-        # Filter directories in-place (also skip symlinked directories)
-        dirs[:] = [
-            d for d in dirs
-            if d not in always_exclude
-            and not d.startswith(".")
-            and not (root_path / d).is_symlink()
-        ]
-
-        for filename in files:
-            file_path = root_path / filename
-            rel_path = str(rel_root / filename)
-
-            # Skip hidden files and symlinks
-            if filename.startswith("."):
-                continue
-            if file_path.is_symlink():
-                continue
-
-            # Check extension
-            if file_path.suffix.lower() not in extensions:
-                continue
-
-            # Check gitignore
-            if gitignore and gitignore.match_file(rel_path):
-                continue
-
-            # Check file size and get stats
-            try:
-                stat = file_path.stat()
-                if stat.st_size > max_size or stat.st_size == 0:
-                    continue
-            except OSError:
-                continue
-
-            yield (rel_path, stat.st_mtime, stat.st_size)
+    for _file_path, rel_path, stat in _walk_codebase(codebase_path, extensions, max_size):
+        yield (rel_path, stat.st_mtime, stat.st_size)
