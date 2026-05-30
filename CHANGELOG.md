@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.1] - 2026-05-30
+
+### Changed
+
+- Bumped the `vector-core` dependency to `v1.1.0`, which adds nested ignore-file support to `FileDiscovery`.
+
 ## [1.1.0] - 2026-05-30
 
 ### Added
