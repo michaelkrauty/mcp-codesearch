@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0] - 2026-05-30
+
+### Added
+
+- **Cross-codebase global ranking for `search_multiple`** — pass `global_ranking=True` to merge results from every searched codebase into a single list ranked *across* codebases, each tagged with its source, answering "across all my repos, where is the best match?". Ranking uses Reciprocal Rank Fusion (via `vector-core`), which fuses by rank position and is therefore robust to the fact that raw similarity scores from different collections are not directly comparable. A result that appears in more than one codebase (e.g. a nested repo indexed both on its own and as part of its parent) is de-duplicated by absolute file location. Supported in `text`, `markdown`, and `json` output.
+
+### Changed
+
+- **`search_multiple` now searches codebases concurrently** instead of sequentially. Indexing and search for each codebase run under `asyncio.gather`, so overall latency is bounded by the slowest codebase rather than the sum of them all. Output ordering, per-codebase `=== path ===` grouping, and per-codebase error isolation are unchanged.
+
+### Fixed
+
+- **`search_multiple` no longer reports cached results as "No results found."** The grouped output keyed off `results_count`, which is left at `0` on a cache hit; it now renders the response's formatted output directly (matching `code_search`), so repeated multi-codebase searches show their results.
+
 ## [1.1.1] - 2026-05-30
 
 ### Changed
