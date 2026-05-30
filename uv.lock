@@ -515,7 +515,7 @@ wheels = [
 
 [[package]]
 name = "mcp-codesearch"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -551,7 +551,7 @@ requires-dist = [
     { name = "qdrant-client", specifier = "~=1.16.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "tree-sitter-language-pack", specifier = ">=0.13.0" },
-    { name = "vector-core", git = "https://github.com/michaelkrauty/vector-core?tag=v1.0.5" },
+    { name = "vector-core", git = "https://github.com/michaelkrauty/vector-core?tag=v1.1.0" },
 ]
 provides-extras = ["dev"]
 
@@ -1254,8 +1254,8 @@ wheels = [
 
 [[package]]
 name = "vector-core"
-version = "1.0.5"
-source = { git = "https://github.com/michaelkrauty/vector-core?tag=v1.0.5#2646c9366dce07a9f1546f63ede14bbefa6096b5" }
+version = "1.1.0"
+source = { git = "https://github.com/michaelkrauty/vector-core?tag=v1.1.0#3f0b6a27fbe1d86a037713f2c407074b9f90ce54" }
 dependencies = [
     { name = "httpx" },
     { name = "pathspec" },
