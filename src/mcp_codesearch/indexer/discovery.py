@@ -14,6 +14,8 @@ from vector_core.utils.hashing import hash_content
 
 from mcp_codesearch.settings import settings
 
+from .notebook import extract_notebook_source
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,9 +64,28 @@ def _safe_read_file(file_path: Path) -> str | None:
             except OSError:
                 pass
 
+
+def _read_indexable_content(file_path: Path) -> str | None:
+    """Read a file's content for indexing, converting notebooks to their code.
+
+    ``.ipynb`` files are reduced to the source of their code cells (see
+    ``extract_notebook_source``) so notebooks are chunked and hashed as code rather
+    than as raw JSON. All other files are returned verbatim. Returns ``None`` when
+    the file can't be read (mirroring ``_safe_read_file``) or when a notebook has no
+    extractable code, so callers skip it via their existing ``is None`` guard.
+    """
+    content = _safe_read_file(file_path)
+    if content is None:
+        return None
+    if file_path.suffix.lower() == ".ipynb":
+        return extract_notebook_source(content) or None
+    return content
+
+
 # Language detection by extension
 EXTENSION_TO_LANGUAGE = {
     ".py": "python",
+    ".ipynb": "python",
     ".js": "javascript",
     ".ts": "typescript",
     ".tsx": "typescript",
@@ -283,7 +304,13 @@ def _walk_codebase(  # noqa: PLR0912
             except OSError as e:
                 logger.warning(f"Failed to stat file {rel_path}: {e}")
                 continue
-            if stat.st_size == 0 or stat.st_size > max_size:
+            # Notebooks are indexed by their (typically small) extracted code, not
+            # their raw JSON, so cell outputs must not push a notebook past the
+            # raw-size limit — that would exclude it from discovery and the metadata
+            # scan, and the next incremental pass would then delete it from the
+            # index. Empty files are still skipped.
+            is_notebook = file_path.suffix.lower() == ".ipynb"
+            if stat.st_size == 0 or (stat.st_size > max_size and not is_notebook):
                 continue
             yield file_path, rel_path, stat
 
@@ -316,8 +343,8 @@ def discover_files(
     for file_path, rel_path, stat in _walk_codebase(
         codebase_path, extensions, max_size, exclude_spec
     ):
-        # Read content (TOCTOU-safe)
-        content = _safe_read_file(file_path)
+        # Read content (TOCTOU-safe; notebooks are reduced to their code cells)
+        content = _read_indexable_content(file_path)
         if content is None:
             logger.debug(f"Skipping file {rel_path}: could not read (symlink or permission issue)")
             continue
@@ -413,8 +440,8 @@ def read_specific_files(
             logger.warning(f"Failed to stat file {rel_path}: {e}")
             continue
 
-        # Read content (TOCTOU-safe)
-        content = _safe_read_file(resolved)
+        # Read content (TOCTOU-safe; notebooks are reduced to their code cells)
+        content = _read_indexable_content(resolved)
         if content is None:
             logger.debug(f"Skipping file {rel_path}: could not read (symlink or permission issue)")
             continue

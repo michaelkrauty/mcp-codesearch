@@ -23,7 +23,7 @@ class CodeSearchSettings(VectorCoreSettingsMixin, BaseSettings):
 
     # Code file extensions to index
     code_extensions: set[str] = {
-        ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+        ".py", ".ipynb", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
         ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
         ".scala", ".cs", ".vue", ".svelte", ".md", ".sql", ".sh",
         ".yaml", ".yml", ".json", ".toml", ".html", ".css", ".scss",

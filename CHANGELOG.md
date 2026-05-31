@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.2] - 2026-05-31
+
+### Added
+
+- **Jupyter notebook (`.ipynb`) indexing.** Notebooks are now discovered and made searchable by their *code*: a new `indexer/notebook.py` reduces a notebook to the source of its `code` cells (markdown, raw, and output cells are dropped), joined with `# %%` cell markers, which is then chunked as Python with full tree-sitter AST support — so a notebook's functions and classes are searchable like any other source file. The conversion is applied through a single shared read path used by both full discovery and incremental change-detection, so a notebook's content hash is computed over its extracted code (output-only edits don't trigger re-indexing, and notebooks never re-index perpetually). Code-less or unparseable notebooks are skipped rather than failing a codebase index. Supports both nbformat v4 (`cells`) and legacy v3 (`worksheets[*].cells` with `input`).
+
+### Fixed
+
+- **Incremental change-detection now removes a previously-indexed file that has become unindexable** — e.g. a notebook whose code cells were all deleted, a file that was emptied, or one that became unreadable. The fast scan still reported such a file by path (so it wasn't treated as deleted) while the content read yielded nothing (so it wasn't treated as modified), leaving its chunks stale in the index; it is now treated as a deletion. (Latent before this release; reachable for any file type, newly easy to hit via notebooks.)
+- **Output-only notebook edits no longer cause a needless re-index.** Notebooks are excluded from the size-delta "definitely modified" shortcut and always hash-verified against their *extracted code*, so adding large cell outputs (which changes the raw file size but not the code) does not re-index the notebook.
+- **A notebook's cell outputs no longer affect whether it is indexed at all.** Notebooks are judged by their (typically small) extracted code rather than their raw JSON size, so large embedded outputs can't push a notebook past `max_file_size_kb` — which would otherwise exclude it from discovery and then delete it from the index on the next incremental scan. (Non-notebook files are still subject to the size limit.)
+
 ## [1.2.1] - 2026-05-30
 
 ### Changed

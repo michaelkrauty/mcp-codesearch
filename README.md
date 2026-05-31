@@ -238,6 +238,8 @@ Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, Ruby, PHP, Swift, Kotlin
 
 **Line-based fallback:** Bash, HTML, CSS, and all other file types (Markdown, Vue, Svelte, config files, etc.) are indexed with line-based chunking.
 
+**Jupyter notebooks (`.ipynb`):** Notebooks are indexed by their *code*. Code cells are extracted (markdown, raw, and output cells are skipped) and chunked as Python with full AST support, so a notebook's functions and classes are searchable just like any other source file. Code-less or unparseable notebooks are skipped.
+
 ## Dependencies
 
 Requires vector-core components:
