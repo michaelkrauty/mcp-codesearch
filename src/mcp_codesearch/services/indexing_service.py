@@ -535,7 +535,7 @@ class IndexingService:
         )
 
         # Filter failed results and log warnings
-        valid_results = []
+        valid_results: list[list[set[str]]] = []
         for path, result in zip(all_paths, results):
             if isinstance(result, BaseException):
                 logger.warning(f"Failed to fetch content for {path}: {result}")
