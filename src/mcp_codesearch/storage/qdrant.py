@@ -194,9 +194,11 @@ class QdrantStorage:
         """Return the dense-vector dimension recorded for an existing collection.
 
         Reads the collection's stored vector configuration from Qdrant. Returns
-        ``None`` when the collection does not expose a named ``dense`` vector
-        (for example a collection created by some other tool), so callers can
-        treat an unreadable dimension as "cannot verify" rather than a mismatch.
+        ``None`` when the config has no named ``dense`` vector (for example a
+        collection created by some other tool), so a caller can treat that as
+        "cannot verify" rather than a mismatch. A genuine read failure (Qdrant
+        unreachable, collection vanished) is not masked here: it propagates and
+        is handled by the caller's existing Qdrant error handling.
         """
         client = await self._get_client()
         info = await client.get_collection(name)

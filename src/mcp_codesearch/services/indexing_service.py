@@ -174,13 +174,21 @@ class IndexingService:
 
         Detects the case where the embedding model was changed (to one with a
         different output dimension) after a codebase was indexed. Continuing
-        would make Qdrant reject every query and upsert with a confusing
+        would make Qdrant reject every upsert and dense query with a confusing
         dimension error, so we fail fast with an actionable message instead.
 
-        This is a no-op when the expected dimension is unknown (``embedding_dim``
-        is still 0 because auto-detection has not resolved it) or when the
-        stored dimension cannot be read, so a transient or unrecognized state
-        never blocks indexing — only a definite mismatch does.
+        The guard is deliberately query-agnostic: it gates *any* reuse of the
+        collection — incremental indexing and search alike — not only dense
+        queries. A dimension change leaves the whole collection unusable (new
+        points can't even be upserted into it), so steering the user to
+        ``force_reindex`` before any use is simpler and clearer than letting an
+        exact-only lookup limp along on a half-broken index.
+
+        Only a *definite* mismatch raises. This is a no-op when the expected
+        dimension is unknown (``embedding_dim`` is still 0 because auto-detection
+        has not resolved it) or when the stored dimension is absent from the
+        collection config (``get_dense_dim`` returns ``None``); a genuine Qdrant
+        read failure propagates to the caller's existing error handling.
         """
         expected = settings.embedding_dim
         if not expected:
