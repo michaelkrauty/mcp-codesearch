@@ -1,5 +1,6 @@
 """Tests for change detection in mcp-codesearch."""
 
+import json
 from pathlib import Path
 
 from mcp_codesearch.indexer.change_detect import (
@@ -7,7 +8,7 @@ from mcp_codesearch.indexer.change_detect import (
     detect_changes,
     detect_changes_fast,
 )
-from mcp_codesearch.indexer.discovery import FileInfo
+from mcp_codesearch.indexer.discovery import FileInfo, discover_files
 
 
 def _make_file_info(name: str = "test.py") -> FileInfo:
@@ -320,3 +321,98 @@ class TestDetectChangesFast:
         # Line 94: mtime=0 in both -> triggers hash check -> modified due to hash diff
         assert len(changes.modified) == 1
         assert changes.modified[0].rel_path == "legacy.py"
+
+
+_NB_WITH_CODE = json.dumps(
+    {
+        "cells": [
+            {"cell_type": "markdown", "source": "# title"},
+            {"cell_type": "code", "source": "def f():\n    return 1\n"},
+        ],
+        "nbformat": 4,
+    }
+)
+
+
+class TestNotebookChangeDetection:
+    """detect_changes_fast handles notebooks, which are indexed by extracted code."""
+
+    def _index(self, tmp_path, rel, raw):
+        """Write a notebook and return the indexed_metadata as if it were indexed."""
+        (tmp_path / rel).write_text(raw)
+        info = next(f for f in discover_files(tmp_path) if f.rel_path == rel)
+        return {
+            rel: {
+                "file_hash": info.content_hash,
+                "mtime": info.mtime,
+                "size_bytes": info.size_bytes,
+            }
+        }
+
+    def test_code_removed_notebook_is_deleted(self, tmp_path):
+        """A notebook edited to drop all code cells is removed from the index."""
+        indexed = self._index(tmp_path, "nb.ipynb", _NB_WITH_CODE)
+        (tmp_path / "nb.ipynb").write_text(
+            json.dumps({"cells": [{"cell_type": "markdown", "source": "# only prose now"}]})
+        )
+
+        changes = detect_changes_fast(tmp_path, indexed_metadata=indexed)
+
+        assert "nb.ipynb" in changes.deleted
+        assert all(f.rel_path != "nb.ipynb" for f in changes.modified)
+
+    def test_malformed_notebook_is_deleted(self, tmp_path):
+        """A previously-indexed notebook that becomes malformed is removed."""
+        indexed = self._index(tmp_path, "nb.ipynb", _NB_WITH_CODE)
+        (tmp_path / "nb.ipynb").write_text("{ no longer valid json " + "x" * 50)
+
+        changes = detect_changes_fast(tmp_path, indexed_metadata=indexed)
+
+        assert "nb.ipynb" in changes.deleted
+
+    def test_output_only_edit_not_reindexed(self, tmp_path):
+        """Adding cell outputs (large raw size delta) does not reindex the code."""
+        indexed = self._index(tmp_path, "nb.ipynb", _NB_WITH_CODE)
+        with_output = json.dumps(
+            {
+                "cells": [
+                    {"cell_type": "markdown", "source": "# title"},
+                    {
+                        "cell_type": "code",
+                        "source": "def f():\n    return 1\n",
+                        "outputs": [{"output_type": "stream", "text": "X" * 500}],
+                    },
+                ],
+                "nbformat": 4,
+            }
+        )
+        (tmp_path / "nb.ipynb").write_text(with_output)
+
+        changes = detect_changes_fast(tmp_path, indexed_metadata=indexed)
+
+        # extracted code is unchanged -> not modified, not deleted
+        assert all(f.rel_path != "nb.ipynb" for f in changes.modified)
+        assert "nb.ipynb" not in changes.deleted
+
+    def test_output_only_edit_uppercase_extension_not_reindexed(self, tmp_path):
+        """The notebook shortcut-exclusion is case-insensitive (e.g. .IPYNB)."""
+        indexed = self._index(tmp_path, "Nb.IPYNB", _NB_WITH_CODE)
+        with_output = json.dumps(
+            {
+                "cells": [
+                    {"cell_type": "markdown", "source": "# title"},
+                    {
+                        "cell_type": "code",
+                        "source": "def f():\n    return 1\n",
+                        "outputs": [{"output_type": "stream", "text": "X" * 500}],
+                    },
+                ],
+                "nbformat": 4,
+            }
+        )
+        (tmp_path / "Nb.IPYNB").write_text(with_output)
+
+        changes = detect_changes_fast(tmp_path, indexed_metadata=indexed)
+
+        assert all(f.rel_path != "Nb.IPYNB" for f in changes.modified)
+        assert "Nb.IPYNB" not in changes.deleted

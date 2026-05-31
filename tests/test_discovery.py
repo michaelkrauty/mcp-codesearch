@@ -1,5 +1,6 @@
 """Tests for file discovery in mcp-codesearch."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -15,8 +16,11 @@ from mcp_codesearch.indexer.discovery import (
     discover_files,
     get_file_hash,
     get_file_stat,
+    read_specific_files,
     scan_file_metadata,
 )
+from mcp_codesearch.indexer.notebook import extract_notebook_source
+from mcp_codesearch.settings import settings
 
 
 class TestFileInfo:
@@ -730,3 +734,110 @@ class TestDiscoverScanConsistency:
 
         assert discovered == scanned
         assert discovered == {"main.py", "pkg/app.py"}
+
+
+_SAMPLE_NB = json.dumps(
+    {
+        "cells": [
+            {"cell_type": "markdown", "source": "# Analysis"},
+            {"cell_type": "code", "source": "import pandas as pd\n"},
+            {"cell_type": "code", "source": "def load():\n    return pd.DataFrame()\n"},
+        ],
+        "nbformat": 4,
+    }
+)
+
+
+class TestNotebookDiscovery:
+    """Discovery of Jupyter notebooks (.ipynb reduced to extracted Python code)."""
+
+    def test_ipynb_discovered_as_python_with_extracted_code(self, tmp_path):
+        (tmp_path / "analysis.ipynb").write_text(_SAMPLE_NB)
+
+        files = list(discover_files(tmp_path))
+
+        assert len(files) == 1
+        info = files[0]
+        assert info.rel_path == "analysis.ipynb"
+        assert info.language == "python"
+        # content is the extracted code, not the raw notebook JSON
+        assert "import pandas as pd" in info.content
+        assert "def load():" in info.content
+        assert "cell_type" not in info.content  # no JSON leaked through
+        assert "# Analysis" not in info.content  # markdown cell dropped
+        assert info.content_hash == hash_content(extract_notebook_source(_SAMPLE_NB))
+
+    def test_ipynb_registered_in_extension_maps(self):
+        assert ".ipynb" in settings.code_extensions
+        assert EXTENSION_TO_LANGUAGE[".ipynb"] == "python"
+        assert _detect_language(Path("x.ipynb")) == "python"
+
+    def test_codeless_notebook_skipped(self, tmp_path):
+        (tmp_path / "prose.ipynb").write_text(
+            json.dumps({"cells": [{"cell_type": "markdown", "source": "# hi"}]})
+        )
+        (tmp_path / "real.py").write_text("x = 1")
+
+        rel_paths = {f.rel_path for f in discover_files(tmp_path)}
+        assert rel_paths == {"real.py"}  # code-less notebook is not indexed
+
+    def test_malformed_notebook_skipped_not_fatal(self, tmp_path):
+        (tmp_path / "broken.ipynb").write_text("{ not valid json")
+        (tmp_path / "ok.py").write_text("y = 2")
+
+        rel_paths = {f.rel_path for f in discover_files(tmp_path)}
+        assert rel_paths == {"ok.py"}  # malformed notebook skipped; .py still found
+
+    def test_read_specific_files_hash_matches_discover(self, tmp_path):
+        # Both content-read paths must produce the SAME content_hash for a notebook,
+        # else incremental change-detection would re-index it on every scan.
+        (tmp_path / "nb.ipynb").write_text(_SAMPLE_NB)
+
+        discovered = next(iter(discover_files(tmp_path)))
+        specific = next(iter(read_specific_files(tmp_path, {"nb.ipynb"})))
+
+        assert discovered.content_hash == specific.content_hash
+        assert discovered.content == specific.content
+
+    def test_oversized_notebook_indexed_by_its_code(self, tmp_path):
+        """A notebook's raw size (large outputs) doesn't exclude it; a large
+        non-notebook is still excluded by the size limit."""
+        nb = json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "source": "import os\n",
+                        "outputs": [{"output_type": "stream", "text": "X" * 5000}],
+                    }
+                ]
+            }
+        )
+        (tmp_path / "big.ipynb").write_text(nb)  # raw ~5 KB, code tiny
+        (tmp_path / "big.py").write_text("# pad\n" * 2000)  # raw ~12 KB
+
+        # max_file_size_kb=1 -> 1024 bytes; both files exceed it
+        files = {f.rel_path: f for f in discover_files(tmp_path, max_file_size_kb=1)}
+
+        assert "big.ipynb" in files  # notebook exempted from the raw-size limit
+        assert "import os" in files["big.ipynb"].content  # indexed by its code
+        assert "big.py" not in files  # non-notebook still excluded
+
+    def test_oversized_notebook_included_in_metadata_scan(self, tmp_path):
+        """scan_file_metadata reports an output-heavy notebook, so incremental
+        change-detection will not treat it as deleted."""
+        nb = json.dumps(
+            {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "source": "y = 2\n",
+                        "outputs": [{"output_type": "stream", "text": "Z" * 5000}],
+                    }
+                ]
+            }
+        )
+        (tmp_path / "heavy.ipynb").write_text(nb)
+
+        scanned = {r[0] for r in scan_file_metadata(tmp_path, max_file_size_kb=1)}
+        assert "heavy.ipynb" in scanned

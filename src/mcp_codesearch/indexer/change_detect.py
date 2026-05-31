@@ -101,11 +101,17 @@ def detect_changes_fast(
 
             # Fast check: if mtime and size unchanged, file is likely unchanged
             if mtime_changed or size_changed:
-                # If both mtime changed AND size differs significantly, skip hash
+                # If both mtime changed AND size differs significantly, skip hash.
+                # Notebooks are indexed by their extracted code, so a large raw
+                # size delta (e.g. new cell outputs) does not imply the code
+                # changed — always hash-verify them rather than taking the
+                # size-based "definitely modified" shortcut.
                 if (
                     mtime_changed
                     and size_changed
                     and abs(size - indexed_size) > _DEFINITELY_MODIFIED_SIZE_THRESHOLD
+                    # case-insensitive, matching how discovery detects notebooks
+                    and Path(rel_path).suffix.lower() != ".ipynb"
                 ):
                     definitely_modified.add(rel_path)
                 else:
@@ -127,8 +133,10 @@ def detect_changes_fast(
     modified: list[FileInfo] = []
     paths_to_read = new_paths | potentially_modified | definitely_modified
 
+    read_paths: set[str] = set()
     for file_info in read_specific_files(codebase_path, paths_to_read):
         rel_path = file_info.rel_path
+        read_paths.add(rel_path)
 
         if rel_path in new_paths:
             added.append(file_info)
@@ -141,5 +149,12 @@ def detect_changes_fast(
             if file_info.content_hash != indexed_hash:
                 modified.append(file_info)
             # else: mtime changed but content same (e.g., touch)
+
+    # A previously-indexed file that is now unindexable yields no FileInfo above
+    # even though the metadata scan still reports it (so it isn't in `deleted`).
+    # This happens when a notebook's code cells are removed or it becomes
+    # malformed, when a file is emptied, or when it becomes unreadable. Treat it
+    # as deleted so its now-stale chunks are removed from the index.
+    deleted.extend((potentially_modified | definitely_modified) - read_paths)
 
     return ChangeSet(added=added, modified=modified, deleted=deleted)
