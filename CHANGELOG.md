@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.0] - 2026-05-31
+
+### Added
+
+- **Embedding-dimension mismatch detection.** When an already-indexed codebase is searched or re-indexed and its collection's stored dense vectors were built with a different embedding dimension than the one now configured — e.g. `VECTOR_EMBEDDING_MODEL` was switched to a model with a different output size — indexing now fails fast with a clear, actionable error that points at `force_reindex`, instead of letting a cryptic Qdrant dimension error surface deep inside a search (or, for a same-dimension model swap, silently returning meaningless results). The guard runs whenever an existing collection is reused, so it covers `code_search`, `search_multiple`, and `search_changed` through their shared auto-index path. It is fail-open: when the expected dimension is unknown (auto-detection has not resolved it) or the stored dimension cannot be read, indexing proceeds untouched — only a definite mismatch is refused. `force_reindex` is unaffected, since it deletes and recreates the collection with the current model.
+
 ## [1.2.2] - 2026-05-31
 
 ### Added

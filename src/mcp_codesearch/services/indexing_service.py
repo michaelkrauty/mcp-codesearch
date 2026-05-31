@@ -33,6 +33,7 @@ from mcp_codesearch.indexer.discovery import (
 from mcp_codesearch.indexer.treesitter import Chunk
 from mcp_codesearch.settings import settings
 from mcp_codesearch.storage.qdrant import (
+    EmbeddingDimMismatchError,
     QdrantStorage,
     collection_name,
 )
@@ -153,6 +154,11 @@ class IndexingService:
                 files = list(discover_files(codebase_path))
                 return await self._full_index(col_name, files, abs_path)
             else:
+                # Reuse of an existing collection: make sure its stored vectors
+                # are still compatible with the current embedding model before
+                # we index into or search against it.
+                await self._verify_embedding_dim(col_name)
+
                 # Incremental index with fast change detection
                 indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
                 changes = detect_changes_fast(codebase_path, indexed_metadata)
@@ -161,6 +167,35 @@ class IndexingService:
                     return 0, 0, None
 
                 return await self._incremental_index(col_name, changes, abs_path)
+
+    async def _verify_embedding_dim(self, col_name: str) -> None:
+        """Refuse to reuse a collection whose dense vectors no longer match the
+        configured embedding dimension.
+
+        Detects the case where the embedding model was changed (to one with a
+        different output dimension) after a codebase was indexed. Continuing
+        would make Qdrant reject every upsert and dense query with a confusing
+        dimension error, so we fail fast with an actionable message instead.
+
+        The guard is deliberately query-agnostic: it gates *any* reuse of the
+        collection — incremental indexing and search alike — not only dense
+        queries. A dimension change leaves the whole collection unusable (new
+        points can't even be upserted into it), so steering the user to
+        ``force_reindex`` before any use is simpler and clearer than letting an
+        exact-only lookup limp along on a half-broken index.
+
+        Only a *definite* mismatch raises. This is a no-op when the expected
+        dimension is unknown (``embedding_dim`` is still 0 because auto-detection
+        has not resolved it) or when the stored dimension is absent from the
+        collection config (``get_dense_dim`` returns ``None``); a genuine Qdrant
+        read failure propagates to the caller's existing error handling.
+        """
+        expected = settings.embedding_dim
+        if not expected:
+            return
+        stored = await self._storage.get_dense_dim(col_name)
+        if stored is not None and stored != expected:
+            raise EmbeddingDimMismatchError(col_name, expected=expected, actual=stored)
 
     async def get_status(self, codebase_path: str) -> dict[str, Any]:
         """

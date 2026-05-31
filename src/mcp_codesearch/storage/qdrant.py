@@ -44,6 +44,28 @@ logger = logging.getLogger(__name__)
 COLLECTION_PREFIX = "codesearch"
 
 
+class EmbeddingDimMismatchError(Exception):
+    """Raised when an existing collection's stored vectors were indexed with a
+    different embedding dimension than the one currently configured.
+
+    Changing the embedding model so its output dimension differs makes a stored
+    index unusable: Qdrant rejects every query and upsert because the vector
+    sizes no longer match. Rather than surfacing that cryptic dimension error
+    deep inside a search, indexing refuses to touch the collection and points
+    the user at ``force_reindex`` to rebuild it with the current model.
+    """
+
+    def __init__(self, collection: str, expected: int, actual: int) -> None:
+        self.collection = collection
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"collection {collection!r} was indexed with {actual}-dimensional "
+            f"dense vectors, but the configured embedding model now produces "
+            f"{expected}-dimensional vectors"
+        )
+
+
 def collection_name(codebase_path: str) -> str:
     """
     Generate deterministic collection name from absolute path.
@@ -167,6 +189,25 @@ class QdrantStorage:
     async def list_collections(self) -> list[str]:
         """List all codesearch collections."""
         return await self._core.list_collections(prefix="codesearch_")
+
+    async def get_dense_dim(self, name: str) -> int | None:
+        """Return the dense-vector dimension recorded for an existing collection.
+
+        Reads the collection's stored vector configuration from Qdrant. Returns
+        ``None`` when the config has no named ``dense`` vector (for example a
+        collection created by some other tool), so a caller can treat that as
+        "cannot verify" rather than a mismatch. A genuine read failure (Qdrant
+        unreachable, collection vanished) is not masked here: it propagates and
+        is handled by the caller's existing Qdrant error handling.
+        """
+        client = await self._get_client()
+        info = await client.get_collection(name)
+        vectors = info.config.params.vectors
+        if isinstance(vectors, dict):
+            dense = vectors.get("dense")
+            if dense is not None:
+                return dense.size
+        return None
 
     # =========================================================================
     # Point ID Generation - Code-search-specific (string IDs)
