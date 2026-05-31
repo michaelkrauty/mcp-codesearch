@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.1] - 2026-05-30
+
+### Changed
+
+- Bumped the `vector-core` dependency to `v1.2.0`.
+
+### Fixed
+
+- Annotated `valid_results` in the incremental-reindex token fetch (`indexing_service.py`) so `mypy src` is clean again; the empty-list initializer was inferred too narrowly.
+
 ## [1.2.0] - 2026-05-30
 
 ### Added
