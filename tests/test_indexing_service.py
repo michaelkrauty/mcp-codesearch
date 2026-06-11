@@ -12,7 +12,12 @@ from mcp_codesearch import helpers
 from mcp_codesearch.indexer.discovery import FileInfo
 from mcp_codesearch.services import indexing_service as idx_svc
 from mcp_codesearch.services.indexing_service import IndexingService
-from mcp_codesearch.storage.qdrant import EmbeddingDimMismatchError, QdrantStorage
+from mcp_codesearch.storage import qdrant as storage_qdrant
+from mcp_codesearch.storage.qdrant import (
+    EmbeddingDimMismatchError,
+    EmbeddingModelMismatchError,
+    QdrantStorage,
+)
 
 
 def _make_file(name: str, content: str) -> FileInfo:
@@ -201,6 +206,7 @@ class TestIndexGuardBranch:
         service._storage.delete_collection = AsyncMock()
         service._storage.create_collection = AsyncMock()
         service._verify_embedding_dim = AsyncMock()
+        service._verify_embedding_model = AsyncMock()
         # discover_files returns nothing, so _full_index returns early.
         monkeypatch.setattr(idx_svc, "discover_files", lambda path: [])
 
@@ -214,6 +220,7 @@ class TestIndexGuardBranch:
         service._storage.collection_exists = AsyncMock(return_value=True)
         service._storage.get_indexed_files_metadata = AsyncMock(return_value={})
         service._verify_embedding_dim = AsyncMock()
+        service._verify_embedding_model = AsyncMock()
         # No changes detected -> index() returns after the guard runs.
         monkeypatch.setattr(
             idx_svc, "detect_changes_fast",
@@ -247,3 +254,195 @@ class TestAutoIndexDimMismatchSurface:
         assert (files, chunks, stats) == (0, 0, None)
         assert 'force_reindex(path="/home/user/proj")' in error
         assert "different embedding model" in error
+
+
+class TestVerifyEmbeddingModel:
+    """Reusing a collection recorded under a different embedding model is
+    refused even when dimensions match; unknown/legacy metadata never blocks."""
+
+    @staticmethod
+    def _service_with_metadata(monkeypatch, metadata, model="Qwen3-Embedding-8B", dim=4096):
+        service = _make_service()
+        monkeypatch.setattr(
+            idx_svc, "settings",
+            SimpleNamespace(embedding_model=model, embedding_dim=dim),
+        )
+        service._storage.get_metadata = AsyncMock(return_value=metadata)
+        service._storage.store_metadata = AsyncMock()
+        return service
+
+    async def test_raises_on_model_mismatch(self, monkeypatch):
+        service = self._service_with_metadata(
+            monkeypatch, {"codebase_path": "/proj", "embedding_model": "bge-large-en"}
+        )
+
+        with pytest.raises(EmbeddingModelMismatchError) as excinfo:
+            await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        err = excinfo.value
+        assert err.collection == "codesearch_abc"
+        assert err.expected == "Qwen3-Embedding-8B"
+        assert err.actual == "bge-large-en"
+        # The message names both models so the cause is obvious in a log.
+        assert "bge-large-en" in str(err) and "Qwen3-Embedding-8B" in str(err)
+        service._storage.store_metadata.assert_not_called()
+
+    async def test_passes_when_model_matches(self, monkeypatch):
+        service = self._service_with_metadata(
+            monkeypatch,
+            {"codebase_path": "/proj", "embedding_model": "Qwen3-Embedding-8B"},
+        )
+
+        await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_not_called()
+
+    async def test_skips_storage_when_no_model_configured(self, monkeypatch):
+        """An empty configured model (auto-detect setups) disables the guard."""
+        service = self._service_with_metadata(monkeypatch, None, model="")
+
+        await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        service._storage.get_metadata.assert_not_called()
+        service._storage.store_metadata.assert_not_called()
+
+    async def test_backfills_when_metadata_missing(self, monkeypatch):
+        """A collection with no metadata point gets stamped with the current model."""
+        service = self._service_with_metadata(monkeypatch, None)
+
+        await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_awaited_once_with("codesearch_abc", "/proj")
+
+    async def test_backfills_when_model_key_absent(self, monkeypatch):
+        """Metadata written before this guard exists lacks the model key."""
+        service = self._service_with_metadata(monkeypatch, {"codebase_path": "/proj"})
+
+        await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_awaited_once_with("codesearch_abc", "/proj")
+
+    async def test_backfill_skipped_while_dim_unresolved(self, monkeypatch):
+        """Metadata writes need a placeholder dense vector; don't stamp at dim 0."""
+        service = self._service_with_metadata(monkeypatch, None, dim=0)
+
+        await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_not_called()
+
+    async def test_non_string_stored_model_fails_open(self, monkeypatch):
+        """A JSON-coerced or foreign stored value is 'cannot verify', not a mismatch."""
+        service = self._service_with_metadata(
+            monkeypatch, {"codebase_path": "/proj", "embedding_model": 123}
+        )
+
+        await service._verify_embedding_model("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_not_called()
+
+
+class TestIndexBranchInvokesModelGuard:
+    """The model guard runs exactly on the reuse branch, like the dim guard."""
+
+    @staticmethod
+    def _ready_service(monkeypatch) -> IndexingService:
+        service = _make_service()
+        service._stale_locks_cleaned = True
+
+        @asynccontextmanager
+        async def _noop_lock(name):
+            yield
+
+        monkeypatch.setattr(idx_svc, "async_file_lock", _noop_lock)
+        return service
+
+    async def test_force_reindex_skips_model_guard(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.delete_collection = AsyncMock()
+        service._storage.create_collection = AsyncMock()
+        service._verify_embedding_dim = AsyncMock()
+        service._verify_embedding_model = AsyncMock()
+        monkeypatch.setattr(idx_svc, "discover_files", lambda path: [])
+
+        await service.index("/proj", force=True)
+
+        service._verify_embedding_model.assert_not_called()
+
+    async def test_existing_collection_invokes_model_guard(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.get_indexed_files_metadata = AsyncMock(return_value={})
+        service._verify_embedding_dim = AsyncMock()
+        service._verify_embedding_model = AsyncMock()
+        monkeypatch.setattr(
+            idx_svc, "detect_changes_fast",
+            lambda path, meta: SimpleNamespace(has_changes=False),
+        )
+
+        result = await service.index("/proj")
+
+        service._verify_embedding_model.assert_awaited_once()
+        # The guard receives the resolved absolute path for backfill stamping.
+        args = service._verify_embedding_model.await_args.args
+        assert args[1] == str(Path("/proj").resolve())
+        assert result == (0, 0, None)
+
+
+class TestAutoIndexModelMismatchSurface:
+    """auto_index turns a model mismatch into an actionable force_reindex message."""
+
+    async def test_maps_model_mismatch_to_force_reindex_hint(self, monkeypatch):
+        svc = MagicMock()
+        svc.index = AsyncMock(
+            side_effect=EmbeddingModelMismatchError(
+                "codesearch_abc",
+                expected="Qwen3-Embedding-8B",
+                actual="bge-large-en",
+            )
+        )
+
+        async def fake_get_indexing_service():
+            return svc
+
+        monkeypatch.setattr(helpers, "get_indexing_service", fake_get_indexing_service)
+
+        files, chunks, stats, error = await helpers.auto_index("/home/user/proj")
+
+        assert (files, chunks, stats) == (0, 0, None)
+        assert 'force_reindex(path="/home/user/proj")' in error
+        assert "different embedding model" in error
+        assert "meaningless" in error
+
+
+class TestStoreMetadataRecordsModel:
+    """The storage wrapper records the configured embedding model."""
+
+    @staticmethod
+    def _storage(monkeypatch, model):
+        storage = QdrantStorage(url="http://localhost:6333")
+        storage._core = MagicMock()
+        storage._core.store_metadata = AsyncMock()
+        monkeypatch.setattr(
+            storage_qdrant, "settings", SimpleNamespace(embedding_model=model)
+        )
+        return storage
+
+    async def test_records_model_when_configured(self, monkeypatch):
+        storage = self._storage(monkeypatch, "Qwen3-Embedding-8B")
+
+        await storage.store_metadata("codesearch_abc", "/proj")
+
+        storage._core.store_metadata.assert_awaited_once_with(
+            "codesearch_abc",
+            {"codebase_path": "/proj", "embedding_model": "Qwen3-Embedding-8B"},
+        )
+
+    async def test_omits_model_when_unconfigured(self, monkeypatch):
+        storage = self._storage(monkeypatch, "")
+
+        await storage.store_metadata("codesearch_abc", "/proj")
+
+        storage._core.store_metadata.assert_awaited_once_with(
+            "codesearch_abc", {"codebase_path": "/proj"}
+        )

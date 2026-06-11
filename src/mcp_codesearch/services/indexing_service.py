@@ -34,6 +34,7 @@ from mcp_codesearch.indexer.treesitter import Chunk
 from mcp_codesearch.settings import settings
 from mcp_codesearch.storage.qdrant import (
     EmbeddingDimMismatchError,
+    EmbeddingModelMismatchError,
     QdrantStorage,
     collection_name,
 )
@@ -158,6 +159,7 @@ class IndexingService:
                 # are still compatible with the current embedding model before
                 # we index into or search against it.
                 await self._verify_embedding_dim(col_name)
+                await self._verify_embedding_model(col_name, abs_path)
 
                 # Incremental index with fast change detection
                 indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
@@ -196,6 +198,45 @@ class IndexingService:
         stored = await self._storage.get_dense_dim(col_name)
         if stored is not None and stored != expected:
             raise EmbeddingDimMismatchError(col_name, expected=expected, actual=stored)
+
+    async def _verify_embedding_model(self, col_name: str, codebase_path: str) -> None:
+        """Refuse to reuse a collection whose vectors were embedded with a
+        different model, even when the output dimension matches.
+
+        The dimension guard above catches model swaps that change the vector
+        size. This guard catches the silent case — same dimension, different
+        model — where every Qdrant operation succeeds but query vectors and
+        stored vectors come from incompatible embedding spaces, so searches
+        quietly return meaningless results. The model name is recorded in
+        collection metadata at index time and compared on every reuse.
+
+        Fail-open by design, mirroring ``_verify_embedding_dim``: a missing
+        configured model, missing collection metadata, or a stored value that
+        is not a string (metadata predating this guard, or foreign collections)
+        never blocks. Only a definite name mismatch raises.
+
+        Collections indexed before the model was recorded are stamped with the
+        current model on first reuse (backfill). Their true model is
+        unknowable after the fact, and any subsequent incremental indexing
+        embeds new chunks with the current model anyway, so recording the
+        current model starts protection from now on without changing search
+        behavior. The stamp is skipped while ``embedding_dim`` is unresolved
+        because metadata writes need the dimension for their placeholder
+        vector. Note the stamp refreshes the metadata ``updated_at`` (reported
+        as ``last_updated`` by index_status) — a one-time cosmetic effect per
+        legacy collection.
+        """
+        expected = settings.embedding_model
+        if not expected:
+            return
+        metadata = await self._storage.get_metadata(col_name)
+        stored = metadata.get("embedding_model") if metadata else None
+        if stored is None:
+            if settings.embedding_dim:
+                await self._storage.store_metadata(col_name, codebase_path)
+            return
+        if isinstance(stored, str) and stored != expected:
+            raise EmbeddingModelMismatchError(col_name, expected=expected, actual=stored)
 
     async def get_status(self, codebase_path: str) -> dict[str, Any]:
         """
