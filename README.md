@@ -188,7 +188,7 @@ search_changed("config", since="3.days.ago")
 | `VECTOR_EMBEDDING_MODEL` | *(required)* | Embedding model name (e.g., `nomic-embed-text`, `text-embedding-3-small`) |
 | `VECTOR_EMBEDDING_DIM` | *(required)* | Vector dimension (must match your model, e.g., `768`, `1536`) |
 
-> **Changing the embedding model.** A codebase's index is tied to the embedding model it was built with. If you switch `VECTOR_EMBEDDING_MODEL` to a model with a different `VECTOR_EMBEDDING_DIM`, the stored vectors become unusable; the next search or index of that codebase fails fast with a clear error rather than a cryptic dimension mismatch from Qdrant. Run `force_reindex` on the affected codebase to rebuild it with the new model — each codebase is reindexed independently.
+> **Changing the embedding model.** A codebase's index is tied to the embedding model it was built with. If you switch `VECTOR_EMBEDDING_MODEL`, the next search or index of that codebase fails fast with a clear error pointing at `force_reindex`, instead of a cryptic Qdrant dimension error (different-dimension swap) or silently meaningless results from incompatible embedding spaces (same-dimension swap — the model name is recorded in each collection's metadata and checked on reuse). Run `force_reindex` on the affected codebase to rebuild it with the new model — each codebase is reindexed independently.
 
 Codesearch-specific settings (configured via environment variables with the `CODESEARCH_` prefix):
 

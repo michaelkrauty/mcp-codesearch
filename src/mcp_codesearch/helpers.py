@@ -11,7 +11,10 @@ from vector_core import EmbeddingServiceError
 from vector_core.storage.qdrant import QdrantConnectionError
 
 from mcp_codesearch.singletons import get_embedder, get_indexing_service
-from mcp_codesearch.storage.qdrant import EmbeddingDimMismatchError
+from mcp_codesearch.storage.qdrant import (
+    EmbeddingDimMismatchError,
+    EmbeddingModelMismatchError,
+)
 
 if TYPE_CHECKING:
     from mcp_codesearch.services.indexing_service import IndexingStats
@@ -156,6 +159,19 @@ async def auto_index(path: str) -> tuple[int, int, IndexingStats | None, str]:
 
 The stored vectors can no longer be searched with the current model, so indexing
 was skipped to avoid Qdrant errors and meaningless results. Rebuild this
+codebase's index with the current model:
+
+  force_reindex(path="{path}")
+
+Only this codebase's collection is affected; other indexed codebases are left as-is."""
+    except EmbeddingModelMismatchError as e:
+        return 0, 0, None, f"""Error: this codebase was indexed with a different embedding model.
+
+{e}.
+
+The stored vectors share the current model's dimension, so searches would appear
+to work — but query and stored vectors come from incompatible embedding spaces,
+and the results would be meaningless. Indexing was skipped instead. Rebuild this
 codebase's index with the current model:
 
   force_reindex(path="{path}")

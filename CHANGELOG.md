@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.0] - 2026-06-11
+
+### Added
+
+- **Embedding-model mismatch detection (same-dimension case).** v1.3.0 catches an embedding-model swap whose output dimension differs; this release closes the silent half: a swap to a *same-dimension* model passes the dimension check, every Qdrant operation succeeds, and searches quietly return meaningless results because query and stored vectors come from incompatible embedding spaces. The configured `VECTOR_EMBEDDING_MODEL` is now recorded in each collection's metadata at index time and compared whenever an existing collection is reused; a definite mismatch fails fast with a `force_reindex` hint, exactly like the dimension guard. The guard is fail-open: no configured model, missing metadata, or an unreadable stored value never blocks. Collections indexed before this release are stamped with the current model on first reuse, so protection begins immediately without reindexing (a one-time `last_updated` refresh per legacy collection is the only visible effect).
+
 ## [1.3.1] - 2026-06-11
 
 ### Changed

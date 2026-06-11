@@ -66,6 +66,28 @@ class EmbeddingDimMismatchError(Exception):
         )
 
 
+class EmbeddingModelMismatchError(Exception):
+    """Raised when an existing collection's metadata records a different
+    embedding model than the one currently configured.
+
+    This is the silent sibling of :class:`EmbeddingDimMismatchError`: a model
+    swap that keeps the same output dimension passes the dimension guard, and
+    every Qdrant upsert and query succeeds — but query vectors and stored
+    vectors come from incompatible embedding spaces, so search results are
+    quietly meaningless. The model name recorded in collection metadata lets
+    indexing refuse the reuse and point the user at ``force_reindex`` instead.
+    """
+
+    def __init__(self, collection: str, expected: str, actual: str) -> None:
+        self.collection = collection
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"collection {collection!r} was indexed with embedding model "
+            f"{actual!r}, but the configured embedding model is now {expected!r}"
+        )
+
+
 def collection_name(codebase_path: str) -> str:
     """
     Generate deterministic collection name from absolute path.
@@ -894,13 +916,17 @@ class QdrantStorage:
         collection: str,
         codebase_path: str,
     ) -> None:
-        """Store collection metadata."""
-        await self._core.store_metadata(
-            collection,
-            {
-                "codebase_path": codebase_path,
-            },
-        )
+        """Store collection metadata.
+
+        Records the configured embedding model alongside the codebase path so
+        a later model swap that keeps the same output dimension can still be
+        detected when the collection is reused. The model key is omitted when
+        no model is configured (auto-detect setups that leave it empty).
+        """
+        metadata: dict[str, Any] = {"codebase_path": codebase_path}
+        if settings.embedding_model:
+            metadata["embedding_model"] = settings.embedding_model
+        await self._core.store_metadata(collection, metadata)
 
     async def get_metadata(self, collection: str) -> dict[str, Any] | None:
         """Get collection metadata."""
