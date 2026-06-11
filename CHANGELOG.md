@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1] - 2026-06-11
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.1, a fix release (fact batch-read ordering, glossary `entry_hash` staleness, per-batch embedding progress callbacks, blank/duplicate glossary input validation). None of the fixed code paths are exercised by mcp-codesearch at runtime, so this is dependency hygiene with no behavior change for code search.
+
 ## [1.3.0] - 2026-05-31
 
 ### Added
