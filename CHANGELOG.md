@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.2] - 2026-06-12
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.3, which makes the glossary store's `update()` uniqueness check self-excluding: renaming an entry's term to a case variant of itself (e.g. "USAF" → "Usaf") or to one of its own aliases no longer fails with a spurious collision against the entry's own rows. mcp-codesearch does not expose glossary tools, so this is dependency hygiene with no behavior change for this server.
+
 ## [1.4.1] - 2026-06-12
 
 ### Changed
