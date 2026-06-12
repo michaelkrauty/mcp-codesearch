@@ -350,7 +350,7 @@ async def search_codebase(
     plan = _plan_query(query, parsed)
 
     # Adjust fetch limit based on filtering needs
-    if plan.name_filter or parsed.path_prefix or parsed.exclude_paths:
+    if plan.name_filter or parsed.path_prefix or parsed.exclude_paths or parsed.file_pattern:
         fetch_limit = limit * 10  # Need more candidates for filtering
     else:
         fetch_limit = limit * 2
