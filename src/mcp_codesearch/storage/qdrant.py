@@ -215,6 +215,10 @@ class QdrantStorage:
     async def delete_collection(self, name: str) -> None:
         """Delete collection."""
         await self._core.delete_collection(name)
+        # Qdrant drops payload indexes with the collection; forget the
+        # cached state so a same-process recreate (e.g. force_reindex)
+        # re-creates the text indexes instead of skipping them.
+        self._text_indexed_collections.discard(name)
 
     async def list_collections(self) -> list[str]:
         """List all codesearch collections."""

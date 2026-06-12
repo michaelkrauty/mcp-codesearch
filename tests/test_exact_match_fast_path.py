@@ -162,3 +162,16 @@ class TestEnsureTextIndexes:
         await storage.create_collection("newcol")
 
         assert storage._client_mock.create_payload_index.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_delete_collection_invalidates_index_cache(self, storage):
+        """A same-process delete + recreate must re-create the text indexes
+        (force_reindex path); Qdrant drops them with the collection."""
+        storage._core.create_collection = AsyncMock()
+        storage._core.delete_collection = AsyncMock()
+
+        await storage.create_collection("col")
+        await storage.delete_collection("col")
+        await storage.create_collection("col")
+
+        assert storage._client_mock.create_payload_index.call_count == 6
