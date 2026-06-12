@@ -542,6 +542,12 @@ async def search_changed(  # noqa: PLR0911
     """
     Search only in files that have changed since a given commit or time.
 
+    Note: this runs a normal ranked search over the whole codebase and
+    intersects the top-ranked candidates with the set of changed files.
+    A match inside a changed file that ranks below the candidate pool
+    (top limit*20, capped at 200) will not appear. A true filter pushdown
+    into the search layer is future work.
+
     Args:
         query: Natural language description of what you're looking for
         path: Root path of git repository (defaults to current directory)
@@ -645,6 +651,9 @@ async def search_changed(  # noqa: PLR0911
     embedder = await get_embedder()
     global_vocab = await get_global_vocab()
 
+    # Fetch a large candidate pool: results are post-filtered by changed
+    # paths, so matches ranking below this pool are invisible (see docstring).
+    candidate_pool = min(limit * 20, 200)
     try:
         results = await search_codebase(
             query=query,
@@ -653,7 +662,7 @@ async def search_changed(  # noqa: PLR0911
             embedder=embedder,
             global_vocab=global_vocab,
             mode="both",
-            limit=limit * 5,
+            limit=candidate_pool,
         )
     except EmbeddingServiceError as e:
         return (
@@ -666,9 +675,12 @@ async def search_changed(  # noqa: PLR0911
 
     if not filtered_results:
         return (
-            index_msg + f"No matches found in changed files "
-            f"(searched {len(changed_files)} changed files since '{since}').\n\n"
-            "Try broadening your query or checking a different time range."
+            index_msg + f"No matches for this query among the top "
+            f"{len(results)} search results within the {len(changed_files)} "
+            f"files changed since '{since}'.\n\n"
+            "A weaker match in a changed file may rank below this candidate "
+            "pool. Try a narrower query, a different time range, or "
+            "force_reindex if the index may be stale."
         )
 
     header = (

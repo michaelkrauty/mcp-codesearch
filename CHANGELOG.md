@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.1] - 2026-06-12
+
+### Fixed
+
+- Path boosting no longer clamps scores to 1.0, which had been collapsing exact-match relevance tiers (name=3.0, summary=2.0, content=1.0) into a tie. Previously the post-boost sort degraded to storage scroll order for exact results, so a `function:` query could truncate away the chunk literally named in the query in favor of incidental content matches, and test-path demotion had no effect on exact results. Tiers now survive boosting; score normalization to 0-1 still runs afterwards, so reported scores are unchanged in scale.
+- The `file:pattern` query syntax now actually filters results. It was parsed and stripped from the search text but never applied, so `code_search("connection pooling file:db.py")` silently searched the whole codebase. The pattern is matched case-insensitively against the filename component using glob semantics: `file:db.py` keeps `src/db.py` but drops `src/db_pool.py`, and `file:*.sql` works as expected. It composes with `path:` and `-path:` filters, and is now documented in the README.
+- `search_changed` is more honest and less likely to miss matches. It works by intersecting top-ranked whole-codebase results with the changed-file set; the candidate pool grew from `limit*5` to `limit*20` (capped at 200), the no-match message now states that nothing matched within the top-ranked candidates rather than claiming every changed file was searched, and the tool docstring documents the ranking-intersection limitation.
+
 ## [1.5.0] - 2026-06-12
 
 ### Added

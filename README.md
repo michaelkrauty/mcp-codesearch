@@ -54,7 +54,7 @@ claude mcp add codesearch -- mcp-codesearch
 - **Hybrid Search**: Dense embeddings + sparse TF-IDF with RRF fusion
 - **AST-Aware Chunking**: Tree-sitter extracts functions, classes, methods with context
 - **18 Languages with AST Support**: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, PHP, Swift, Kotlin, Scala, C#, SQL, JSON, YAML, TOML (line-based fallback for Bash, HTML, CSS, and other file types)
-- **Query Syntax**: `function:name`, `class:name`, `path:prefix`, `-path:exclude`
+- **Query Syntax**: `function:name`, `class:name`, `file:pattern`, `path:prefix`, `-path:exclude`
 - **Incremental Indexing**: Change detection via mtime+size before hashing
 - **Query Preprocessing**: Synonym expansion (`fn` → `function`, `db` → `database`)
 - **Flexible Ignores**: Nested `.gitignore`, `.git/info/exclude`, and `.codesearchignore` (gitignore syntax) honored at every directory level
@@ -101,6 +101,10 @@ code_search("cls:WebSocketClient")  # alias
 # Path filtering
 code_search("auth path:src/services")
 code_search("test -path:vendor -path:node_modules")
+
+# Filename filtering (glob, case-insensitive, matches filename only)
+code_search("connection pooling file:db.py")
+code_search("schema migration file:*.sql")
 
 # Struct search (Rust, C, Go)
 code_search("struct:Message")

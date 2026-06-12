@@ -114,6 +114,38 @@ class TestPathBoosting:
         test_result = next(r for r in boosted if "tests/" in r.path)
         assert src_result.score > test_result.score
 
+    def test_exact_match_tiers_survive_boost(self):
+        """Exact-match score tiers (name=3.0/summary=2.0/content=1.0) must not
+        be clamped into a tie; sort must order by tier, not arrival order."""
+        # Reverse arrival order: content tier first, name tier last
+        results = [
+            self._make_result("lib/content_hit.py", 1.0),
+            self._make_result("lib/summary_hit.py", 2.0),
+            self._make_result("lib/name_hit.py", 3.0),
+        ]
+        boosted = _apply_path_boost(results)
+
+        assert [r.path for r in boosted] == [
+            "lib/name_hit.py",
+            "lib/summary_hit.py",
+            "lib/content_hit.py",
+        ]
+        # Scores above 1.0 must be preserved (normalization happens later)
+        assert boosted[0].score > boosted[1].score > boosted[2].score
+        assert boosted[0].score > 1.0
+
+    def test_demoted_exact_name_match_outranks_boosted_content_match(self):
+        """A name-tier exact match in a demoted test path must still outrank
+        a content-tier match in a boosted src path."""
+        results = [
+            self._make_result("src/incidental.py", 1.0),  # content tier, boosted
+            self._make_result("tests/test_target.py", 3.0),  # name tier, demoted
+        ]
+        boosted = _apply_path_boost(results)
+
+        assert boosted[0].path == "tests/test_target.py"
+        assert boosted[0].score > boosted[1].score
+
 
 class TestScoreNormalization:
     """Tests for score normalization."""
@@ -251,6 +283,49 @@ class TestResultFiltering:
 
         assert len(filtered) == 1
         assert filtered[0].name == "handleRequest"
+
+    def test_file_pattern_exact_filename(self):
+        """file:db.py keeps src/db.py and drops src/db_pool.py."""
+        parsed = ParsedQuery(text="", file_pattern="db.py")
+        results = [
+            self._make_result("src/db.py"),
+            self._make_result("src/db_pool.py"),
+            self._make_result("src/other/db.py"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        assert [r.path for r in filtered] == ["src/db.py", "src/other/db.py"]
+
+    def test_file_pattern_glob(self):
+        """file:*.sql matches by glob against the filename component."""
+        parsed = ParsedQuery(text="", file_pattern="*.sql")
+        results = [
+            self._make_result("migrations/001_init.sql"),
+            self._make_result("src/db.py"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        assert len(filtered) == 1
+        assert filtered[0].path == "migrations/001_init.sql"
+
+    def test_file_pattern_case_insensitive(self):
+        parsed = ParsedQuery(text="", file_pattern="DB.PY")
+        results = [self._make_result("src/db.py")]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        assert len(filtered) == 1
+
+    def test_file_pattern_combined_with_path_prefix(self):
+        parsed = ParsedQuery(text="", file_pattern="*.py", path_prefix="src")
+        results = [
+            self._make_result("src/db.py"),
+            self._make_result("src/schema.sql"),
+            self._make_result("tests/test_db.py"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        assert len(filtered) == 1
+        assert filtered[0].path == "src/db.py"
 
 
 class TestResultMerging:
