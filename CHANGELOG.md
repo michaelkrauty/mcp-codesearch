@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.3] - 2026-06-12
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.4, which makes `FactStore.create()`/`update()` validate their inputs up front: blank subject/predicate/object/fact-type fields and out-of-range confidence values now raise `ValueError` before any database access. mcp-codesearch uses neither the facts store nor the glossary, so this is dependency hygiene with no behavior change for this server.
+
 ## [1.4.2] - 2026-06-12
 
 ### Changed
