@@ -187,9 +187,11 @@ class QdrantStorage:
             url=self.url,
             embedding_dim=settings.embedding_dim,
         )
-        # Collections whose full-text payload indexes were already ensured
-        # by this process (one creation attempt per collection per process).
+        # Collections whose full-text payload indexes were successfully
+        # ensured by this process, and those whose creation failed (one
+        # creation attempt per collection per process).
         self._text_indexed_collections: set[str] = set()
+        self._text_index_failed_collections: set[str] = set()
 
     async def _get_client(self) -> AsyncQdrantClient:
         """Get the underlying Qdrant client."""
@@ -219,6 +221,7 @@ class QdrantStorage:
         # cached state so a same-process recreate (e.g. force_reindex)
         # re-creates the text indexes instead of skipping them.
         self._text_indexed_collections.discard(name)
+        self._text_index_failed_collections.discard(name)
 
     async def list_collections(self) -> list[str]:
         """List all codesearch collections."""
@@ -775,20 +778,22 @@ class QdrantStorage:
     # matches nothing at all through MatchText).
     _TEXT_INDEX_MAX_TOKEN_LEN = 64
 
-    async def _ensure_text_indexes(self, collection: str) -> None:
+    async def _ensure_text_indexes(self, collection: str) -> bool:
         """Create full-text payload indexes for exact-match pre-filtering.
 
         Idempotent (Qdrant ignores creation of an already-existing index)
-        and attempted once per collection per process. Failure is
-        non-fatal: MatchText filtering stays correct without an index,
-        just unaccelerated, and exact_match_search's zero-result fallback
-        still guards completeness.
+        and attempted once per collection per process. Returns True only
+        when the indexes are known to exist with the documented
+        parameters. After a creation failure the fast path must not be
+        used at all: a partially-indexed or unindexed MatchText filter is
+        evaluated with Qdrant's default tokenization rather than the
+        parameters _text_prefilter_applicable assumes, and a partial
+        fast-path hit would suppress the exhaustive fallback.
         """
         if collection in self._text_indexed_collections:
-            return
-        # Mark before attempting so an unhealthy Qdrant isn't hammered on
-        # every search; the next process retries.
-        self._text_indexed_collections.add(collection)
+            return True
+        if collection in self._text_index_failed_collections:
+            return False
         params = TextIndexParams(
             type=TextIndexType.TEXT,
             tokenizer=TokenizerType.WORD,
@@ -806,7 +811,13 @@ class QdrantStorage:
                     wait=True,
                 )
         except Exception as e:
+            # Remember the failure so an unhealthy Qdrant isn't hammered
+            # on every search; the next process retries.
             logger.warning(f"Could not create text indexes on {collection}: {e}")
+            self._text_index_failed_collections.add(collection)
+            return False
+        self._text_indexed_collections.add(collection)
+        return True
 
     def _text_prefilter_applicable(self, query: str) -> bool:
         """Whether the MatchText fast path is safe for this query.
@@ -878,8 +889,9 @@ class QdrantStorage:
             logger.warning(f"Regex compilation failed for query '{query[:50]}': {e}")
             compiled_pattern = None  # Fall back to substring search
 
-        if self._text_prefilter_applicable(query):
-            await self._ensure_text_indexes(collection)
+        if self._text_prefilter_applicable(query) and await self._ensure_text_indexes(
+            collection
+        ):
             text_conditions = [
                 FieldCondition(key=field, match=MatchText(text=query))
                 for field in self._TEXT_INDEX_FIELDS

@@ -143,7 +143,10 @@ class TestEnsureTextIndexes:
         assert schema.lowercase is True
 
     @pytest.mark.asyncio
-    async def test_index_creation_failure_is_nonfatal(self, storage):
+    async def test_index_creation_failure_disables_fast_path(self, storage):
+        """A failed index build must route to the exhaustive scan: a
+        partially-indexed MatchText filter could return a non-empty
+        subset and wrongly suppress the fallback."""
         storage._client_mock.create_payload_index = AsyncMock(
             side_effect=RuntimeError("forbidden")
         )
@@ -154,6 +157,13 @@ class TestEnsureTextIndexes:
         results = await storage.exact_match_search("col", "foo")
 
         assert len(results) == 1  # search proceeded despite index failure
+        (flt,) = _scroll_filters(storage._client_mock)
+        assert not getattr(flt, "should", None)  # exhaustive, not fast path
+
+        # Second search: no creation retry, still exhaustive.
+        await storage.exact_match_search("col", "bar")
+        assert storage._client_mock.create_payload_index.call_count == 3
+        assert not any(getattr(f, "should", None) for f in _scroll_filters(storage._client_mock))
 
     @pytest.mark.asyncio
     async def test_create_collection_ensures_indexes(self, storage):
