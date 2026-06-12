@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 from enum import Enum, auto
@@ -115,6 +116,11 @@ def _apply_path_boost(results: list[SearchResult]) -> list[SearchResult]:
 
     Uses additive adjustments (not multiplicative) to prevent score inversion.
     Total adjustment is capped at PATH_BOOST_MAX in either direction.
+
+    Scores are NOT clamped to an upper bound here: exact-match search
+    deliberately produces tiered scores above 1.0 (name=3.0, summary=2.0,
+    content=1.0), and clamping would collapse those tiers into a tie before
+    the sort below. _normalize_scores maps everything to [0, 1] afterwards.
     """
     for result in results:
         path_lower = result.path.lower()
@@ -127,8 +133,8 @@ def _apply_path_boost(results: list[SearchResult]) -> list[SearchResult]:
         # Cap adjustment to prevent extreme score changes
         adjustment = max(-PATH_BOOST_MAX, min(PATH_BOOST_MAX, adjustment))
 
-        # Apply additive adjustment, clamping to valid [0, 1] range
-        result.score = max(0.0, min(1.0, result.score + adjustment))
+        # Apply additive adjustment, keeping scores non-negative
+        result.score = max(0.0, result.score + adjustment)
 
     # Re-sort by adjusted score
     return sorted(results, key=lambda r: r.score, reverse=True)
@@ -158,11 +164,19 @@ def _normalize_scores(results: list[SearchResult]) -> list[SearchResult]:
     return results
 
 
-def _filter_by_parsed_query(
+def _filter_by_parsed_query(  # noqa: PLR0912
     results: list[SearchResult],
     parsed: ParsedQuery,
 ) -> list[SearchResult]:
-    """Filter results based on parsed query constraints."""
+    """Filter results based on parsed query constraints.
+
+    Applies the following filters when present in the parsed query:
+    - path_prefix (path:X) - path component matching
+    - exclude_paths (-path:X) - path substring exclusion
+    - file_pattern (file:X) - filename glob matching (case-insensitive)
+    - function_name/class_name (fn:X / class:X) - chunk name matching
+    - scope (scope:X) - chunk type filtering
+    """
     filtered = results
 
     # Filter by path prefix (matches path components anywhere in the path)
@@ -209,6 +223,16 @@ def _filter_by_parsed_query(
             exclude_re = parsed.get_exclude_paths_regex()
             if exclude_re:
                 filtered = [r for r in filtered if not exclude_re.search(r.path)]
+
+    # Filter by filename pattern (file:db.py, file:*.sql)
+    # Matches the filename component only, case-insensitive.
+    # Patterns without wildcards match the filename exactly (fnmatch semantics).
+    if parsed.file_pattern:
+        pattern = parsed.file_pattern.lower()
+        filtered = [
+            r for r in filtered
+            if fnmatch.fnmatch(r.path.rsplit('/', 1)[-1].lower(), pattern)
+        ]
 
     # Filter by function/class name - strict filtering, not just boosting
     if parsed.function_name:
