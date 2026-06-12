@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.2] - 2026-06-12
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.5. `QdrantStorage.get_metadata` now only JSON-deserializes dict-shaped strings, symmetric with `store_metadata` which only serializes dicts. This improves the precision of mcp-codesearch's embedding-model guard: stored model names that happen to look like non-dict JSON (e.g. `"123"`) now round-trip as strings and are actually compared, instead of deserializing to a non-string and failing open (silently skipping the check).
+
 ## [1.5.1] - 2026-06-12
 
 ### Fixed

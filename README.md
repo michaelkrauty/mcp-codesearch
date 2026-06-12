@@ -14,7 +14,7 @@ MCP server for semantic code search with AST-aware chunking, hybrid vectors, and
 Requires [vector-core](https://github.com/michaelkrauty/vector-core).
 
 ```bash
-pip install git+https://github.com/michaelkrauty/vector-core.git@v1.2.4
+pip install git+https://github.com/michaelkrauty/vector-core.git@v1.2.5
 pip install git+https://github.com/michaelkrauty/mcp-codesearch.git
 ```
 
