@@ -160,9 +160,10 @@ class TestEnsureTextIndexes:
         (flt,) = _scroll_filters(storage._client_mock)
         assert not getattr(flt, "should", None)  # exhaustive, not fast path
 
-        # Second search: no creation retry, still exhaustive.
+        # Second search: no creation retry (the loop aborted on the first
+        # field's failure, so exactly one attempt was made), still exhaustive.
         await storage.exact_match_search("col", "bar")
-        assert storage._client_mock.create_payload_index.call_count == 3
+        assert storage._client_mock.create_payload_index.call_count == 1
         assert not any(getattr(f, "should", None) for f in _scroll_filters(storage._client_mock))
 
     @pytest.mark.asyncio
