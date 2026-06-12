@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.1] - 2026-06-12
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.2, which makes glossary store `create()`/`update()` atomic: alias validation (cross-entry collisions and case-normalized intra-list duplicates) now runs before any row is written, with a rollback-on-error backstop. mcp-codesearch does not expose glossary tools, so this is dependency hygiene with no behavior change for this server.
+
 ## [1.4.0] - 2026-06-11
 
 ### Added
