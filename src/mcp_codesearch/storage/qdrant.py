@@ -20,8 +20,12 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     FieldCondition,
     Filter,
+    MatchText,
     MatchValue,
     PointStruct,
+    TextIndexParams,
+    TextIndexType,
+    TokenizerType,
 )
 from qdrant_client.models import (
     SparseVector as QdrantSparseVector,
@@ -183,6 +187,11 @@ class QdrantStorage:
             url=self.url,
             embedding_dim=settings.embedding_dim,
         )
+        # Collections whose full-text payload indexes were successfully
+        # ensured by this process, and those whose creation failed (one
+        # creation attempt per collection per process).
+        self._text_indexed_collections: set[str] = set()
+        self._text_index_failed_collections: set[str] = set()
 
     async def _get_client(self) -> AsyncQdrantClient:
         """Get the underlying Qdrant client."""
@@ -201,12 +210,18 @@ class QdrantStorage:
         return await self._core.collection_exists(name)
 
     async def create_collection(self, name: str) -> None:
-        """Create collection with hybrid vector config."""
+        """Create collection with hybrid vector config and text indexes."""
         await self._core.create_collection(name, dense_dim=settings.embedding_dim)
+        await self._ensure_text_indexes(name)
 
     async def delete_collection(self, name: str) -> None:
         """Delete collection."""
         await self._core.delete_collection(name)
+        # Qdrant drops payload indexes with the collection; forget the
+        # cached state so a same-process recreate (e.g. force_reindex)
+        # re-creates the text indexes instead of skipping them.
+        self._text_indexed_collections.discard(name)
+        self._text_index_failed_collections.discard(name)
 
     async def list_collections(self) -> list[str]:
         """List all codesearch collections."""
@@ -752,7 +767,77 @@ class QdrantStorage:
         "chunk_type", "start_line", "end_line", "line_count",
     ]
 
-    async def exact_match_search(  # noqa: PLR0912, PLR0915
+    # Fields covered by the full-text payload indexes that pre-filter
+    # exact-match scans; must stay in sync with the fields scanned in
+    # _exact_match_scan.
+    _TEXT_INDEX_FIELDS = ("content", "name", "summary")
+
+    # Mirrors TextIndexParams.max_token_len on the indexes below: longer
+    # tokens are never indexed, so a query containing a longer word must
+    # skip the indexed fast path (verified against Qdrant: such a query
+    # matches nothing at all through MatchText).
+    _TEXT_INDEX_MAX_TOKEN_LEN = 64
+
+    async def _ensure_text_indexes(self, collection: str) -> bool:
+        """Create full-text payload indexes for exact-match pre-filtering.
+
+        Idempotent (Qdrant ignores creation of an already-existing index)
+        and attempted once per collection per process. Returns True only
+        when the indexes are known to exist with the documented
+        parameters. After a creation failure the fast path must not be
+        used at all: a partially-indexed or unindexed MatchText filter is
+        evaluated with Qdrant's default tokenization rather than the
+        parameters _text_prefilter_applicable assumes, and a partial
+        fast-path hit would suppress the exhaustive fallback.
+        """
+        if collection in self._text_indexed_collections:
+            return True
+        if collection in self._text_index_failed_collections:
+            return False
+        params = TextIndexParams(
+            type=TextIndexType.TEXT,
+            tokenizer=TokenizerType.WORD,
+            lowercase=True,
+            min_token_len=1,
+            max_token_len=self._TEXT_INDEX_MAX_TOKEN_LEN,
+        )
+        try:
+            client = await self._get_client()
+            for field in self._TEXT_INDEX_FIELDS:
+                await client.create_payload_index(
+                    collection_name=collection,
+                    field_name=field,
+                    field_schema=params,
+                    wait=True,
+                )
+        except Exception as e:
+            # Remember the failure so an unhealthy Qdrant isn't hammered
+            # on every search; the next process retries.
+            logger.warning(f"Could not create text indexes on {collection}: {e}")
+            self._text_index_failed_collections.add(collection)
+            return False
+        self._text_indexed_collections.add(collection)
+        return True
+
+    def _text_prefilter_applicable(self, query: str) -> bool:
+        """Whether the MatchText fast path is safe for this query.
+
+        The pre-filter must never drop a point the regex scan would
+        accept. Two query shapes cannot honor that: one with no
+        alphanumeric content produces no MatchText tokens at all, and one
+        containing a word longer than max_token_len queries a token that
+        was never indexed. Whitespace-delimited word length bounds any
+        tokenizer's token length from above, so this check is
+        conservative: it may skip the fast path unnecessarily, never the
+        reverse.
+        """
+        if not any(c.isalnum() for c in query):
+            return False
+        return all(
+            len(word) <= self._TEXT_INDEX_MAX_TOKEN_LEN for word in query.split()
+        )
+
+    async def exact_match_search(
         self,
         collection: str,
         query: str,
@@ -763,8 +848,18 @@ class QdrantStorage:
         """
         Fallback exact substring search for when semantic search fails.
 
-        Scans stored content/summary fields for substring matches.
-        This is slower than vector search but catches exact matches.
+        Scans stored content/name/summary fields for word-boundary
+        matches. For eligible queries (see _text_prefilter_applicable) a
+        Qdrant MatchText pre-filter narrows the scroll to points that
+        contain every query token, and the regex scoring runs only on
+        those candidates: a word-boundary regex hit implies the literal
+        query's own tokens are present, so the pre-filter cannot drop
+        regex matches, while MatchText's anywhere-in-field token matching
+        only adds candidates the regex then rejects. If the fast path
+        yields nothing, the exhaustive scan runs as a safety net — which
+        also preserves the substring fallback for oversized fields (see
+        _safe_regex_search inside _exact_match_scan), the one case the
+        pre-filter cannot see.
         """
         client = await self._get_client()
         query_lower = query.lower()
@@ -786,14 +881,6 @@ class QdrantStorage:
 
         query_filter = Filter(must=filter_conditions) if filter_conditions else None  # type: ignore[arg-type]
 
-        results: list[SearchResult] = []
-        offset = None
-        high_quality_count = 0  # Track high-quality matches for early termination
-
-        # Early termination thresholds
-        _EARLY_TERMINATION_THRESHOLD = 10
-        _HIGH_QUALITY_SCORE = 2.5  # Name match (3.0) or summary match (2.0)
-
         # Pre-compile regex pattern outside loop with IGNORECASE (15-25% faster fallback search)
         # Using IGNORECASE avoids .lower() calls on each field
         try:
@@ -801,6 +888,57 @@ class QdrantStorage:
         except re.error as e:
             logger.warning(f"Regex compilation failed for query '{query[:50]}': {e}")
             compiled_pattern = None  # Fall back to substring search
+
+        if self._text_prefilter_applicable(query) and await self._ensure_text_indexes(
+            collection
+        ):
+            text_conditions = [
+                FieldCondition(key=field, match=MatchText(text=query))
+                for field in self._TEXT_INDEX_FIELDS
+            ]
+            fast_filter = Filter(must=filter_conditions, should=text_conditions)  # type: ignore[arg-type]
+            try:
+                results = await self._exact_match_scan(
+                    client, collection, fast_filter,
+                    compiled_pattern, query_lower, query, limit,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Full-text pre-filtered scan failed for {collection}; "
+                    f"falling back to exhaustive scan: {e}"
+                )
+                results = []
+            if results:
+                return results
+
+        return await self._exact_match_scan(
+            client, collection, query_filter,
+            compiled_pattern, query_lower, query, limit,
+        )
+
+    async def _exact_match_scan(  # noqa: PLR0912, PLR0915
+        self,
+        client: AsyncQdrantClient,
+        collection: str,
+        scroll_filter: Filter | None,
+        compiled_pattern: re.Pattern[str] | None,
+        query_lower: str,
+        query: str,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Scroll the collection and score word-boundary matches.
+
+        Matching and scoring are independent of how scroll_filter was
+        built, so the pre-filtered fast path and the exhaustive fallback
+        share this loop unchanged.
+        """
+        results: list[SearchResult] = []
+        offset = None
+        high_quality_count = 0  # Track high-quality matches for early termination
+
+        # Early termination thresholds
+        _EARLY_TERMINATION_THRESHOLD = 10
+        _HIGH_QUALITY_SCORE = 2.5  # Name match (3.0) or summary match (2.0)
 
         def _safe_regex_search(
             compiled: re.Pattern[str] | None,
@@ -829,7 +967,7 @@ class QdrantStorage:
                 break
             points, offset = await client.scroll(
                 collection,
-                scroll_filter=query_filter,
+                scroll_filter=scroll_filter,
                 limit=1000,  # Increased from 200 for 25-40% faster fallback
                 offset=offset,
                 with_payload=self._EXACT_MATCH_PAYLOAD_FIELDS,

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0] - 2026-06-12
+
+### Added
+
+- Exact-match search now uses Qdrant full-text payload indexes (`content`, `name`, `summary`) as a server-side pre-filter, replacing the previous scan of every point in the collection with a scan of only the points containing the query's tokens. Word-boundary matching semantics and field-based scoring are unchanged: a regex hit implies the query's own tokens are present, so the pre-filter cannot drop matches, and the token-anywhere candidates it adds are still rejected by the regex. Queries the index cannot serve safely (no alphanumeric content, or a word longer than the indexed token limit) skip the fast path, and a fast path that finds nothing falls back to the exhaustive scan. One deliberate precision improvement: fields over the regex size cutoff are matched by plain substring in the exhaustive scan, which can surface mid-token hits (`handle_request` inside `xhandle_requestx`) that contradict the word-boundary contract; the pre-filter does not produce these, so such false positives no longer appear alongside genuine word-boundary matches. They still appear, unchanged, when the fast path finds nothing and the exhaustive scan runs. True word-boundary occurrences in oversized fields tokenize at their boundaries and are therefore always visible to the pre-filter.
+- Text indexes are created automatically on new collections and added lazily (idempotently) to existing collections on their first exact-match search. Index creation is additive and reversible: it never modifies points, and a failure merely leaves the search unaccelerated.
+
 ## [1.4.3] - 2026-06-12
 
 ### Changed
