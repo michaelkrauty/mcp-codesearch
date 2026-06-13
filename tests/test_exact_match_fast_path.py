@@ -232,3 +232,39 @@ class TestExactMatchRanking:
         results = await storage.exact_match_search("col", "foo", mode="chunk", limit=2)
 
         assert len(results) == 2
+
+
+class TestExactMatchRankFalse:
+    """rank=False keeps scroll order so callers that discard the top score
+    tier (find_references drops the name-equal definition) still see the
+    lower-tier matches they want, instead of a pool ranked to all-definitions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rank_false_preserves_scroll_order(self, storage):
+        # Content references scroll first, definitions (name matches) after.
+        pts = [_point(i, content="calls foo()") for i in range(1, 4)]
+        pts += [_point(50 + i, name="foo") for i in range(1, 6)]
+        storage._client_mock.scroll = AsyncMock(return_value=(pts, None))
+
+        results = await storage.exact_match_search(
+            "col", "foo", mode="chunk", limit=3, rank=False
+        )
+
+        # First three in scroll order — the content references, NOT the
+        # higher-scored definitions that scroll later.
+        assert [r.score for r in results] == [1.0, 1.0, 1.0]
+
+    @pytest.mark.asyncio
+    async def test_rank_false_does_not_starve_references(self, storage):
+        # Mirrors find_references: a flood of same-named definitions plus a few
+        # references. rank=False must still surface references for the caller.
+        refs = [_point(i, content="uses foo here") for i in range(1, 4)]
+        defs = [_point(100 + i, name="foo") for i in range(60)]
+        storage._client_mock.scroll = AsyncMock(return_value=(refs + defs, None))
+
+        results = await storage.exact_match_search(
+            "col", "foo", mode="chunk", limit=9, rank=False
+        )
+        content_refs = [r for r in results if r.score == 1.0]
+        assert len(content_refs) == 3  # all references present, not ranked away
