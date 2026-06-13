@@ -714,12 +714,27 @@ async def search_changed(  # noqa: PLR0911
     filtered_results = [r for r in results if r.path in changed_files][:limit]
 
     if not filtered_results:
-        if use_pushdown:
+        # The definitive "no matches exist" claim is only justified when
+        # retrieval was constrained to the changed files AND nothing was
+        # post-filtered afterwards; structured query filters still discard
+        # candidates from a bounded pool, so they keep the hedged wording.
+        if use_pushdown and not has_post_filters:
             return (
                 index_msg + f"No matches for this query in the "
                 f"{len(changed_files)} files changed since '{since}'.\n\n"
                 "Try a broader query, a different time range, or "
                 "force_reindex if the index may be stale."
+            )
+        if use_pushdown:
+            return (
+                index_msg + f"No matches for this query among the top "
+                f"{len(results)} search results within the "
+                f"{len(changed_files)} files changed since '{since}'.\n\n"
+                "The query's structured filters (path:/-path:/file:/fn:/"
+                "class:/scope:) are applied to a bounded candidate pool, so "
+                "a weaker match in a changed file may rank below it. Try a "
+                "narrower query, a different time range, or force_reindex "
+                "if the index may be stale."
             )
         return (
             index_msg + f"No matches for this query among the top "
