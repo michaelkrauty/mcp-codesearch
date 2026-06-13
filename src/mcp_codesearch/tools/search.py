@@ -32,6 +32,7 @@ from mcp_codesearch.helpers import (
     to_abs_path,
     validate_git_since,
 )
+from mcp_codesearch.search.preprocess import parse_query
 from mcp_codesearch.search.query import format_results, search_codebase
 from mcp_codesearch.services import SearchQuery
 from mcp_codesearch.singletons import (
@@ -667,10 +668,25 @@ async def search_changed(  # noqa: PLR0911
     # _MAX_PUSHDOWN_PATHS the filter payload would get unwieldy, so fall
     # back to post-filtering a large candidate pool (the pre-pushdown
     # behavior, where matches below the pool are invisible).
+    #
+    # The modest pool is only safe when nothing else is post-filtered: a
+    # query carrying its own structured constraints (path:/-path:/file:/
+    # fn:/class:/scope:) still discards candidates after retrieval, so it
+    # keeps the large pool — the pushdown then makes that pool strictly
+    # more effective, never smaller, than before.
     _MAX_PUSHDOWN_PATHS = 500
+    parsed = parse_query(query)
+    has_post_filters = bool(
+        parsed.path_prefix
+        or parsed.exclude_paths
+        or parsed.file_pattern
+        or parsed.function_name
+        or parsed.class_name
+        or parsed.scope
+    )
     use_pushdown = len(changed_files) <= _MAX_PUSHDOWN_PATHS
     if use_pushdown:
-        candidate_pool = limit * 2
+        candidate_pool = min(limit * 20, 200) if has_post_filters else limit * 2
         restrict_paths = sorted(changed_files)
     else:
         candidate_pool = min(limit * 20, 200)
