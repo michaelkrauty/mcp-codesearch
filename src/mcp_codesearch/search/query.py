@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
@@ -279,6 +280,22 @@ def _filter_by_parsed_query(  # noqa: PLR0912
     return filtered
 
 
+def _file_pattern_predicate(pattern: str) -> Callable[[str], bool]:
+    """Precise file: semantics as a path predicate.
+
+    Matches the filename component against the pattern, case-insensitively
+    — the same rule _filter_by_parsed_query applies after retrieval. Used
+    inside the exact-match scan so its result limit and early termination
+    only ever count true filename matches.
+    """
+    pattern_lower = pattern.lower()
+
+    def predicate(path: str) -> bool:
+        return fnmatch.fnmatch(path.rsplit("/", 1)[-1].lower(), pattern_lower)
+
+    return predicate
+
+
 def _merge_results(
     primary: list[SearchResult],
     secondary: list[SearchResult],
@@ -378,10 +395,20 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
     # prefilter would drop both. They keep post-filtering over the widened
     # candidate pool instead.
     path_text_tokens: list[str] | None = None
+    file_predicate: Callable[[str], bool] | None = None
     if parsed.file_pattern:
         tokens = file_pattern_pushdown_tokens(parsed.file_pattern)
         if tokens and await storage._ensure_text_indexes(col_name):
             path_text_tokens = tokens
+
+        # Precise fnmatch constraint for the exact-match scan. The token
+        # pushdown above is only a superset prefilter, so within the
+        # constrained candidate set token-level false positives (init hits
+        # in db_pool.py while searching file:db.py) could still consume the
+        # scan's result limit or trip its early termination before the true
+        # match is reached. The predicate is applied inside the scan before
+        # any match counting, independent of whether the token pushdown ran.
+        file_predicate = _file_pattern_predicate(parsed.file_pattern)
 
     async def _retrieve(path_tokens: list[str] | None) -> list[SearchResult]:
         """Run the planned retrieval with the given path-token pushdown."""
@@ -397,6 +424,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 limit=fetch_limit,
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
+                path_predicate=file_predicate,
             )
 
         elif plan.query_type == QueryType.EXACT_PHRASE:
@@ -409,6 +437,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 limit=fetch_limit,
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
+                path_predicate=file_predicate,
             )
 
         elif plan.query_type == QueryType.NAME_SEMANTIC:
@@ -422,6 +451,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 limit=limit * 2,
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
+                path_predicate=file_predicate,
             )
 
             # 2. Semantic search for context (with graceful degradation)
@@ -505,6 +535,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
                     path_text_tokens=path_tokens,
+                    path_predicate=file_predicate,
                 )
                 if exact_results:
                     # Merge: exact matches first

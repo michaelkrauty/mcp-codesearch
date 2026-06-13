@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal
@@ -898,6 +899,7 @@ class QdrantStorage:
         limit: int = 10,
         restrict_paths: list[str] | None = None,
         path_text_tokens: list[str] | None = None,
+        path_predicate: Callable[[str], bool] | None = None,
     ) -> list[SearchResult]:
         """
         Fallback exact substring search for when semantic search fails.
@@ -923,6 +925,14 @@ class QdrantStorage:
         in OTHER files could exhaust the scan budget before the
         constrained file was ever reached, and the post-filter would then
         return nothing despite a real match existing in the index.
+
+        path_predicate carries the caller's PRECISE path constraint (e.g.
+        the fnmatch semantics of a file: pattern, which path_text_tokens
+        only approximates as a superset). Points failing it are skipped
+        before they can count toward the result limit or the early
+        termination threshold, so token-level false positives (init hits
+        in db_pool.py while searching file:db.py) cannot exhaust the scan
+        budget either.
         """
         client = await self._get_client()
         query_lower = query.lower()
@@ -967,6 +977,7 @@ class QdrantStorage:
                 results = await self._exact_match_scan(
                     client, collection, fast_filter,
                     compiled_pattern, query_lower, query, limit,
+                    path_predicate=path_predicate,
                 )
             except Exception as e:
                 logger.warning(
@@ -980,6 +991,7 @@ class QdrantStorage:
         return await self._exact_match_scan(
             client, collection, query_filter,
             compiled_pattern, query_lower, query, limit,
+            path_predicate=path_predicate,
         )
 
     async def _exact_match_scan(  # noqa: PLR0912, PLR0915
@@ -991,12 +1003,15 @@ class QdrantStorage:
         query_lower: str,
         query: str,
         limit: int,
+        path_predicate: Callable[[str], bool] | None = None,
     ) -> list[SearchResult]:
         """Scroll the collection and score word-boundary matches.
 
         Matching and scoring are independent of how scroll_filter was
         built, so the pre-filtered fast path and the exhaustive fallback
-        share this loop unchanged.
+        share this loop unchanged. Points whose path fails path_predicate
+        are skipped before they can count toward the limit or the early
+        termination threshold (see exact_match_search).
         """
         results: list[SearchResult] = []
         offset = None
@@ -1045,6 +1060,14 @@ class QdrantStorage:
 
                 # Skip metadata point
                 if point_type == "__metadata__":
+                    continue
+
+                # Precise path constraint: skip before any match counting
+                # so path false positives cannot consume the result limit
+                # or trip early termination.
+                if path_predicate is not None and not path_predicate(
+                    str(p.get("path") or "")
+                ):
                     continue
 
                 # Check for word boundary match in searchable fields

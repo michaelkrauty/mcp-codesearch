@@ -276,7 +276,9 @@ class TestIssue25EndToEnd:
     @pytest.mark.asyncio
     async def test_pushdown_skipped_when_index_creation_fails(self, storage):
         """No text index => MatchText on path is untrusted and must not be
-        sent; the query falls back to post-filtering only."""
+        sent. The precise in-scan file predicate (which needs no index)
+        still keeps the scan budget from being burned on other files, so
+        the match is found anyway."""
         storage._client_mock.create_payload_index = AsyncMock(
             side_effect=RuntimeError("forbidden")
         )
@@ -290,13 +292,43 @@ class TestIssue25EndToEnd:
             global_vocab=MagicMock(),
         )
 
-        # Without the index gate the pushdown cannot run; with the budget
-        # exhausted by other files the post-filter finds nothing. The point
-        # of this test is the absence of MatchText, not the empty result.
-        assert results == []
+        assert [r.path for r in results] == ["src/db.py"]
         for flt in _scroll_filters(storage._client_mock):
             if flt is not None:
                 assert "MatchText" not in _path_conditions(flt)
+
+
+class TestTokenFalsePositivesInsideConstrainedSet:
+    """The token pushdown is a superset prefilter: db_pool.py contains the
+    tokens of file:db.py. Within that constrained set, false-positive hits
+    must not consume the exact scan's limit or early termination before
+    the true filename match — the precise predicate runs inside the scan."""
+
+    @pytest.mark.asyncio
+    async def test_db_pool_hits_do_not_starve_db_py(self, storage):
+        # Page 1: 1000 points in db_pool.py (path tokens: src, db, pool, py
+        # — a token-level match for "db py"), 12 of them named "init",
+        # enough to trip early termination. db.py only appears on page 2.
+        points = [
+            _point(i, path="src/db_pool.py",
+                   name="init" if i < 12 else "",
+                   content="def init(): pass" if i < 12 else "x")
+            for i in range(1000)
+        ]
+        points.append(
+            _point(1000, path="src/db.py", name="init", content="def init(): pass")
+        )
+        storage._client_mock.scroll = _filtering_scroll(points)
+
+        results = await search_codebase(
+            query="fn:init file:db.py",
+            codebase_path="/tmp",
+            storage=storage,
+            embedder=MagicMock(),
+            global_vocab=MagicMock(),
+        )
+
+        assert [r.path for r in results] == ["src/db.py"]
 
 
 class TestZeroResultFallback:
