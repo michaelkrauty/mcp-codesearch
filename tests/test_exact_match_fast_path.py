@@ -117,7 +117,7 @@ class TestFastPathWiring:
 
 class TestEnsureTextIndexes:
     @pytest.mark.asyncio
-    async def test_creates_three_indexes_once_per_collection(self, storage):
+    async def test_creates_four_indexes_once_per_collection(self, storage):
         storage._client_mock.scroll = AsyncMock(return_value=([], None))
 
         await storage.exact_match_search("col", "foo")
@@ -127,8 +127,8 @@ class TestEnsureTextIndexes:
             c.kwargs["field_name"]
             for c in storage._client_mock.create_payload_index.call_args_list
         }
-        assert created == {"content", "name", "summary"}
-        assert storage._client_mock.create_payload_index.call_count == 3
+        assert created == {"content", "name", "summary", "path"}
+        assert storage._client_mock.create_payload_index.call_count == 4
 
     @pytest.mark.asyncio
     async def test_index_params_pin_the_documented_contract(self, storage):
@@ -172,7 +172,7 @@ class TestEnsureTextIndexes:
 
         await storage.create_collection("newcol")
 
-        assert storage._client_mock.create_payload_index.call_count == 3
+        assert storage._client_mock.create_payload_index.call_count == 4
 
     @pytest.mark.asyncio
     async def test_delete_collection_invalidates_index_cache(self, storage):
@@ -185,4 +185,4 @@ class TestEnsureTextIndexes:
         await storage.delete_collection("col")
         await storage.create_collection("col")
 
-        assert storage._client_mock.create_payload_index.call_count == 6
+        assert storage._client_mock.create_payload_index.call_count == 8

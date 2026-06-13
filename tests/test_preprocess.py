@@ -1,10 +1,13 @@
 """Tests for query preprocessing."""
 
 from mcp_codesearch.search.preprocess import (
+    _MAX_INDEXED_TOKEN_LEN,
     expand_camelcase,
+    file_pattern_pushdown_tokens,
     infer_language,
     preprocess_query,
 )
+from mcp_codesearch.storage.qdrant import QdrantStorage
 
 
 class TestCamelCaseExpansion:
@@ -196,3 +199,73 @@ class TestParseQueryEdgeCases:
         result = parse_query("authentication docs:")
 
         assert "docs:" in result.text or "authentication" in result.text
+
+
+class TestFilePatternPushdownTokens:
+    """file_pattern_pushdown_tokens must only emit tokens GUARANTEED to
+    appear as whole path tokens in every match — a superset prefilter.
+    Dropping a token is always safe (widens the superset); emitting an
+    unguaranteed token is never safe (could exclude a true match)."""
+
+    def test_prefix_glob(self):
+        assert file_pattern_pushdown_tokens("test_*.py") == ["test", "py"]
+
+    def test_extension_glob(self):
+        assert file_pattern_pushdown_tokens("*.sql") == ["sql"]
+
+    def test_exact_filename(self):
+        assert file_pattern_pushdown_tokens("db.py") == ["db", "py"]
+
+    def test_wildcard_adjacent_runs_dropped(self):
+        # "test" touches '*' on both sides: a match like "mytest_helper.py"
+        # would not contain "test" as a whole token.
+        assert file_pattern_pushdown_tokens("*test*") is None
+
+    def test_bare_star(self):
+        assert file_pattern_pushdown_tokens("*") is None
+
+    def test_question_mark_is_wildcard(self):
+        assert file_pattern_pushdown_tokens("?.py") == ["py"]
+
+    def test_character_class_is_wildcard(self):
+        # The "est" run is adjacent to the [td] class and must be dropped.
+        assert file_pattern_pushdown_tokens("[td]est_*.py") == ["py"]
+
+    def test_lowercased(self):
+        assert file_pattern_pushdown_tokens("TEST_*.PY") == ["test", "py"]
+
+    def test_oversized_token_dropped(self):
+        # 65-char alnum run with clean boundaries: never indexed, so
+        # including it would make MatchText match NOTHING (fail-closed trap).
+        long_run = "a" * 65
+        assert file_pattern_pushdown_tokens(f"{long_run}.py") == ["py"]
+        assert file_pattern_pushdown_tokens(long_run) is None
+
+    def test_max_len_token_kept(self):
+        assert file_pattern_pushdown_tokens("a" * 64) == ["a" * 64]
+
+    def test_negated_character_class(self):
+        assert file_pattern_pushdown_tokens("[!t]est_*.py") == ["py"]
+
+    def test_class_containing_bracket(self):
+        # fnmatch: ']' first in the set is literal, class ends at next ']'.
+        # The class is a wildcard, so the adjacent "x" run is dropped.
+        assert file_pattern_pushdown_tokens("[]]x.py") == ["py"]
+
+    def test_unmatched_bracket_treated_as_wildcard(self):
+        # Conservative: "ab" touches the unmatched '[' and is dropped.
+        assert file_pattern_pushdown_tokens("[ab.py") == ["py"]
+
+    def test_no_alnum_content(self):
+        assert file_pattern_pushdown_tokens("...") is None
+        assert file_pattern_pushdown_tokens("") is None
+
+    def test_multiple_separators(self):
+        assert file_pattern_pushdown_tokens("conf-test_v2.tar.gz") == [
+            "conf", "test", "v2", "tar", "gz",
+        ]
+
+    def test_token_limit_matches_storage_index_params(self):
+        """The local cutoff must mirror the storage layer's indexed token
+        limit, or pushdown could query never-indexed tokens."""
+        assert _MAX_INDEXED_TOKEN_LEN == QdrantStorage._TEXT_INDEX_MAX_TOKEN_LEN

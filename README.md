@@ -103,6 +103,8 @@ code_search("auth path:src/services")
 code_search("test -path:vendor -path:node_modules")
 
 # Filename filtering (glob, case-insensitive, matches filename only)
+# Pushed into the retrieval layer when possible, so a match in the named
+# file is found even if it would rank below the candidate pool
 code_search("connection pooling file:db.py")
 code_search("schema migration file:*.sql")
 
@@ -175,7 +177,10 @@ Search results boosted/demoted by path:
 
 ## Git Integration
 
-`search_changed` supports git revisions:
+`search_changed` searches only files changed since a git revision or time. The
+changed-file set is applied as a retrieval-layer filter, so results are ranked
+within the changed files rather than intersected against a bounded whole-codebase
+candidate pool (change sets over 500 files fall back to post-filtering).
 ```bash
 search_changed("auth logic", since="HEAD~5")
 search_changed("database", since="main")

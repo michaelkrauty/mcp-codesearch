@@ -367,6 +367,102 @@ def parse_query(query: str) -> ParsedQuery:
     return result
 
 
+# Mirrors QdrantStorage._TEXT_INDEX_MAX_TOKEN_LEN (storage/qdrant.py): the
+# full-text payload indexes never index tokens longer than this, so a
+# MatchText query containing a longer token matches NOTHING at all. Any
+# pushdown token above this length must be dropped (dropping a token only
+# widens the candidate superset, which is always safe).
+_MAX_INDEXED_TOKEN_LEN = 64
+
+
+def file_pattern_pushdown_tokens(pattern: str) -> list[str] | None:  # noqa: PLR0912
+    """Extract path tokens guaranteed to appear in any ``file:`` match.
+
+    Given an fnmatch pattern applied to a FILENAME, return lowercased
+    alphanumeric tokens that are guaranteed to appear as whole tokens
+    (word-tokenizer semantics: maximal alphanumeric runs) in the full
+    PATH of every file whose filename matches the pattern. The result
+    can therefore be used as a Qdrant ``MatchText`` pre-filter on the
+    indexed ``path`` field: it may admit extra candidates, but it can
+    never exclude a true match (a superset prefilter).
+
+    Why filename tokens are valid against the full path: the filename is
+    a complete path component, so a token boundary at pattern start or
+    pattern end becomes ``/`` or string-end in the path — still a token
+    boundary under the word tokenizer.
+
+    Wildcards are ``*``, ``?``, and any ``[...]`` character class (an
+    unmatched ``[`` is treated conservatively as a wildcard). An
+    alphanumeric run in the literal parts qualifies only when both of
+    its neighbors are literal non-alphanumeric characters or the pattern
+    boundary; a run adjacent to a wildcard is not guaranteed to be a
+    whole token in the matched filename and is dropped. Tokens longer
+    than the indexed token limit are dropped too (they are never
+    indexed; see _MAX_INDEXED_TOKEN_LEN).
+
+    Returns None when no tokens survive, meaning no pushdown is possible.
+    """
+    # Flatten the pattern into elements: a literal character (str) or a
+    # wildcard (None). Each [...] class collapses into one wildcard.
+    elements: list[str | None] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c in "*?":
+            elements.append(None)
+            i += 1
+        elif c == "[":
+            # Find the closing bracket using fnmatch rules: a ']' that
+            # appears first (optionally after '!') belongs to the set.
+            j = i + 1
+            if j < n and pattern[j] == "!":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j < n:
+                elements.append(None)
+                i = j + 1
+            else:
+                # Unmatched '[': fnmatch treats it as a literal, but a
+                # wildcard is the conservative (superset-safe) reading.
+                elements.append(None)
+                i += 1
+        else:
+            elements.append(c)
+            i += 1
+
+    tokens: list[str] = []
+    k = 0
+    m = len(elements)
+    while k < m:
+        e = elements[k]
+        if isinstance(e, str) and e.isalnum():
+            start = k
+            run_chars: list[str] = []
+            while k < m:
+                ch = elements[k]
+                if isinstance(ch, str) and ch.isalnum():
+                    run_chars.append(ch)
+                    k += 1
+                else:
+                    break
+            # The run is maximal, so a literal neighbor is necessarily
+            # non-alphanumeric; only a wildcard neighbor (None) is unsafe.
+            left_ok = start == 0 or isinstance(elements[start - 1], str)
+            right_ok = k == m or isinstance(elements[k], str)
+            if left_ok and right_ok:
+                token = "".join(run_chars).lower()
+                if len(token) <= _MAX_INDEXED_TOKEN_LEN:
+                    tokens.append(token)
+        else:
+            k += 1
+
+    return tokens or None
+
+
 def preprocess_query(query: str, expand: bool = True) -> tuple[str, ParsedQuery]:
     """
     Full query preprocessing pipeline.

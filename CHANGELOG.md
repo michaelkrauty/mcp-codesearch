@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.0] - 2026-06-12
+
+### Added
+
+- The `path` payload field now gets a full-text index (same parameters as the existing `content`/`name`/`summary` indexes), created on new collections and added lazily to existing ones. It powers retrieval-layer pushdown of filename constraints and is never used as a should-condition, so exact-match candidate selection on content fields is unchanged.
+
+### Changed
+
+- `file:` filename patterns are now pushed into the retrieval layer as a Qdrant `MatchText` filter on the indexed `path` field, instead of only post-filtering a bounded candidate pool. The pushdown extracts only tokens guaranteed (by fnmatch wildcard analysis under word-tokenizer semantics) to appear as whole path tokens in every matching file, so it can admit extra candidates but never exclude a true match; the precise fnmatch post-filter is unchanged. The constraint joins both the fast-path filter and the exhaustive scan of exact-match search, which makes the scan's early termination safe under filename constraints — previously a query like `fn:init file:db.py` could return nothing because `init` hits in other files exhausted the scan budget before `db.py` was ever reached. If a constrained search returns nothing, it reruns once without the token filter as a safety net for unforeseen tokenizer edge cases (e.g. unicode filenames). Patterns yielding no guaranteed tokens (such as `*test*`) and collections where index creation failed simply skip the pushdown.
+- `search_changed` now pushes the changed-file set into retrieval as an exact `MatchAny` path filter, so ranking happens within the changed files only and a match can no longer rank below the candidate pool and silently disappear. The candidate pool shrinks accordingly (`limit*2`), the post-intersection remains as belt-and-suspenders, and the no-results message states plainly that nothing in the changed files matched. Change sets over 500 files fall back to the previous post-filter behavior (pool of `limit*20` capped at 200) to keep filter payloads small, and only then does the message mention the candidate-pool caveat.
+- `path:` and `-path:` deliberately keep post-filtering over their widened candidate pool. Their semantics include substring-within-a-component matching (`path:earch` matches `src/mcp_codesearch/`, `path:src/mcp` matches `src/mcpx/`), so no token-based prefilter is a superset of their matches and a pushdown would drop valid results.
+
 ## [1.5.2] - 2026-06-12
 
 ### Changed

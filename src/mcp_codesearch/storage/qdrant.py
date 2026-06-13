@@ -20,6 +20,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     FieldCondition,
     Filter,
+    MatchAny,
     MatchText,
     MatchValue,
     PointStruct,
@@ -568,6 +569,33 @@ class QdrantStorage:
     # Hybrid Search - Uses vector-core HybridSearcher for RRF fusion
     # =========================================================================
 
+    @staticmethod
+    def _path_pushdown_conditions(
+        restrict_paths: list[str] | None,
+        path_text_tokens: list[str] | None,
+    ) -> list[FieldCondition]:
+        """Build must-conditions that push path constraints into retrieval.
+
+        ``restrict_paths`` is an exact set constraint: MatchAny on the
+        ``path`` payload field matches full stored values and needs no
+        index (verified against Qdrant on both indexed and unindexed
+        fields). ``path_text_tokens`` is a whole-token AND constraint:
+        MatchText against the text-indexed ``path`` field. Callers must
+        only pass tokens when the text indexes are known to exist
+        (_ensure_text_indexes returned True) — an unindexed MatchText is
+        evaluated with Qdrant's default tokenization and is not trusted.
+        """
+        conditions: list[FieldCondition] = []
+        if restrict_paths:
+            conditions.append(
+                FieldCondition(key="path", match=MatchAny(any=restrict_paths))
+            )
+        if path_text_tokens:
+            conditions.append(
+                FieldCondition(key="path", match=MatchText(text=" ".join(path_text_tokens)))
+            )
+        return conditions
+
     async def hybrid_search(
         self,
         collection: str,
@@ -579,6 +607,8 @@ class QdrantStorage:
         prefetch_limit: int | None = None,
         dense_weight: float | None = None,
         sparse_weight: float | None = None,
+        restrict_paths: list[str] | None = None,
+        path_text_tokens: list[str] | None = None,
     ) -> list[SearchResult]:
         """
         Hybrid search using RRF fusion of dense and sparse results.
@@ -591,6 +621,10 @@ class QdrantStorage:
                            Higher = better quality but slower. Default from settings.
             dense_weight: Weight for dense (semantic) vectors in RRF. Default from settings.
             sparse_weight: Weight for sparse (TF-IDF) vectors in RRF. Default from settings.
+            restrict_paths: Exact path set to constrain retrieval to (MatchAny).
+            path_text_tokens: Whole tokens that must appear in the path
+                (MatchText; requires the text indexes — see
+                _path_pushdown_conditions).
         """
         # Build code-search-specific filters
         filter_conditions: list[FieldCondition] = []
@@ -606,6 +640,9 @@ class QdrantStorage:
             filter_conditions.append(
                 FieldCondition(key="language", match=MatchValue(value=language))
             )
+        filter_conditions.extend(
+            self._path_pushdown_conditions(restrict_paths, path_text_tokens)
+        )
 
         # Use vector-core's HybridSearcher for RRF fusion
         searcher = HybridSearcher(
@@ -670,6 +707,8 @@ class QdrantStorage:
         mode: Literal["file", "chunk", "both"] = "both",
         language: str | None = None,
         limit: int = 10,
+        restrict_paths: list[str] | None = None,
+        path_text_tokens: list[str] | None = None,
     ) -> list[SearchResult]:
         """
         Sparse-only search using TF-IDF vectors when embedding service is unavailable.
@@ -684,6 +723,9 @@ class QdrantStorage:
             mode: "file", "chunk", or "both"
             language: Optional language filter
             limit: Max results
+            restrict_paths: Exact path set to constrain retrieval to (MatchAny)
+            path_text_tokens: Whole tokens that must appear in the path
+                (MatchText; requires the text indexes)
 
         Returns:
             List of SearchResult with degraded=True
@@ -704,6 +746,9 @@ class QdrantStorage:
             filter_conditions.append(
                 FieldCondition(key="language", match=MatchValue(value=language))
             )
+        filter_conditions.extend(
+            self._path_pushdown_conditions(restrict_paths, path_text_tokens)
+        )
 
         query_filter = Filter(must=filter_conditions) if filter_conditions else None  # type: ignore[arg-type]
 
@@ -769,8 +814,15 @@ class QdrantStorage:
 
     # Fields covered by the full-text payload indexes that pre-filter
     # exact-match scans; must stay in sync with the fields scanned in
-    # _exact_match_scan.
+    # _exact_match_scan. Deliberately excludes "path": these fields feed
+    # the should-conditions of the exact-match fast path, and including
+    # path there would admit path-token candidates into content scans.
     _TEXT_INDEX_FIELDS = ("content", "name", "summary")
+
+    # All fields that get a full-text payload index. Includes "path" for
+    # retrieval-layer pushdown of filename constraints (file: patterns),
+    # which is applied as a must-condition, never a should-condition.
+    _TEXT_INDEXED_PAYLOAD_FIELDS = (*_TEXT_INDEX_FIELDS, "path")
 
     # Mirrors TextIndexParams.max_token_len on the indexes below: longer
     # tokens are never indexed, so a query containing a longer word must
@@ -803,7 +855,7 @@ class QdrantStorage:
         )
         try:
             client = await self._get_client()
-            for field in self._TEXT_INDEX_FIELDS:
+            for field in self._TEXT_INDEXED_PAYLOAD_FIELDS:
                 await client.create_payload_index(
                     collection_name=collection,
                     field_name=field,
@@ -844,6 +896,8 @@ class QdrantStorage:
         mode: Literal["file", "chunk", "both"] = "both",
         language: str | None = None,
         limit: int = 10,
+        restrict_paths: list[str] | None = None,
+        path_text_tokens: list[str] | None = None,
     ) -> list[SearchResult]:
         """
         Fallback exact substring search for when semantic search fails.
@@ -860,6 +914,15 @@ class QdrantStorage:
         also preserves the substring fallback for oversized fields (see
         _safe_regex_search inside _exact_match_scan), the one case the
         pre-filter cannot see.
+
+        Path pushdown (restrict_paths / path_text_tokens) joins the
+        must-conditions of BOTH the fast-path filter and the exhaustive
+        query_filter. That is what makes the scroll loop's early
+        termination (it stops after 10 high-quality hits) safe under
+        filename or changed-set constraints: without the pushdown, hits
+        in OTHER files could exhaust the scan budget before the
+        constrained file was ever reached, and the post-filter would then
+        return nothing despite a real match existing in the index.
         """
         client = await self._get_client()
         query_lower = query.lower()
@@ -878,6 +941,9 @@ class QdrantStorage:
             filter_conditions.append(
                 FieldCondition(key="language", match=MatchValue(value=language))
             )
+        filter_conditions.extend(
+            self._path_pushdown_conditions(restrict_paths, path_text_tokens)
+        )
 
         query_filter = Filter(must=filter_conditions) if filter_conditions else None  # type: ignore[arg-type]
 
