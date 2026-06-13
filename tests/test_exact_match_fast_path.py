@@ -186,3 +186,49 @@ class TestEnsureTextIndexes:
         await storage.create_collection("col")
 
         assert storage._client_mock.create_payload_index.call_count == 8
+
+
+class TestExactMatchRanking:
+    """The scan returns the highest-scored `limit` matches, not the first
+    `limit` reached in scroll order (which is point-id order, unrelated to
+    match quality). Without ranking, a lone name match for a widely-referenced
+    symbol is crowded out by content matches that scroll ahead of it — e.g.
+    `cls:Foo` surfacing files that mention Foo but never its definition.
+    """
+
+    @pytest.mark.asyncio
+    async def test_late_name_match_not_crowded_out_by_earlier_content(self, storage):
+        # Five content matches (score 1.0) scroll before the one name match
+        # (score 3.0); limit is smaller than the content run.
+        pts = [_point(i, content="uses foo() here") for i in range(1, 6)]
+        pts.append(_point(99, name="foo", content="def foo(): ..."))
+        storage._client_mock.scroll = AsyncMock(return_value=(pts, None))
+
+        results = await storage.exact_match_search("col", "foo", mode="chunk", limit=3)
+
+        assert len(results) == 3
+        assert results[0].score == 3.0  # the definition ranks first
+        assert any(r.name == "foo" for r in results)  # and is actually present
+
+    @pytest.mark.asyncio
+    async def test_results_sorted_by_score_descending(self, storage):
+        pts = [
+            _point(1, content="foo()"),       # 1.0
+            _point(2, name="foo"),            # 3.0
+            _point(3, summary="re: foo"),     # 2.0
+            _point(4, content="also foo"),    # 1.0
+        ]
+        storage._client_mock.scroll = AsyncMock(return_value=(pts, None))
+
+        results = await storage.exact_match_search("col", "foo", mode="chunk", limit=10)
+
+        assert [r.score for r in results] == [3.0, 2.0, 1.0, 1.0]
+
+    @pytest.mark.asyncio
+    async def test_limit_still_caps_returned_results(self, storage):
+        pts = [_point(i, name="foo") for i in range(1, 8)]
+        storage._client_mock.scroll = AsyncMock(return_value=(pts, None))
+
+        results = await storage.exact_match_search("col", "foo", mode="chunk", limit=2)
+
+        assert len(results) == 2
