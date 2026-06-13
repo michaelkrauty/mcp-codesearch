@@ -410,6 +410,15 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
         # any match counting, independent of whether the token pushdown ran.
         file_predicate = _file_pattern_predicate(parsed.file_pattern)
 
+    # Rank exact-match results by score only when no post-retrieval filter that
+    # exact_match_search does not itself enforce will discard the top tier.
+    # _filter_by_parsed_query still applies path:/-path:/scope: after retrieval;
+    # ranking name matches to the front before that filter runs could truncate
+    # away the lower-scored matches it wants (see exact_match_search's rank=).
+    # file: is pushed into the scan via file_predicate, so it does not disable
+    # ranking — its candidates are already constrained before truncation.
+    rank_exact = not (parsed.path_prefix or parsed.exclude_paths or parsed.scope)
+
     async def _retrieve(path_tokens: list[str] | None) -> list[SearchResult]:
         """Run the planned retrieval with the given path-token pushdown."""
         results: list[SearchResult] = []
@@ -425,6 +434,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
                 path_predicate=file_predicate,
+                rank=rank_exact,
             )
 
         elif plan.query_type == QueryType.EXACT_PHRASE:
@@ -438,6 +448,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
                 path_predicate=file_predicate,
+                rank=rank_exact,
             )
 
         elif plan.query_type == QueryType.NAME_SEMANTIC:
@@ -452,6 +463,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
                 path_predicate=file_predicate,
+                rank=rank_exact,
             )
 
             # 2. Semantic search for context (with graceful degradation)
@@ -536,6 +548,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                     restrict_paths=restrict_paths,
                     path_text_tokens=path_tokens,
                     path_predicate=file_predicate,
+                    rank=rank_exact,
                 )
                 if exact_results:
                     # Merge: exact matches first
