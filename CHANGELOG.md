@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.1] - 2026-06-13
+
+### Fixed
+
+- Exact-match search now returns the highest-scored matches rather than the first ones reached in scroll order. The scan stopped as soon as it had collected `limit` matches, but scroll order is point-id order — unrelated to match quality — so a high-value name match (score 3.0) could be crowded out by lower-value content matches (1.0) that happened to scroll ahead of it. In practice `fn:Name` / `cls:Name` / `class:Name` lookups for a widely-referenced symbol returned files that merely *mention* the symbol while omitting its actual definition (the one chunk whose name equals the query). The scan now collects a candidate pool of `max(limit, 500)` matches, ranks by score, and returns the top `limit`, so the definition is no longer lost to truncation. The high-quality early-termination and per-collection scroll cap are unchanged, so cost stays bounded.
+
 ## [1.6.0] - 2026-06-12
 
 ### Added

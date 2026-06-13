@@ -164,12 +164,16 @@ async def find_references(
 
     storage = await get_storage()
 
-    # Use exact match search
+    # Use exact match search. rank=False keeps matches in scroll order rather
+    # than ranking name matches (the definition, score 3.0) to the front: this
+    # search drops the definition to surface usages, so a ranked pool of
+    # same-named definitions would crowd out the content references it wants.
     results = await storage.exact_match_search(
         collection=col_name,
         query=symbol,
         mode="chunk",
         limit=limit * 3,
+        rank=False,
     )
 
     # Filter results

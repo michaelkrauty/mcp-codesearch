@@ -1,6 +1,7 @@
 """Tests for query planning and execution."""
 
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -13,6 +14,7 @@ from mcp_codesearch.search.query import (
     _normalize_scores,
     _plan_query,
     format_results,
+    search_codebase,
 )
 from mcp_codesearch.storage.qdrant import SearchResult
 
@@ -655,6 +657,54 @@ class TestSearchCodebase:
         mock_storage.hybrid_search.assert_called_once()
         # Results should include both (merged)
         assert len(results) >= 1
+
+
+    @pytest.mark.asyncio
+    async def test_name_lookup_without_postfilter_ranks_exact(self):
+        """A bare cls:/fn: lookup ranks exact-match results (rank=True) so the
+        definition is not lost to scroll-order truncation."""
+        mock_storage = MagicMock()
+        mock_storage.exact_match_search = AsyncMock(return_value=[])
+        mock_embedder = MagicMock()
+        mock_global_vocab = MagicMock()
+
+        await search_codebase(
+            query="cls:Foo", codebase_path="/test", storage=mock_storage,
+            embedder=mock_embedder, global_vocab=mock_global_vocab, limit=10,
+        )
+
+        assert mock_storage.exact_match_search.call_args.kwargs["rank"] is True
+
+    @pytest.mark.asyncio
+    async def test_name_lookup_with_path_filter_disables_ranking(self):
+        """With an un-pushed post-filter (path:) ranking is disabled so the
+        score sort cannot starve the lower-scored matches the filter wants."""
+        mock_storage = MagicMock()
+        mock_storage.exact_match_search = AsyncMock(return_value=[])
+        mock_embedder = MagicMock()
+        mock_global_vocab = MagicMock()
+
+        await search_codebase(
+            query="cls:Foo path:src", codebase_path="/test", storage=mock_storage,
+            embedder=mock_embedder, global_vocab=mock_global_vocab, limit=10,
+        )
+
+        assert mock_storage.exact_match_search.call_args.kwargs["rank"] is False
+
+    @pytest.mark.asyncio
+    async def test_scope_filter_disables_ranking(self):
+        """scope: is post-filtered too, so it disables exact-match ranking."""
+        mock_storage = MagicMock()
+        mock_storage.exact_match_search = AsyncMock(return_value=[])
+        mock_embedder = MagicMock()
+        mock_global_vocab = MagicMock()
+
+        await search_codebase(
+            query="cls:Foo scope:test", codebase_path="/test", storage=mock_storage,
+            embedder=mock_embedder, global_vocab=mock_global_vocab, limit=10,
+        )
+
+        assert mock_storage.exact_match_search.call_args.kwargs["rank"] is False
 
 
 class TestFilterByParsedQueryEdgeCases:

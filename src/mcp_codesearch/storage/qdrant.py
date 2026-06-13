@@ -806,6 +806,18 @@ class QdrantStorage:
     # Safety limit for scroll loops to prevent runaway resource consumption
     _MAX_SCROLL_ITERATIONS = 1000  # 1000 * 1000 = 1M points max
 
+    # Candidate pool size for exact-match ranking. The scan collects matches
+    # up to max(limit, this) and then returns the highest-scored `limit` of
+    # them, rather than the first `limit` encountered in scroll order. Scroll
+    # order is point-id order, unrelated to match quality, so a high-value
+    # name match (score 3.0) for a widely-referenced symbol could otherwise be
+    # crowded out by lower-value content matches (1.0) that happen to scroll
+    # first — e.g. `cls:Foo` returning test files that mention Foo but never
+    # the definition of Foo itself. A pool well above any realistic
+    # per-symbol match count keeps that from happening while bounding both the
+    # scan cost and the memory held during ranking.
+    _EXACT_MATCH_RANK_POOL = 500
+
     # Payload fields needed for exact match search (avoiding full content load)
     # This reduces payload size significantly (2-10x faster for large codebases)
     _EXACT_MATCH_PAYLOAD_FIELDS = [
@@ -900,6 +912,7 @@ class QdrantStorage:
         restrict_paths: list[str] | None = None,
         path_text_tokens: list[str] | None = None,
         path_predicate: Callable[[str], bool] | None = None,
+        rank: bool = True,
     ) -> list[SearchResult]:
         """
         Fallback exact substring search for when semantic search fails.
@@ -933,6 +946,15 @@ class QdrantStorage:
         termination threshold, so token-level false positives (init hits
         in db_pool.py while searching file:db.py) cannot exhaust the scan
         budget either.
+
+        rank (default True) returns the highest-scored ``limit`` matches by
+        scanning a larger candidate pool and sorting by field-tier score, so
+        a name match is not crowded out of a definition lookup by content
+        matches that scroll ahead of it. Callers that deliberately discard
+        the top tier — ``find_references`` drops the name-equal definition to
+        surface usages — pass ``rank=False`` to keep the first ``limit``
+        matches in scroll order instead, so the tier they want is not ranked
+        away before they filter.
         """
         client = await self._get_client()
         query_lower = query.lower()
@@ -977,7 +999,7 @@ class QdrantStorage:
                 results = await self._exact_match_scan(
                     client, collection, fast_filter,
                     compiled_pattern, query_lower, query, limit,
-                    path_predicate=path_predicate,
+                    path_predicate=path_predicate, rank=rank,
                 )
             except Exception as e:
                 logger.warning(
@@ -991,7 +1013,7 @@ class QdrantStorage:
         return await self._exact_match_scan(
             client, collection, query_filter,
             compiled_pattern, query_lower, query, limit,
-            path_predicate=path_predicate,
+            path_predicate=path_predicate, rank=rank,
         )
 
     async def _exact_match_scan(  # noqa: PLR0912, PLR0915
@@ -1004,18 +1026,35 @@ class QdrantStorage:
         query: str,
         limit: int,
         path_predicate: Callable[[str], bool] | None = None,
+        rank: bool = True,
     ) -> list[SearchResult]:
-        """Scroll the collection and score word-boundary matches.
+        """Scroll the collection, score word-boundary matches, and return the
+        highest-scored ``limit`` of them.
 
         Matching and scoring are independent of how scroll_filter was
         built, so the pre-filtered fast path and the exhaustive fallback
         share this loop unchanged. Points whose path fails path_predicate
-        are skipped before they can count toward the limit or the early
+        are skipped before they can count toward the pool or the early
         termination threshold (see exact_match_search).
+
+        When ``rank`` is set the scan collects a candidate pool of up to
+        ``max(limit, _EXACT_MATCH_RANK_POOL)`` matches and then sorts by score
+        so the returned ``limit`` are the best matches, not merely the first
+        ones reached in (quality-agnostic) scroll order — without ranking, a
+        lone name match could be crowded out by lower-value content matches
+        that scroll ahead of it. When ``rank`` is False the scan keeps the
+        first ``limit`` matches in scroll order, for callers that discard the
+        top tier and must not have it ranked to the front first (see
+        exact_match_search).
         """
         results: list[SearchResult] = []
         offset = None
         high_quality_count = 0  # Track high-quality matches for early termination
+
+        # When ranking, collect a pool larger than the caller's limit so a
+        # late-scrolling high-value match still makes it in, then rank and
+        # truncate at the end. When not ranking, stop at limit in scroll order.
+        scan_cap = max(limit, self._EXACT_MATCH_RANK_POOL) if rank else limit
 
         # Early termination thresholds
         _EARLY_TERMINATION_THRESHOLD = 10
@@ -1041,7 +1080,7 @@ class QdrantStorage:
             return compiled.search(text)
 
         for _iteration in range(self._MAX_SCROLL_ITERATIONS):
-            if len(results) >= limit:
+            if len(results) >= scan_cap:
                 break
             # Early termination: if we have enough high-quality results, stop searching
             if high_quality_count >= _EARLY_TERMINATION_THRESHOLD:
@@ -1120,7 +1159,7 @@ class QdrantStorage:
 
                     results.append(result)
 
-                    if len(results) >= limit:
+                    if len(results) >= scan_cap:
                         break
 
             if offset is None:
@@ -1132,7 +1171,12 @@ class QdrantStorage:
                 f"for query '{query[:50]}...' in collection {collection}"
             )
 
-        return results
+        if rank:
+            # Rank by score (stable sort preserves scroll order within a tier)
+            # and return the best `limit`, so high-value matches deeper in the
+            # pool are not lost to the truncation.
+            results.sort(key=lambda r: r.score, reverse=True)
+        return results[:limit]
 
     # =========================================================================
     # Metadata Storage - Adapted from vector-core
