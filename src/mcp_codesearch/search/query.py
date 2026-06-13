@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
@@ -15,7 +16,11 @@ from pydantic import BaseModel, ConfigDict
 from vector_core import EmbeddingClient, GlobalVocabulary
 from vector_core.embeddings.client import CircuitBreakerOpenError
 
-from mcp_codesearch.search.preprocess import ParsedQuery, preprocess_query
+from mcp_codesearch.search.preprocess import (
+    ParsedQuery,
+    file_pattern_pushdown_tokens,
+    preprocess_query,
+)
 from mcp_codesearch.settings import PATH_BOOST_MAX, PATH_BOOST_PATTERNS
 from mcp_codesearch.storage.qdrant import (
     QdrantStorage,
@@ -275,6 +280,22 @@ def _filter_by_parsed_query(  # noqa: PLR0912
     return filtered
 
 
+def _file_pattern_predicate(pattern: str) -> Callable[[str], bool]:
+    """Precise file: semantics as a path predicate.
+
+    Matches the filename component against the pattern, case-insensitively
+    — the same rule _filter_by_parsed_query applies after retrieval. Used
+    inside the exact-match scan so its result limit and early termination
+    only ever count true filename matches.
+    """
+    pattern_lower = pattern.lower()
+
+    def predicate(path: str) -> bool:
+        return fnmatch.fnmatch(path.rsplit("/", 1)[-1].lower(), pattern_lower)
+
+    return predicate
+
+
 def _merge_results(
     primary: list[SearchResult],
     secondary: list[SearchResult],
@@ -298,7 +319,7 @@ def _merge_results(
     return merged
 
 
-async def search_codebase(
+async def search_codebase(  # noqa: PLR0913, PLR0915
     query: str,
     codebase_path: str | Path,
     storage: QdrantStorage,
@@ -309,6 +330,7 @@ async def search_codebase(
     limit: int = 10,
     path_prefix: str | None = None,
     exclude_paths: list[str] | None = None,
+    restrict_paths: list[str] | None = None,
 ) -> list[SearchResult]:
     """
     Search indexed codebase with intelligent query planning.
@@ -330,6 +352,9 @@ async def search_codebase(
         limit: Max results
         path_prefix: Only return results from paths starting with this prefix
         exclude_paths: Exclude results containing these path substrings
+        restrict_paths: Exact set of relative paths to constrain retrieval to.
+            Pushed into the storage layer as a Qdrant payload filter, so
+            matches outside the set never consume the candidate pool.
 
     Returns:
         List of SearchResult
@@ -355,113 +380,187 @@ async def search_codebase(
     else:
         fetch_limit = limit * 2
 
-    results: list[SearchResult] = []
+    # Retrieval-layer pushdown for file: patterns. The extracted tokens are a
+    # guaranteed superset prefilter (see file_pattern_pushdown_tokens): every
+    # true match contains them as whole path tokens, so constraining retrieval
+    # by them cannot drop a match, while the fnmatch post-filter below keeps
+    # the precise glob semantics. Gated on _ensure_text_indexes: an unindexed
+    # MatchText uses Qdrant's default tokenization and is NOT trusted.
+    #
+    # path: and -path: are deliberately NOT pushed down. Their semantics
+    # include substring-within-a-component matching, so no token-based
+    # prefilter is a superset of their matches: "path:earch" must match
+    # "src/mcp_codesearch/" (mid-token), and "path:src/mcp" must match
+    # "src/mcpx/" (a component prefix splitting a token) — a MatchText
+    # prefilter would drop both. They keep post-filtering over the widened
+    # candidate pool instead.
+    path_text_tokens: list[str] | None = None
+    file_predicate: Callable[[str], bool] | None = None
+    if parsed.file_pattern:
+        tokens = file_pattern_pushdown_tokens(parsed.file_pattern)
+        if tokens and await storage._ensure_text_indexes(col_name):
+            path_text_tokens = tokens
 
-    # Execute based on query plan
-    if plan.query_type == QueryType.NAME_ONLY:
-        # Pure name lookup - skip embedding entirely
-        results = await storage.exact_match_search(
-            collection=col_name,
-            query=plan.name_filter or "",
-            mode=mode,
-            language=language,
-            limit=fetch_limit,
-        )
+        # Precise fnmatch constraint for the exact-match scan. The token
+        # pushdown above is only a superset prefilter, so within the
+        # constrained candidate set token-level false positives (init hits
+        # in db_pool.py while searching file:db.py) could still consume the
+        # scan's result limit or trip its early termination before the true
+        # match is reached. The predicate is applied inside the scan before
+        # any match counting, independent of whether the token pushdown ran.
+        file_predicate = _file_pattern_predicate(parsed.file_pattern)
 
-    elif plan.query_type == QueryType.EXACT_PHRASE:
-        # Exact phrase - skip semantic search
-        results = await storage.exact_match_search(
-            collection=col_name,
-            query=plan.search_text,
-            mode=mode,
-            language=language,
-            limit=fetch_limit,
-        )
+    async def _retrieve(path_tokens: list[str] | None) -> list[SearchResult]:
+        """Run the planned retrieval with the given path-token pushdown."""
+        results: list[SearchResult] = []
 
-    elif plan.query_type == QueryType.NAME_SEMANTIC:
-        # Name filter + semantic: do both and merge
-        # 1. Exact name lookup first (high priority)
-        name_results = await storage.exact_match_search(
-            collection=col_name,
-            query=plan.name_filter or "",
-            mode=mode,
-            language=language,
-            limit=limit * 2,
-        )
-
-        # 2. Semantic search for context (with graceful degradation)
-        try:
-            dense_query = await embedder.embed_single_cached(processed_query or plan.search_text)
-            sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
-
-            semantic_results = await storage.hybrid_search(
+        if plan.query_type == QueryType.NAME_ONLY:
+            # Pure name lookup - skip embedding entirely
+            results = await storage.exact_match_search(
                 collection=col_name,
-                dense_query=dense_query,
-                sparse_query=sparse_query,
+                query=plan.name_filter or "",
                 mode=mode,
                 language=language,
                 limit=fetch_limit,
+                restrict_paths=restrict_paths,
+                path_text_tokens=path_tokens,
+                path_predicate=file_predicate,
             )
-        except CircuitBreakerOpenError as e:
-            # Embedding service unavailable - fall back to sparse-only search
-            logger.warning(f"Embedding service unavailable, falling back to sparse-only search: {e}")
-            sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
-            semantic_results = await storage.sparse_only_search(
+
+        elif plan.query_type == QueryType.EXACT_PHRASE:
+            # Exact phrase - skip semantic search
+            results = await storage.exact_match_search(
                 collection=col_name,
-                sparse_query=sparse_query,
+                query=plan.search_text,
                 mode=mode,
                 language=language,
                 limit=fetch_limit,
+                restrict_paths=restrict_paths,
+                path_text_tokens=path_tokens,
+                path_predicate=file_predicate,
             )
 
-        # Merge: name results first (higher priority)
-        results = _merge_results(name_results, semantic_results)
-
-    else:  # QueryType.SEMANTIC
-        # Full semantic search with exact match fallback (with graceful degradation)
-        try:
-            dense_query = await embedder.embed_single_cached(processed_query or plan.search_text)
-            sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
-
-            results = await storage.hybrid_search(
+        elif plan.query_type == QueryType.NAME_SEMANTIC:
+            # Name filter + semantic: do both and merge
+            # 1. Exact name lookup first (high priority)
+            name_results = await storage.exact_match_search(
                 collection=col_name,
-                dense_query=dense_query,
-                sparse_query=sparse_query,
+                query=plan.name_filter or "",
                 mode=mode,
                 language=language,
-                limit=fetch_limit,
-            )
-        except CircuitBreakerOpenError as e:
-            # Embedding service unavailable - fall back to sparse-only search
-            logger.warning(f"Embedding service unavailable, falling back to sparse-only search: {e}")
-            sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
-            results = await storage.sparse_only_search(
-                collection=col_name,
-                sparse_query=sparse_query,
-                mode=mode,
-                language=language,
-                limit=fetch_limit,
+                limit=limit * 2,
+                restrict_paths=restrict_paths,
+                path_text_tokens=path_tokens,
+                path_predicate=file_predicate,
             )
 
-        # Fallback to exact match if semantic scores are low
-        EXACT_MATCH_THRESHOLD = 0.3
-        if not results or (results and results[0].score < EXACT_MATCH_THRESHOLD):
-            exact_results = await storage.exact_match_search(
-                collection=col_name,
-                query=parsed.text or query,
-                mode=mode,
-                language=language,
-                limit=fetch_limit,
-            )
-            if exact_results:
-                # Merge: exact matches first
-                results = _merge_results(exact_results, results)
+            # 2. Semantic search for context (with graceful degradation)
+            try:
+                dense_query = await embedder.embed_single_cached(
+                    processed_query or plan.search_text
+                )
+                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+
+                semantic_results = await storage.hybrid_search(
+                    collection=col_name,
+                    dense_query=dense_query,
+                    sparse_query=sparse_query,
+                    mode=mode,
+                    language=language,
+                    limit=fetch_limit,
+                    restrict_paths=restrict_paths,
+                    path_text_tokens=path_tokens,
+                )
+            except CircuitBreakerOpenError as e:
+                # Embedding service unavailable - fall back to sparse-only search
+                logger.warning(
+                    f"Embedding service unavailable, falling back to sparse-only search: {e}"
+                )
+                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+                semantic_results = await storage.sparse_only_search(
+                    collection=col_name,
+                    sparse_query=sparse_query,
+                    mode=mode,
+                    language=language,
+                    limit=fetch_limit,
+                    restrict_paths=restrict_paths,
+                    path_text_tokens=path_tokens,
+                )
+
+            # Merge: name results first (higher priority)
+            results = _merge_results(name_results, semantic_results)
+
+        else:  # QueryType.SEMANTIC
+            # Full semantic search with exact match fallback (with graceful degradation)
+            try:
+                dense_query = await embedder.embed_single_cached(
+                    processed_query or plan.search_text
+                )
+                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+
+                results = await storage.hybrid_search(
+                    collection=col_name,
+                    dense_query=dense_query,
+                    sparse_query=sparse_query,
+                    mode=mode,
+                    language=language,
+                    limit=fetch_limit,
+                    restrict_paths=restrict_paths,
+                    path_text_tokens=path_tokens,
+                )
+            except CircuitBreakerOpenError as e:
+                # Embedding service unavailable - fall back to sparse-only search
+                logger.warning(
+                    f"Embedding service unavailable, falling back to sparse-only search: {e}"
+                )
+                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+                results = await storage.sparse_only_search(
+                    collection=col_name,
+                    sparse_query=sparse_query,
+                    mode=mode,
+                    language=language,
+                    limit=fetch_limit,
+                    restrict_paths=restrict_paths,
+                    path_text_tokens=path_tokens,
+                )
+
+            # Fallback to exact match if semantic scores are low
+            EXACT_MATCH_THRESHOLD = 0.3
+            if not results or (results and results[0].score < EXACT_MATCH_THRESHOLD):
+                exact_results = await storage.exact_match_search(
+                    collection=col_name,
+                    query=parsed.text or query,
+                    mode=mode,
+                    language=language,
+                    limit=fetch_limit,
+                    restrict_paths=restrict_paths,
+                    path_text_tokens=path_tokens,
+                    path_predicate=file_predicate,
+                )
+                if exact_results:
+                    # Merge: exact matches first
+                    results = _merge_results(exact_results, results)
+
+        return results
+
+    results = await _retrieve(path_text_tokens)
 
     # Apply path-based boosting
     results = _apply_path_boost(results)
 
     # Apply parsed query filters
     results = _filter_by_parsed_query(results, parsed)
+
+    # Zero-result fallback for the file-token pushdown: if the constrained
+    # retrieval plus post-filters produced nothing, rerun once WITHOUT the
+    # path tokens (restrict_paths stays — it is an exact set, not a token
+    # heuristic) and re-apply the post-filters. This mirrors the exact-match
+    # fast-path-empty → exhaustive discipline and covers unforeseen tokenizer
+    # edge cases (e.g. unicode filenames) at the cost of one extra query.
+    if not results and path_text_tokens:
+        results = await _retrieve(None)
+        results = _apply_path_boost(results)
+        results = _filter_by_parsed_query(results, parsed)
 
     # Normalize scores to 0-1 range for consistent interpretation
     results = _normalize_scores(results[:limit])

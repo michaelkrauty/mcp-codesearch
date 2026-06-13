@@ -32,6 +32,7 @@ from mcp_codesearch.helpers import (
     to_abs_path,
     validate_git_since,
 )
+from mcp_codesearch.search.preprocess import parse_query
 from mcp_codesearch.search.query import format_results, search_codebase
 from mcp_codesearch.services import SearchQuery
 from mcp_codesearch.singletons import (
@@ -530,44 +531,16 @@ def _format_global_markdown(
     return "\n".join(lines)
 
 
-@mcp.tool()
-@tool_error_handler
-async def search_changed(  # noqa: PLR0911
-    query: str,
-    path: str = ".",
-    since: str = "HEAD~10",
-    limit: int = 10,
-    output_format: Literal["text", "json", "markdown"] = "text",
-) -> str:
+def _changed_files_since(  # noqa: PLR0911
+    path: str, abs_path: str, since: str
+) -> tuple[set[str], str]:
+    """Resolve the set of files changed since a git revision or time.
+
+    Returns ``(changed_files, error)``: a non-empty ``error`` means the
+    caller should abort and surface it verbatim. Paths are returned
+    relative to ``abs_path`` (the indexed codebase root) so they match
+    search result paths.
     """
-    Search only in files that have changed since a given commit or time.
-
-    Note: this runs a normal ranked search over the whole codebase and
-    intersects the top-ranked candidates with the set of changed files.
-    A match inside a changed file that ranks below the candidate pool
-    (top limit*20, capped at 200) will not appear. A true filter pushdown
-    into the search layer is future work.
-
-    Args:
-        query: Natural language description of what you're looking for
-        path: Root path of git repository (defaults to current directory)
-        since: Git revision or time to compare against (e.g., "HEAD~10", "main", "3.days.ago")
-        limit: Max results to return (default 10)
-        output_format: Output format - "text" (default), "json", or "markdown"
-
-    Returns:
-        Search results filtered to changed files
-    """
-    if not query or not query.strip():
-        return "Error: Query cannot be empty."
-
-    limit = validate_limit(limit, default=10)
-
-    path_result = validate_directory_path(path)
-    if isinstance(path_result, dict):
-        return format_error(path_result)
-    abs_path = str(path_result)
-
     # Find git repository root (supports subdirectories of a repo)
     try:
         git_root_result = subprocess.run(
@@ -576,15 +549,15 @@ async def search_changed(  # noqa: PLR0911
             capture_output=True, text=True, timeout=10,
         )
         if git_root_result.returncode != 0:
-            return f"Error: {path} is not within a git repository"
+            return set(), f"Error: {path} is not within a git repository"
         git_root = git_root_result.stdout.strip()
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return f"Error: {path} is not within a git repository (git not found or timed out)"
+        return set(), f"Error: {path} is not within a git repository (git not found or timed out)"
 
     # Validate since parameter (returns transformed value for .ago patterns)
     is_valid, validated_result = validate_git_since(since)
     if not is_valid:
-        return validated_result
+        return set(), validated_result
 
     # Get list of changed files from git
     try:
@@ -609,7 +582,7 @@ async def search_changed(  # noqa: PLR0911
             )
 
             if git_result.returncode != 0:
-                return (
+                return set(), (
                     f"Error: Git command failed. Invalid revision or time: '{since}'\n\n"
                     "Examples:\n  - HEAD~10 (last 10 commits)\n"
                     "  - main (since diverging from main)\n  - 3.days.ago (relative time)"
@@ -621,21 +594,60 @@ async def search_changed(  # noqa: PLR0911
         raw_files = {f.strip() for f in git_result.stdout.strip().split("\n") if f.strip()}
         if rel_prefix == ".":
             # Indexed path IS the repo root — paths already match
-            changed_files = raw_files
-        else:
-            # Indexed path is a subdirectory — strip the prefix
-            prefix = rel_prefix + "/"
-            changed_files = {
-                f[len(prefix):] for f in raw_files if f.startswith(prefix)
-            }
-
-        if not changed_files:
-            return f"No files changed since '{since}'."
+            return raw_files, ""
+        # Indexed path is a subdirectory — strip the prefix
+        prefix = rel_prefix + "/"
+        return {f[len(prefix):] for f in raw_files if f.startswith(prefix)}, ""
 
     except subprocess.TimeoutExpired:
-        return "Error: Git command timed out."
+        return set(), "Error: Git command timed out."
     except FileNotFoundError:
-        return "Error: git command not found. Ensure git is installed and in PATH."
+        return set(), "Error: git command not found. Ensure git is installed and in PATH."
+
+
+@mcp.tool()
+@tool_error_handler
+async def search_changed(  # noqa: PLR0911
+    query: str,
+    path: str = ".",
+    since: str = "HEAD~10",
+    limit: int = 10,
+    output_format: Literal["text", "json", "markdown"] = "text",
+) -> str:
+    """
+    Search only in files that have changed since a given commit or time.
+
+    The changed-file set is pushed into the retrieval layer as a Qdrant
+    payload filter, so ranking happens within the changed files only and
+    a match cannot be lost below a candidate pool. For very large change
+    sets (over 500 files) the tool falls back to post-filtering a
+    bounded candidate pool to keep filter payloads small.
+
+    Args:
+        query: Natural language description of what you're looking for
+        path: Root path of git repository (defaults to current directory)
+        since: Git revision or time to compare against (e.g., "HEAD~10", "main", "3.days.ago")
+        limit: Max results to return (default 10)
+        output_format: Output format - "text" (default), "json", or "markdown"
+
+    Returns:
+        Search results filtered to changed files
+    """
+    if not query or not query.strip():
+        return "Error: Query cannot be empty."
+
+    limit = validate_limit(limit, default=10)
+
+    path_result = validate_directory_path(path)
+    if isinstance(path_result, dict):
+        return format_error(path_result)
+    abs_path = str(path_result)
+
+    changed_files, git_error = _changed_files_since(path, abs_path, since)
+    if git_error:
+        return git_error
+    if not changed_files:
+        return f"No files changed since '{since}'."
 
     # Auto-index if needed
     files_indexed, chunks_indexed, stats, error = await auto_index(abs_path)
@@ -646,14 +658,39 @@ async def search_changed(  # noqa: PLR0911
     if files_indexed > 0 and stats:
         index_msg = f"[Indexed {files_indexed} files, {chunks_indexed} chunks]\n\n"
 
-    # Search with higher limit to filter
     storage = await get_storage()
     embedder = await get_embedder()
     global_vocab = await get_global_vocab()
 
-    # Fetch a large candidate pool: results are post-filtered by changed
-    # paths, so matches ranking below this pool are invisible (see docstring).
-    candidate_pool = min(limit * 20, 200)
+    # Push the changed-file set into retrieval as an exact path filter, so
+    # ranking happens within the changed files only — a modest candidate
+    # pool suffices because nothing outside the set can consume it. Beyond
+    # _MAX_PUSHDOWN_PATHS the filter payload would get unwieldy, so fall
+    # back to post-filtering a large candidate pool (the pre-pushdown
+    # behavior, where matches below the pool are invisible).
+    #
+    # The modest pool is only safe when nothing else is post-filtered: a
+    # query carrying its own structured constraints (path:/-path:/file:/
+    # fn:/class:/scope:) still discards candidates after retrieval, so it
+    # keeps the large pool — the pushdown then makes that pool strictly
+    # more effective, never smaller, than before.
+    _MAX_PUSHDOWN_PATHS = 500
+    parsed = parse_query(query)
+    has_post_filters = bool(
+        parsed.path_prefix
+        or parsed.exclude_paths
+        or parsed.file_pattern
+        or parsed.function_name
+        or parsed.class_name
+        or parsed.scope
+    )
+    use_pushdown = len(changed_files) <= _MAX_PUSHDOWN_PATHS
+    if use_pushdown:
+        candidate_pool = min(limit * 20, 200) if has_post_filters else limit * 2
+        restrict_paths = sorted(changed_files)
+    else:
+        candidate_pool = min(limit * 20, 200)
+        restrict_paths = None
     try:
         results = await search_codebase(
             query=query,
@@ -663,6 +700,7 @@ async def search_changed(  # noqa: PLR0911
             global_vocab=global_vocab,
             mode="both",
             limit=candidate_pool,
+            restrict_paths=restrict_paths,
         )
     except EmbeddingServiceError as e:
         return (
@@ -670,17 +708,43 @@ async def search_changed(  # noqa: PLR0911
             "Ensure the embedding service is running and accessible."
         )
 
-    # Filter to only changed files
+    # Intersect with the changed-file set. Under pushdown this is
+    # belt-and-suspenders (retrieval was already constrained); in the
+    # large-change-set fallback it is the actual filter.
     filtered_results = [r for r in results if r.path in changed_files][:limit]
 
     if not filtered_results:
+        # The definitive "no matches exist" claim is only justified when
+        # retrieval was constrained to the changed files AND nothing was
+        # post-filtered afterwards; structured query filters still discard
+        # candidates from a bounded pool, so they keep the hedged wording.
+        if use_pushdown and not has_post_filters:
+            return (
+                index_msg + f"No matches for this query in the "
+                f"{len(changed_files)} files changed since '{since}'.\n\n"
+                "Try a broader query, a different time range, or "
+                "force_reindex if the index may be stale."
+            )
+        if use_pushdown:
+            return (
+                index_msg + f"No matches for this query among the top "
+                f"{len(results)} search results within the "
+                f"{len(changed_files)} files changed since '{since}'.\n\n"
+                "The query's structured filters (path:/-path:/file:/fn:/"
+                "class:/scope:) are applied to a bounded candidate pool, so "
+                "a weaker match in a changed file may rank below it. Try a "
+                "narrower query, a different time range, or force_reindex "
+                "if the index may be stale."
+            )
         return (
             index_msg + f"No matches for this query among the top "
             f"{len(results)} search results within the {len(changed_files)} "
             f"files changed since '{since}'.\n\n"
-            "A weaker match in a changed file may rank below this candidate "
-            "pool. Try a narrower query, a different time range, or "
-            "force_reindex if the index may be stale."
+            f"With more than {_MAX_PUSHDOWN_PATHS} changed files the search "
+            "post-filters a bounded candidate pool, so a weaker match in a "
+            "changed file may rank below it. Try a narrower query, a "
+            "different time range, or force_reindex if the index may be "
+            "stale."
         )
 
     header = (
