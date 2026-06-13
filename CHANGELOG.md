@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.2] - 2026-06-13
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.6. v1.2.6 fixes `FactIndexer.index_all()`/`_train_vocabulary()` to index the complete fact corpus instead of the 50 most-recently-modified facts and to register the sparse vocabulary from all facts. mcp-codesearch does not use the fact indexer (it indexes code, not facts), so no behavior of this server changes; this keeps the pin current with the shared library.
+
 ## [1.6.1] - 2026-06-13
 
 ### Fixed
