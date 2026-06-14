@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.3] - 2026-06-14
+
+### Changed
+
+- Bumped the shared `vector-core` library to v1.2.7 (FactStore: case-insensitive `query()`/`list_summaries()` type filters + rejection of inverted `valid_from`/`valid_to` ranges). mcp-codesearch indexes code and does not use FactStore, so no behavior of this server changes; this keeps the pin current with the shared library.
+
 ## [1.6.2] - 2026-06-13
 
 ### Changed
