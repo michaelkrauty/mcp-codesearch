@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.4] - 2026-06-19
+
+### Fixed
+
+- **`find_references` no longer reports "No references found" for a symbol that is referenced but defined in many places.** The exact-match scan stops scrolling once it has collected 10 high-quality (name/summary) matches. That optimization is only safe when ranking, but `find_references` calls the scan with `rank=False` and then discards the name-equal definitions to surface usages. On a collection larger than one scroll page (1000 points), if the first page held 10 or more same-named definitions, the scan stopped before fetching later pages, so the actual usages (which scroll into those later pages) were never read and the tool returned nothing despite real references existing. The same early stop also affected the path-/scope-filtered exact search (`code_search "sym path:src"`), which likewise post-filters the scroll-order pool. Early termination is now gated on `rank`, so a `rank=False` scan reads the full scroll-order pool up to its cap; `scan_cap` and the scroll-iteration limit still bound the work, and ranked searches are unchanged.
+
 ## [1.6.3] - 2026-06-14
 
 ### Changed
