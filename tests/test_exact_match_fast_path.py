@@ -268,3 +268,27 @@ class TestExactMatchRankFalse:
         )
         content_refs = [r for r in results if r.score == 1.0]
         assert len(content_refs) == 3  # all references present, not ranked away
+
+    @pytest.mark.asyncio
+    async def test_rank_false_does_not_early_terminate_across_scroll_pages(self, storage):
+        # Multi-batch version of the above: the name-match definitions (the
+        # high-quality tier find_references discards) all land in the FIRST
+        # scroll page, the references in a LATER page. High-quality early
+        # termination must NOT stop the scroll after page one, or the
+        # references are never fetched and find_references reports none. The
+        # single-page test above cannot catch this since it never advances
+        # past page one. limit (30) exceeds page one's matches so scan_cap is
+        # not what stops it — only the early-termination gate matters here.
+        defs = [_point(100 + i, name="foo") for i in range(12)]  # 12 name matches (3.0)
+        refs = [_point(i, content="uses foo here") for i in range(1, 4)]  # 3 usages (1.0)
+        storage._client_mock.scroll = AsyncMock(
+            side_effect=[(defs, "page2"), (refs, None)]
+        )
+
+        results = await storage.exact_match_search(
+            "col", "foo", mode="chunk", limit=30, rank=False
+        )
+
+        # Both scroll pages must be fetched, so the references survive.
+        assert storage._client_mock.scroll.call_count == 2
+        assert len([r for r in results if r.score == 1.0]) == 3

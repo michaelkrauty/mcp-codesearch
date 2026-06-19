@@ -954,7 +954,12 @@ class QdrantStorage:
         the top tier — ``find_references`` drops the name-equal definition to
         surface usages — pass ``rank=False`` to keep the first ``limit``
         matches in scroll order instead, so the tier they want is not ranked
-        away before they filter.
+        away before they filter. rank=False also disables the high-quality
+        early termination: a caller that discards the top tier (or applies an
+        un-pushed path:/scope: post-filter) must see the full scroll-order
+        pool up to ``limit``, not a scan cut short once enough name/summary
+        matches are reached and then dropped, which would starve the lower
+        tier across later scroll pages. ``scan_cap`` still bounds the scan.
         """
         client = await self._get_client()
         query_lower = query.lower()
@@ -1082,8 +1087,15 @@ class QdrantStorage:
         for _iteration in range(self._MAX_SCROLL_ITERATIONS):
             if len(results) >= scan_cap:
                 break
-            # Early termination: if we have enough high-quality results, stop searching
-            if high_quality_count >= _EARLY_TERMINATION_THRESHOLD:
+            # Early termination: once enough high-quality (name/summary) matches
+            # are in hand, stop scrolling. This is only safe when ranking: a
+            # rank=False caller post-processes the full scroll-order pool
+            # (find_references discards the name-match definitions to surface
+            # usages; search_codebase applies un-pushed path:/scope: filters),
+            # so cutting the scroll short on high-quality count starves the
+            # lower-tier matches it actually wants. scan_cap still bounds the
+            # rank=False scan.
+            if rank and high_quality_count >= _EARLY_TERMINATION_THRESHOLD:
                 break
             points, offset = await client.scroll(
                 collection,
