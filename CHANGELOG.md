@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.5] - 2026-06-19
+
+### Changed
+
+- Bumped `vector-core` to `v1.2.8`. Pure dependency hygiene: v1.2.8 fixes `SparseVectorizer.extend_vocab` IDF recomputation and the `limit=0` semantics of two library list methods, plus two docstring corrections. mcp-codesearch builds sparse vectors through `GlobalVocabulary` (not the standalone `SparseVectorizer`) and never passes `limit=0` to those stores, so no behavior of this server changes. This keeps the pin current with the shared library.
+
 ## [1.6.4] - 2026-06-19
 
 ### Fixed
