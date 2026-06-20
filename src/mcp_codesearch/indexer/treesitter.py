@@ -326,6 +326,14 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
 
         if is_container and lines > settings.class_split_threshold:
             overview_content = _generate_class_overview(type_node, source, name, language)
+            # The overview is built from the inner class node and would drop the
+            # @decorator lines that precede it; prepend them so the overview
+            # chunk still contains the class decorators. The slice is empty for
+            # an undecorated class (where type_node is node), making this a no-op.
+            decorators = source[node.start_byte:type_node.start_byte].decode(
+                "utf-8", errors="ignore"
+            )
+            overview_content = decorators + overview_content
             chunks.append(Chunk(
                 content=overview_content,
                 chunk_type="class_overview",

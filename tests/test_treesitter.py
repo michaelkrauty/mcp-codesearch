@@ -221,6 +221,21 @@ class Widget:
         method_names = {c.name for c in chunks if c.chunk_type == "function"}
         assert "method_0" in method_names and "method_19" in method_names
 
+    def test_decorated_large_class_overview_keeps_decorator(self):
+        """The class_overview for a large decorated class includes the decorator
+        line, so searches that rely on the decorator still match it."""
+        methods = "\n".join(
+            f"    def method_{i}(self):\n        '''doc {i}'''\n        return {i}\n"
+            for i in range(20)
+        )
+        code = f"@dataclass\nclass Big:\n{methods}"
+        chunks = chunk_with_treesitter(code, "python")
+        overview = [
+            c for c in chunks if c.chunk_type == "class_overview" and c.name == "Big"
+        ]
+        assert len(overview) == 1
+        assert "@dataclass" in overview[0].content
+
     def test_decorated_method_in_class_is_function(self):
         """A decorated method inside a class is typed as a function."""
         code = '''class Service:
