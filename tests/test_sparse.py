@@ -120,8 +120,8 @@ class TestVocabExtension:
         old_hello_idf = vectorizer._idf.get("hello", 0)
         old_world_idf = vectorizer._idf.get("world", 0)
 
-        # Add docs WITH "hello" - this will update hello's IDF
-        # extend_vocab only updates IDF for tokens that appear in new docs
+        # Add docs WITH "hello". extend_vocab recomputes IDF for the whole
+        # vocabulary because the corpus size changed (vector-core >= 1.2.8).
         vectorizer.extend_vocab(["hello there", "hello everybody"])
 
         new_hello_idf = vectorizer._idf.get("hello", 0)
@@ -129,8 +129,9 @@ class TestVocabExtension:
         # hello now appears in 4 of 5 docs vs 2 of 3 docs
         assert new_hello_idf != old_hello_idf
 
-        # world's IDF should stay the same (not in new docs)
-        assert vectorizer._idf.get("world") == old_world_idf
+        # "world"'s IDF is also recomputed: the corpus grew (3 -> 5 docs), so
+        # its IDF rises even though it is absent from the new docs.
+        assert vectorizer._idf.get("world") != old_world_idf
 
 
 class TestVocabConsistency:

@@ -559,34 +559,54 @@ def _changed_files_since(  # noqa: PLR0911
     if not is_valid:
         return set(), validated_result
 
+    git_error = (
+        f"Error: Git command failed. Invalid revision or time: '{since}'\n\n"
+        "Examples:\n  - HEAD~10 (last 10 commits)\n"
+        "  - main (since diverging from main)\n  - 3.days.ago (relative time)"
+    )
+
     # Get list of changed files from git
     try:
-        # Use transformed value if provided, otherwise use original
-        git_since = validated_result if validated_result else since
-
-        git_result = subprocess.run(
-            ["git", "diff", "--name-only", git_since],
-            check=False, cwd=git_root,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        if git_result.returncode != 0:
+        if validated_result:
+            # A relative time (e.g. "3 days ago"): files touched by commits
+            # since then.
             git_result = subprocess.run(
-                ["git", "log", "--since", git_since, "--name-only", "--pretty=format:"],
+                ["git", "log", "--since", validated_result, "--name-only", "--pretty=format:"],
                 check=False, cwd=git_root,
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
-
             if git_result.returncode != 0:
-                return set(), (
-                    f"Error: Git command failed. Invalid revision or time: '{since}'\n\n"
-                    "Examples:\n  - HEAD~10 (last 10 commits)\n"
-                    "  - main (since diverging from main)\n  - 3.days.ago (relative time)"
-                )
+                return set(), git_error
+        else:
+            # A revision (branch/tag/commit/HEAD~N): the files changed since
+            # HEAD diverged from it, INCLUDING uncommitted work. Diff the
+            # working tree against the MERGE-BASE rather than the revision tip:
+            # a bare `git diff <rev>` compares against the tip, so a branch that
+            # advanced after divergence would pollute the set with files the
+            # user never touched (the docs/error text below promise "since
+            # diverging from main"). For an ancestor revision (e.g. HEAD~10)
+            # the merge-base is the revision itself, so the result is unchanged.
+            base_result = subprocess.run(
+                ["git", "merge-base", since, "HEAD"],
+                check=False, cwd=git_root,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if base_result.returncode != 0:
+                return set(), git_error
+            merge_base = base_result.stdout.strip()
+            git_result = subprocess.run(
+                ["git", "diff", "--name-only", merge_base],
+                check=False, cwd=git_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if git_result.returncode != 0:
+                return set(), git_error
 
         # Git returns paths relative to repo root. Convert to be relative to
         # the indexed codebase path so they match search result paths.
