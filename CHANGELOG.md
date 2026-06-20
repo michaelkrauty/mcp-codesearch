@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.9] - 2026-06-20
+
+### Fixed
+
+- **`cleanup_orphans` no longer deletes a still-valid collection when its codebase path cannot be confirmed.** A collection was treated as an orphan, and deleted, whenever its path could not be determined or did not exist on disk. That swept up cases where the path was merely unreadable at the time: a transient backend error while reading the collection's metadata or inferring its path made the path look unknown, and a codebase on an unmounted removable or network volume made the path look absent, so a temporarily unavailable codebase was mistaken for a deleted one and its index destroyed. A backend error while reading one collection also aborted the entire cleanup. `cleanup_orphans` now deletes a collection only on positive confirmation that the codebase is gone (a path was determined and is confirmed absent on disk). Any uncertainty, an undeterminable path, a backend error, or an inaccessible location (raising `OSError`), keeps the collection and reports it as skipped, and a per-collection error no longer aborts the run. The classification was extracted into a helper for clarity. Note: a codebase on a removable or network volume still looks deleted if the volume is unmounted but readable as an empty mount point, so run `cleanup_orphans` while those volumes are mounted.
+
 ## [1.6.8] - 2026-06-20
 
 ### Fixed
