@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.11] - 2026-06-20
+
+### Changed
+
+- Bumped `vector-core` to `v1.2.9`. This improves fuzzy query-token matching: vector-core no longer caps fuzzy match candidates before scoring, so a typo or rare token in a search query reliably finds its closest vocabulary term instead of occasionally missing it on a large vocabulary (`vectorize_query` has fuzzy matching on by default, which the search path uses). v1.2.9 also guards against an unscoped fact-source status reset and corrects a latent query field-prefix parser, neither of which mcp-codesearch exercises.
+
 ## [1.6.10] - 2026-06-20
 
 ### Fixed
