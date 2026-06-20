@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.6] - 2026-06-19
+
+### Fixed
+
+- **`search_changed(since="<branch>")` now reports only what changed since the branch diverged, not files the target branch advanced on afterwards.** `_changed_files_since` ran `git diff --name-only <since>`, a two-dot diff against the *tip* of `<since>`. For a branch revision like `main` that has advanced since you branched off it, that set wrongly included files changed on `main` after the divergence and never touched on your branch, so `search_changed` could return matches in files you never modified, contradicting the documented "since diverging from main" intent. It now diffs the working tree against the merge-base of `<since>` and `HEAD`, so the result is exactly what changed on your side of the divergence, including uncommitted work. Ancestor revisions such as `HEAD~10` are unaffected (the merge-base is the revision itself), and relative-time queries (`3.days.ago`) still use `git log --since`.
+- Aligned the vendored `SparseVectorizer` IDF test with vector-core 1.2.8, which recomputes IDF for the whole vocabulary on `extend_vocab` (the test still asserted the older new-tokens-only behavior).
+
 ## [1.6.5] - 2026-06-19
 
 ### Changed
