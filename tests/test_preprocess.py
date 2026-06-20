@@ -192,6 +192,18 @@ class TestParseQueryEdgeCases:
         assert result.scope == "function"
         assert result.text == "handler"
 
+    def test_scope_struct_enum_module_normalized_to_class(self):
+        """scope:struct/enum/interface/type/module collapse onto the class
+        bucket and are stripped from the embedded query text."""
+        from mcp_codesearch.search.preprocess import parse_query
+
+        for token in ("struct", "enum", "interface", "type", "module"):
+            result = parse_query(f"handler scope:{token}")
+
+            assert result.scope == "class", token
+            assert result.text == "handler", token
+            assert "scope:" not in result.text, token
+
     def test_docs_prefix_not_parsed_as_filter(self):
         """docs: prefix is treated as plain text (feature removed)."""
         from mcp_codesearch.search.preprocess import parse_query

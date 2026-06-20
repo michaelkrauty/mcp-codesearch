@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import re
 from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
@@ -169,6 +170,43 @@ def _normalize_scores(results: list[SearchResult]) -> list[SearchResult]:
     return results
 
 
+# A result counts as a "test" result (scope:test / scope:impl) when its path
+# sits under a test directory, or its filename / symbol name carries a "test"
+# or "spec" word. Matching is tokenized on word boundaries (camelCase humps,
+# snake_case, dots, dashes, surrounding punctuation) so conventions like
+# tests/, __tests__/, integration_tests/, test_foo, foo_test, UserServiceTest,
+# TestUserService, FooSpec, tests.py, foo.test.ts and bar.spec.js are all
+# detected, while substrings such as "contest", "latest", "attestation",
+# "protest" or "fastest" are not misclassified as tests.
+_WORD_SPLIT_RE = re.compile(
+    r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+_TEST_WORDS = frozenset({"test", "tests", "spec", "specs"})
+
+
+def _word_tokens(text: str) -> set[str]:
+    """Split an identifier or filename into lowercase word tokens."""
+    return {tok.lower() for tok in _WORD_SPLIT_RE.split(text) if tok}
+
+
+def _is_test_result(result: SearchResult) -> bool:
+    """Whether a result belongs to test code, by tokenized path/name matching."""
+    components = result.path.split("/")
+    # Any ancestor directory that tokenizes to a test/spec directory (tests/,
+    # __tests__/, spec/, integration_tests/, ...) marks everything under it,
+    # including helpers with neutral filenames (e.g. spec/support/factory.rb).
+    for directory in components[:-1]:
+        if _TEST_WORDS & _word_tokens(directory):
+            return True
+    # Filename carrying a test/spec word: test_x, x_test, XTest, FooSpec,
+    # tests.py, foo.test.ts, bar.spec.js.
+    filename = components[-1] if components else ""
+    if _TEST_WORDS & _word_tokens(filename):
+        return True
+    # Symbol name carrying a test/spec word: test_x, TestX, XTest, FooSpec.
+    return bool(result.name and _TEST_WORDS & _word_tokens(result.name))
+
+
 def _filter_by_parsed_query(  # noqa: PLR0912
     results: list[SearchResult],
     parsed: ParsedQuery,
@@ -250,19 +288,11 @@ def _filter_by_parsed_query(  # noqa: PLR0912
     # Filter by scope (chunk type)
     if parsed.scope:
         if parsed.scope == "test":
-            # Test scope: include only results from test files or with test-like names
-            filtered = [
-                r for r in filtered
-                if "test" in r.path.lower()
-                or (r.name and "test" in r.name.lower())
-            ]
+            # Test scope: include only results from test files or test-like names
+            filtered = [r for r in filtered if _is_test_result(r)]
         elif parsed.scope == "impl":
-            # Implementation scope: exclude test files
-            filtered = [
-                r for r in filtered
-                if "test" not in r.path.lower()
-                and (not r.name or "test" not in r.name.lower())
-            ]
+            # Implementation scope: exclude test files and test-like names
+            filtered = [r for r in filtered if not _is_test_result(r)]
         elif parsed.scope == "function":
             # Only function/method chunks
             filtered = [
@@ -270,8 +300,19 @@ def _filter_by_parsed_query(  # noqa: PLR0912
                 if r.chunk_type and r.chunk_type in ("function", "method")
             ]
         elif parsed.scope == "class":
-            # Only class/struct/interface chunks
-            class_types = ("class", "class_overview", "struct", "interface", "impl")
+            # Only class-like chunks. Includes the structural and type-definition
+            # chunk types the indexer emits (enum, type aliases, module),
+            # which scope:struct/enum/interface/type/module also normalize to.
+            class_types = (
+                "class",
+                "class_overview",
+                "struct",
+                "interface",
+                "impl",
+                "enum",
+                "type",
+                "module",
+            )
             filtered = [
                 r for r in filtered
                 if r.chunk_type and r.chunk_type in class_types
