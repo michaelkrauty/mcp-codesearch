@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.10] - 2026-06-20
+
+### Fixed
+
+- **Decorated Python definitions are now chunked by their real kind, and decorated classes are split into per-method chunks.** A decorated `def` or `class` is wrapped in a `decorated_definition` node. The chunker unwrapped it only to read the name; the chunk-type and container decisions still looked at the wrapper, whose type contains none of the kind keywords, so every decorated function or method was stored as a generic `block` instead of `function`, and every decorated class as `block` instead of `class`. Because the wrapper was not recognized as a container, a decorated class also skipped its `class_overview` chunk and never recursed into its body, so none of its methods were emitted as their own chunks. This silently degraded search: `scope:function` and `scope:class` dropped decorated definitions (decorators like `@property`, `@staticmethod`, `@dataclass`, `@app.route`, and `@pytest.fixture` are pervasive), and a decorated class's methods were absent from the chunk index entirely. The chunker now drives the type, container, overview, and child-traversal decisions off the inner definition node while keeping the chunk content and line range on the outer node so the decorators stay part of the chunk. Existing collections pick up the corrected chunking as their files change or on the next force re-index.
+
 ## [1.6.9] - 2026-06-20
 
 ### Fixed

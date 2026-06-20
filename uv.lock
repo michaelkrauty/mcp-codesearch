@@ -515,7 +515,7 @@ wheels = [
 
 [[package]]
 name = "mcp-codesearch"
-version = "1.6.9"
+version = "1.6.10"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },

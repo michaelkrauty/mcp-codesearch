@@ -299,21 +299,33 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
         text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
         name = _get_node_name(node, source)
 
-        # Handle decorated definitions (Python)
+        # Handle decorated definitions (Python). The wrapper node carries the
+        # decorators, but the type and container decisions, the overview
+        # generation, and the child traversal must run on the inner definition
+        # (function_definition / class_definition). Driving them off the wrapper
+        # types every decorated def as a generic "block" and a decorated class
+        # never yields its overview or per-method chunks. The chunk content and
+        # line range stay on the outer node so the decorators remain part of it.
+        type_node = node
         if node.type == "decorated_definition":
             for child in node.children:
                 if child.type in definition_types:
                     name = _get_node_name(child, source)
+                    type_node = child
                     break
 
-        chunk_type = _node_to_chunk_type(node.type)
+        chunk_type = _node_to_chunk_type(type_node.type)
         full_context = _build_context_path(context_parts)
 
-        is_container = "class" in node.type or "struct" in node.type or "impl" in node.type
+        is_container = (
+            "class" in type_node.type
+            or "struct" in type_node.type
+            or "impl" in type_node.type
+        )
         lines = node.end_point[0] - node.start_point[0] + 1
 
         if is_container and lines > settings.class_split_threshold:
-            overview_content = _generate_class_overview(node, source, name, language)
+            overview_content = _generate_class_overview(type_node, source, name, language)
             chunks.append(Chunk(
                 content=overview_content,
                 chunk_type="class_overview",
@@ -333,11 +345,11 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
             ))
 
         if is_container:
-            type_prefix = "class" if "class" in node.type else chunk_type
+            type_prefix = "class" if "class" in type_node.type else chunk_type
             new_context = (
                 context_parts + [f"{type_prefix}:{name}"] if name else context_parts
             )
-            for child in reversed(node.children):
+            for child in reversed(type_node.children):
                 stack.append((child, new_context))
 
     return chunks
