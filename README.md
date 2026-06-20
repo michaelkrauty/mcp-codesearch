@@ -143,6 +143,8 @@ code_search("error scope:function")    # Only function chunks
 code_search("model scope:class")       # Only class chunks
 code_search("validate scope:test")     # Only test functions
 code_search("handler scope:impl")      # Non-test code only
+# scope:method is an alias for scope:function; scope:struct, scope:enum,
+# scope:interface, scope:type and scope:module are aliases for scope:class
 ```
 
 ## Search Modes

@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.7] - 2026-06-20
+
+### Fixed
+
+- **`scope:test` and `scope:impl` now classify results by tokenized path and name matching instead of a bare `"test"` substring.** The filter kept a result for `scope:test` (and dropped it for `scope:impl`) whenever the literal `test` appeared anywhere in its path or symbol name, so files and symbols like `contest`, `latest`, `attestation`, `protest`, and `fastest` were misclassified as tests. A result now counts as a test only when its path, filename, or symbol name carries a `test` or `spec` word on a token boundary (camelCase humps, snake_case, dots, dashes). This recognizes the common conventions across ecosystems, including `tests/` and `__tests__/` directories, `test_foo.py`, `foo_test.go`, `UserServiceTest.java`, `FooSpec.kt`, `tests.py`, `foo.test.ts`, and `bar.spec.js`, while no longer treating substrings such as `contest` or `latest` as tests.
+- **`scope:class` now also matches `enum`, type-alias, and `module` chunks.** The indexer emits `enum`, `type`, and `module` chunk types, but the `scope:class` filter only kept `class`, `class_overview`, `struct`, `interface`, and `impl`, so those definitions were silently excluded. They are now included.
+- **`scope:struct`, `scope:enum`, `scope:interface`, `scope:type`, and `scope:module` are now recognized and normalized to `scope:class`.** Previously only `scope:function|class|method|test|impl` were parsed; any other scope token was left untouched in the query, applied no filter (a silent no-op), and leaked the literal `scope:...` text into the embedding query. `scope:method` continues to normalize to `scope:function`.
+
 ## [1.6.6] - 2026-06-19
 
 ### Fixed

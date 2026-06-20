@@ -353,13 +353,22 @@ def parse_query(query: str) -> ParsedQuery:
         result.path_prefix = match.group(1)
         remaining = remaining[:match.start()] + remaining[match.end():]
 
-    # scope:type - filter by chunk type (function, class, test, impl)
-    match = re.search(r'\bscope:(function|class|method|test|impl)\b', remaining, re.I)
+    # scope:type - filter by chunk type. The structural and type-definition
+    # kinds (struct, enum, interface, type, module) collapse onto the "class"
+    # bucket, mirroring how type:/struct: are treated above; method collapses
+    # to function. Recognizing them here also strips the token from the
+    # embedded query text instead of leaking it into the semantic search.
+    match = re.search(
+        r'\bscope:(function|class|method|test|impl|struct|enum|interface|type|module)\b',
+        remaining,
+        re.I,
+    )
     if match:
         scope_val = match.group(1).lower()
-        # Normalize: method -> function
         if scope_val == "method":
             scope_val = "function"
+        elif scope_val in ("struct", "enum", "interface", "type", "module"):
+            scope_val = "class"
         result.scope = scope_val
         remaining = remaining[:match.start()] + remaining[match.end():]
 

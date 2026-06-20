@@ -814,3 +814,90 @@ class TestFilterByParsedQueryEdgeCases:
         assert "MyClass" in names
         assert "MyStruct" in names
         assert "Overview" in names
+
+    def test_scope_test_anchored_rejects_substrings(self):
+        """scope:test anchors on path/name and does not match substrings such
+        as contest/latest/attestation."""
+        parsed = ParsedQuery(text="", scope="test", exclude_paths=[])
+        results = [
+            self._make_result("src/contest.py", name="contest"),
+            self._make_result("src/latest.py", name="latest"),
+            self._make_result("src/attestation.py", name="attestation"),
+            self._make_result("tests/test_main.py", name="test_main"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        # Only the genuine test file survives.
+        assert [r.path for r in filtered] == ["tests/test_main.py"]
+
+    def test_scope_impl_keeps_nontest_substrings(self):
+        """scope:impl keeps non-test files whose name merely contains 'test' as
+        a substring, and drops genuine tests."""
+        parsed = ParsedQuery(text="", scope="impl", exclude_paths=[])
+        results = [
+            self._make_result("src/contest.py", name="contest"),
+            self._make_result("src/latest.py", name="latest"),
+            self._make_result("src/attestation.py", name="attestation"),
+            self._make_result("tests/test_main.py", name="test_main"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        assert [r.path for r in filtered] == [
+            "src/contest.py",
+            "src/latest.py",
+            "src/attestation.py",
+        ]
+
+    def test_scope_class_includes_enum_type_module(self):
+        """scope:class includes enum, type-alias and module chunk types, which
+        the indexer also emits, alongside class/struct/interface."""
+        parsed = ParsedQuery(text="", scope="class", exclude_paths=[])
+        results = [
+            self._make_result("src/m.py", name="C", chunk_type="class"),
+            self._make_result("src/m.py", name="E", chunk_type="enum"),
+            self._make_result("src/m.py", name="T", chunk_type="type"),
+            self._make_result("src/m.py", name="M", chunk_type="module"),
+            self._make_result("src/m.py", name="S", chunk_type="struct"),
+            self._make_result("src/m.py", name="O", chunk_type="class_overview"),
+            self._make_result("src/m.py", name="f", chunk_type="function"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        kept = {r.name for r in filtered}
+        assert kept == {"C", "E", "T", "M", "S", "O"}
+
+    def test_scope_test_recognizes_common_conventions(self):
+        """scope:test detects test directory and filename conventions across
+        ecosystems (Jest __tests__, JUnit *Test, RSpec/Kotlin *Spec, dotted
+        *.test/*.spec, Django tests.py, prefix Test* class names)."""
+        parsed = ParsedQuery(text="", scope="test", exclude_paths=[])
+        results = [
+            self._make_result("src/__tests__/helpers.ts", name="buildUser"),
+            self._make_result("app/UserServiceTest.java", name="setUp"),
+            self._make_result("app/FooTests.cs", name="Setup"),
+            self._make_result("src/OrderSpec.kt", name="describe"),
+            self._make_result("pkg/foo.test.ts", name="render"),
+            self._make_result("pkg/bar.spec.js", name="mount"),
+            self._make_result("app/tests.py", name="run"),
+            self._make_result("src/main.py", name="TestUserService"),
+            self._make_result("integration_tests/runner.py", name="run"),
+            self._make_result("spec/support/factory_bot.rb", name="configure"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        # Every result is recognized as a test.
+        assert len(filtered) == len(results)
+
+    def test_scope_impl_keeps_substrings_drops_conventions(self):
+        """scope:impl drops the test conventions above but keeps implementation
+        files whose path/name merely contain a test substring."""
+        parsed = ParsedQuery(text="", scope="impl", exclude_paths=[])
+        results = [
+            self._make_result("src/__tests__/helpers.ts", name="buildUser"),
+            self._make_result("app/UserServiceTest.java", name="setUp"),
+            self._make_result("src/contest.py", name="latestEntry"),
+            self._make_result("src/service.py", name="manifest"),
+        ]
+        filtered = _filter_by_parsed_query(results, parsed)
+
+        assert [r.path for r in filtered] == ["src/contest.py", "src/service.py"]
