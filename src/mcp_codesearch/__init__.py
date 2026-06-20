@@ -1,6 +1,6 @@
 """MCP Code Search - Semantic code search using Qdrant and OpenAI-compatible embeddings"""
 
-__version__ = "1.6.12"
+__version__ = "1.6.13"
 
 
 def main() -> None:

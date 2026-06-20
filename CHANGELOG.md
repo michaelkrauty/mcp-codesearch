@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.13] - 2026-06-20
+
+### Changed
+
+- Bump vector-core to v1.2.10 (fixes a `find_connections` duplicate-entity bug in the shared facts graph).
+
 ## [1.6.12] - 2026-06-20
 
 ### Fixed
