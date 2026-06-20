@@ -145,15 +145,31 @@ class IndexingService:
             exists = await self._storage.collection_exists(col_name)
 
             if not exists or force:
-                # Full index
+                # Full index. The existing collection is destroyed before the
+                # rebuild, so a failure partway through must not leave a corrupt
+                # state behind: the shared global vocabulary would otherwise keep
+                # this codebase's full token contribution (skewing IDF for every
+                # other indexed codebase) and a surviving partial collection
+                # would make the next access run an *incremental* index that
+                # double-counts those already-registered tokens. On any failure
+                # roll back to a clean "not indexed" state instead.
                 if exists:
                     # Unregister vocab FIRST, then delete collection
                     self._safe_unregister_vocab(col_name)
                     await self._storage.delete_collection(col_name)
-                await self._storage.create_collection(col_name)
 
-                files = list(discover_files(codebase_path))
-                return await self._full_index(col_name, files, abs_path)
+                # Everything from collection (re)creation onward can fail and
+                # leave a partial or empty collection plus a stale vocabulary
+                # registration behind (file discovery can raise on a malformed
+                # ignore pattern, the batch loop on a transient embed/Qdrant
+                # error), so guard the whole rebuild and roll back on any failure.
+                try:
+                    await self._storage.create_collection(col_name)
+                    files = list(discover_files(codebase_path))
+                    return await self._full_index(col_name, files, abs_path)
+                except Exception:
+                    await self._rollback_failed_full_index(col_name)
+                    raise
             else:
                 # Reuse of an existing collection: make sure its stored vectors
                 # are still compatible with the current embedding model before
@@ -292,6 +308,30 @@ class IndexingService:
         except Exception as e:
             logger.warning(f"Failed to unregister vocabulary for {col_name}: {e}")
             return False
+
+    async def _rollback_failed_full_index(self, col_name: str) -> None:
+        """Undo the partial side effects of a full index that failed midway.
+
+        A full (re)index registers this codebase's token contribution with the
+        shared global vocabulary in Phase 1, before any points are embedded and
+        upserted in Phase 2. If Phase 2 raises, the contribution is left behind
+        even though the collection holds few or no points, which skews IDF for
+        every other codebase; and the partial collection, if kept, would steer
+        the next access onto the incremental path, which adds the same tokens a
+        second time. Removing both leaves a clean "not indexed" state so the
+        next access does a fresh full index.
+
+        Best-effort: each step is independent and its failure is logged, not
+        raised, so the original indexing error is the one that propagates.
+        """
+        self._safe_unregister_vocab(col_name)
+        try:
+            await self._storage.delete_collection(col_name)
+        except Exception as e:
+            logger.warning(
+                f"Failed to drop partial collection {col_name} after a failed "
+                f"full index: {e}"
+            )
 
     async def delete(self, codebase_path: str) -> bool:
         """
