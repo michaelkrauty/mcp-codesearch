@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.8] - 2026-06-20
+
+### Fixed
+
+- **A force re-index that fails partway through no longer corrupts the shared global vocabulary or leaves a partial collection that double-counts on the next access.** A forced full re-index drops the existing collection and rebuilds it, registering the codebase's full token contribution with the shared global vocabulary in Phase 1, before any points are embedded and upserted in Phase 2. If Phase 2 raised (a transient embedding-service or Qdrant error), the old index was already gone, the new collection held few or no points, and the full vocabulary contribution stayed registered, skewing IDF and therefore sparse ranking for every other indexed codebase. Worse, the surviving partial collection steered the next access onto the incremental path, whose additive vocabulary update counted the same tokens a second time. The force path now rolls back on any failure: it removes the codebase's vocabulary contribution and drops the partial collection, leaving a clean "not indexed" state so the next access performs a fresh full index. The rollback is best-effort and the original indexing error still propagates.
+
 ## [1.6.7] - 2026-06-20
 
 ### Fixed

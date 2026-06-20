@@ -446,3 +446,61 @@ class TestStoreMetadataRecordsModel:
         storage._core.store_metadata.assert_awaited_once_with(
             "codesearch_abc", {"codebase_path": "/proj"}
         )
+
+
+class TestForceReindexRollback:
+    """A force re-index destroys the existing collection before rebuilding it.
+    If the rebuild fails partway (a transient embedding/Qdrant error in Phase 2),
+    the service must roll back to a clean "not indexed" state: drop this
+    codebase's contribution from the shared global vocabulary (so a partial
+    rebuild does not skew IDF for every other codebase) and drop the partial
+    collection (so the next access does a fresh full index instead of an
+    incremental one that double-counts the already-registered tokens)."""
+
+    @staticmethod
+    def _ready_service(monkeypatch) -> IndexingService:
+        service = _make_service()
+        service._stale_locks_cleaned = True
+
+        @asynccontextmanager
+        async def _noop_lock(name):
+            yield
+
+        monkeypatch.setattr(idx_svc, "async_file_lock", _noop_lock)
+        return service
+
+    async def test_rolls_back_vocab_and_collection_on_phase2_failure(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.delete_collection = AsyncMock()
+        service._storage.create_collection = AsyncMock()
+        # one file so _full_index proceeds past its empty-list early return
+        monkeypatch.setattr(idx_svc, "discover_files", lambda path: [object()])
+        # avoid real chunking; Phase 1 registers vocab, Phase 2 then fails
+        service._prepare_files = MagicMock(return_value=([object()], {"doc-0": ["tok"]}))
+        service._process_batch = AsyncMock(side_effect=RuntimeError("transient embed failure"))
+
+        with pytest.raises(RuntimeError, match="transient embed failure"):
+            await service.index("/proj", force=True)
+
+        # Pre-delete unregister of the old contribution + rollback unregister == 2.
+        assert service._global_vocab.unregister_codebase.call_count == 2
+        # Pre-rebuild delete of the old collection + rollback delete of the partial == 2.
+        assert service._storage.delete_collection.await_count == 2
+
+    async def test_successful_force_reindex_does_not_roll_back(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.delete_collection = AsyncMock()
+        service._storage.create_collection = AsyncMock()
+        service._storage.store_metadata = AsyncMock()
+        monkeypatch.setattr(idx_svc, "discover_files", lambda path: [object()])
+        service._prepare_files = MagicMock(return_value=([object()], {"doc-0": ["tok"]}))
+        service._process_batch = AsyncMock(return_value=1)  # succeeds
+
+        _files, chunks, _stats = await service.index("/proj", force=True)
+
+        # Only the pre-rebuild delete + pre-delete unregister run; no rollback.
+        assert service._storage.delete_collection.await_count == 1
+        assert service._global_vocab.unregister_codebase.call_count == 1
+        assert chunks == 1
