@@ -488,6 +488,29 @@ class TestForceReindexRollback:
         # Pre-rebuild delete of the old collection + rollback delete of the partial == 2.
         assert service._storage.delete_collection.await_count == 2
 
+    async def test_rolls_back_when_discovery_fails_after_recreate(self, monkeypatch):
+        """File discovery runs after the old collection is dropped and the new
+        one created. If it raises (e.g. a malformed ignore pattern), the freshly
+        created empty collection must still be rolled back, or the next access
+        takes the incremental path instead of a clean full rebuild."""
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.delete_collection = AsyncMock()
+        service._storage.create_collection = AsyncMock()
+
+        def _boom(path):
+            raise ValueError("malformed ignore pattern")
+
+        monkeypatch.setattr(idx_svc, "discover_files", _boom)
+
+        with pytest.raises(ValueError, match="malformed ignore pattern"):
+            await service.index("/proj", force=True)
+
+        # Pre-rebuild delete of the old collection + rollback delete of the
+        # freshly created (empty) collection == 2.
+        assert service._storage.delete_collection.await_count == 2
+        assert service._global_vocab.unregister_codebase.call_count == 2
+
     async def test_successful_force_reindex_does_not_roll_back(self, monkeypatch):
         service = self._ready_service(monkeypatch)
         service._storage.collection_exists = AsyncMock(return_value=True)

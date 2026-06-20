@@ -157,10 +157,15 @@ class IndexingService:
                     # Unregister vocab FIRST, then delete collection
                     self._safe_unregister_vocab(col_name)
                     await self._storage.delete_collection(col_name)
-                await self._storage.create_collection(col_name)
 
-                files = list(discover_files(codebase_path))
+                # Everything from collection (re)creation onward can fail and
+                # leave a partial or empty collection plus a stale vocabulary
+                # registration behind (file discovery can raise on a malformed
+                # ignore pattern, the batch loop on a transient embed/Qdrant
+                # error), so guard the whole rebuild and roll back on any failure.
                 try:
+                    await self._storage.create_collection(col_name)
+                    files = list(discover_files(codebase_path))
                     return await self._full_index(col_name, files, abs_path)
                 except Exception:
                     await self._rollback_failed_full_index(col_name)
