@@ -176,6 +176,78 @@ def multi_decorated():
         names = [c.name for c in chunks if c.name]
         assert "decorated_func" in names or len(names) > 0
 
+    def test_decorated_function_chunk_type_is_function(self):
+        """A decorated function is typed as a function, not a generic block, so
+        scope:function search still matches it."""
+        code = '''@decorator
+def handler():
+    return 1
+'''
+        chunks = chunk_with_treesitter(code, "python")
+        handler = [c for c in chunks if c.name == "handler"]
+        assert len(handler) == 1
+        assert handler[0].chunk_type == "function"
+
+    def test_decorated_class_chunk_type_is_class_and_methods_emitted(self):
+        """A small decorated class is typed as a class (not a block), and its
+        methods are still emitted as their own chunks."""
+        code = '''@dataclass
+class Widget:
+    def first(self):
+        return 1
+
+    def second(self):
+        return 2
+'''
+        chunks = chunk_with_treesitter(code, "python")
+        widget = [c for c in chunks if c.name == "Widget"]
+        assert len(widget) == 1
+        assert widget[0].chunk_type == "class"
+        method_names = {c.name for c in chunks if c.chunk_type == "function"}
+        assert {"first", "second"} <= method_names
+
+    def test_decorated_large_class_yields_overview_and_methods(self):
+        """A large decorated class yields a class_overview plus per-method
+        chunks (previously it collapsed to one 'block' chunk with no methods)."""
+        methods = "\n".join(
+            f"    def method_{i}(self):\n        '''doc {i}'''\n        return {i}\n"
+            for i in range(20)
+        )
+        code = f"@dataclass\nclass Big:\n{methods}"
+        chunks = chunk_with_treesitter(code, "python")
+        assert any(
+            c.chunk_type == "class_overview" and c.name == "Big" for c in chunks
+        )
+        method_names = {c.name for c in chunks if c.chunk_type == "function"}
+        assert "method_0" in method_names and "method_19" in method_names
+
+    def test_decorated_large_class_overview_keeps_decorator(self):
+        """The class_overview for a large decorated class includes the decorator
+        line, so searches that rely on the decorator still match it."""
+        methods = "\n".join(
+            f"    def method_{i}(self):\n        '''doc {i}'''\n        return {i}\n"
+            for i in range(20)
+        )
+        code = f"@dataclass\nclass Big:\n{methods}"
+        chunks = chunk_with_treesitter(code, "python")
+        overview = [
+            c for c in chunks if c.chunk_type == "class_overview" and c.name == "Big"
+        ]
+        assert len(overview) == 1
+        assert "@dataclass" in overview[0].content
+
+    def test_decorated_method_in_class_is_function(self):
+        """A decorated method inside a class is typed as a function."""
+        code = '''class Service:
+    @staticmethod
+    def helper():
+        return 1
+'''
+        chunks = chunk_with_treesitter(code, "python")
+        helper = [c for c in chunks if c.name == "helper"]
+        assert len(helper) == 1
+        assert helper[0].chunk_type == "function"
+
     def test_unknown_language_returns_empty(self):
         """Unknown language returns empty list."""
         chunks = chunk_with_treesitter("code", "made_up_language")
