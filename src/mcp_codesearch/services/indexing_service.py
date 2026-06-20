@@ -333,6 +333,40 @@ class IndexingService:
                 f"full index: {e}"
             )
 
+    def _rollback_incremental_vocab(
+        self,
+        col_name: str,
+        added_tokens: list[set[str]],
+        removed_tokens: list[set[str]],
+        net_doc_change: int,
+    ) -> None:
+        """Undo an incremental vocabulary delta after a failed batch.
+
+        The incremental path commits its additive token delta to the shared
+        vocabulary before embedding and upserting the new points. If that upsert
+        fails, the delta is left behind while the modified files' old points are
+        already deleted, so the next run re-detects those files as added and
+        counts their tokens a second time, inflating IDF for every codebase that
+        shares the vocabulary. Applying the inverse delta (added and removed
+        swapped, net negated) returns the contribution to its pre-update state.
+
+        Best-effort: a failure to roll back is logged, not raised, so it does not
+        mask the original indexing error.
+        """
+        try:
+            self._global_vocab.update_codebase_incremental(
+                col_name,
+                added_tokens=removed_tokens,
+                removed_tokens=added_tokens,
+                net_doc_change=-net_doc_change,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to roll back incremental vocabulary for {col_name} "
+                f"after a batch error; the shared vocabulary may over-count "
+                f"until the next force_reindex: {e}"
+            )
+
     async def delete(self, codebase_path: str) -> bool:
         """
         Delete index for a codebase.
@@ -480,20 +514,31 @@ class IndexingService:
             net_doc_change=net_doc_change,
         )
 
-        # Clear token sets to free memory
-        del added_tokens
-        del removed_tokens
-
-        # Process files in batches for embedding and storage
+        # Process files in batches for embedding and storage. The vocabulary
+        # delta above is already durably committed; if a batch fails here, undo
+        # it so the failed files are not counted twice in the shared vocabulary
+        # when the next run re-detects them as added (their old points were
+        # already deleted and are not re-written on failure). The force/full
+        # path has the equivalent rollback via _rollback_failed_full_index.
         total_chunks = 0
         languages: dict[str, int] = {}
 
-        for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
-            batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
-            batch = prepared_files[batch_start:batch_end]
+        try:
+            for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
+                batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
+                batch = prepared_files[batch_start:batch_end]
 
-            chunk_count = await self._process_batch(batch, col_name, languages)
-            total_chunks += chunk_count
+                chunk_count = await self._process_batch(batch, col_name, languages)
+                total_chunks += chunk_count
+        except Exception:
+            self._rollback_incremental_vocab(
+                col_name, added_tokens, removed_tokens, net_doc_change
+            )
+            raise
+
+        # Clear token sets to free memory
+        del added_tokens
+        del removed_tokens
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         stats = IndexingStats(

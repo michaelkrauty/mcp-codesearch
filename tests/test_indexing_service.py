@@ -527,3 +527,44 @@ class TestForceReindexRollback:
         assert service._storage.delete_collection.await_count == 1
         assert service._global_vocab.unregister_codebase.call_count == 1
         assert chunks == 1
+
+
+class TestIncrementalIndexRollback:
+    """An incremental index commits the additive global-vocab delta before it
+    embeds and upserts the new points. If a batch fails after that commit, the
+    delta must be rolled back, or the failed files are double-counted in the
+    shared vocabulary when the next run re-detects them as added (the force/full
+    path has the equivalent rollback)."""
+
+    async def test_batch_failure_rolls_back_the_vocab_delta(self, monkeypatch):
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(return_value=[])
+        service._prepare_files = MagicMock(return_value=([object()], [{"tok"}]))
+        service._process_batch = AsyncMock(
+            side_effect=RuntimeError("transient embed failure")
+        )
+        changes = SimpleNamespace(added=[object()], modified=[], deleted=[])
+
+        with pytest.raises(RuntimeError, match="transient embed failure"):
+            await service._incremental_index("codesearch_x", changes, "/proj")
+
+        # The delta was applied once and undone once (inverse: added<->removed).
+        calls = service._global_vocab.update_codebase_incremental.call_args_list
+        assert len(calls) == 2
+        orig, inv = calls[0].kwargs, calls[1].kwargs
+        assert orig["added_tokens"] == [{"tok"}] and orig["removed_tokens"] == []
+        assert inv["added_tokens"] == [] and inv["removed_tokens"] == [{"tok"}]
+        assert inv["net_doc_change"] == -orig["net_doc_change"]
+
+    async def test_successful_incremental_does_not_roll_back(self, monkeypatch):
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(return_value=[])
+        service._prepare_files = MagicMock(return_value=([object()], [{"tok"}]))
+        service._process_batch = AsyncMock(return_value=1)
+        service._storage.store_metadata = AsyncMock()
+        changes = SimpleNamespace(added=[object()], modified=[], deleted=[])
+
+        await service._incremental_index("codesearch_x", changes, "/proj")
+
+        # Only the original delta; no inverse rollback.
+        assert service._global_vocab.update_codebase_incremental.call_count == 1
