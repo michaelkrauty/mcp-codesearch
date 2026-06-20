@@ -527,3 +527,61 @@ class TestForceReindexRollback:
         assert service._storage.delete_collection.await_count == 1
         assert service._global_vocab.unregister_codebase.call_count == 1
         assert chunks == 1
+
+
+class TestIncrementalIndexRollback:
+    """An incremental index deletes the changed files' old points, commits the
+    additive global-vocab delta, then upserts the new points. If a batch fails
+    after the commit, the unpersisted side effects must be rolled back so the
+    shared vocabulary stays consistent with Qdrant: only the ADDED part of the
+    delta is undone (the removed-token deletions match the already-deleted old
+    points and must stay), and the in-flight files' partial points are deleted so
+    the next run re-detects them as added (the force/full path has the equivalent
+    rollback)."""
+
+    async def test_batch_failure_undoes_added_part_and_keeps_removals(
+        self, monkeypatch
+    ):
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(return_value=[{"old"}])
+        modified = SimpleNamespace(rel_path="mod.py")
+        service._prepare_files = MagicMock(return_value=([object()], [{"new"}]))
+        service._process_batch = AsyncMock(
+            side_effect=RuntimeError("transient embed failure")
+        )
+        service._storage.delete_by_paths_batch = AsyncMock()
+        # A modified file: its old tokens are removed, its new tokens are added.
+        changes = SimpleNamespace(added=[], modified=[modified], deleted=[])
+
+        with pytest.raises(RuntimeError, match="transient embed failure"):
+            await service._incremental_index("codesearch_x", changes, "/proj")
+
+        calls = service._global_vocab.update_codebase_incremental.call_args_list
+        assert len(calls) == 2
+        orig, undo = calls[0].kwargs, calls[1].kwargs
+        # Original committed delta: add new tokens, remove old tokens.
+        assert orig["added_tokens"] == [{"new"}] and orig["removed_tokens"] == [{"old"}]
+        # Rollback undoes ONLY the added part; it does NOT restore {"old"}
+        # (whose points are already deleted).
+        assert undo["added_tokens"] == []
+        assert undo["removed_tokens"] == [{"new"}]
+        assert undo["net_doc_change"] == -1
+        # The in-flight file's partial points are deleted so the next run
+        # re-detects it as added.
+        service._storage.delete_by_paths_batch.assert_awaited_once()
+        assert service._storage.delete_by_paths_batch.await_args.args[1] == ["mod.py"]
+
+    async def test_successful_incremental_does_not_roll_back(self, monkeypatch):
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(return_value=[])
+        service._prepare_files = MagicMock(return_value=([object()], [{"tok"}]))
+        service._process_batch = AsyncMock(return_value=1)
+        service._storage.store_metadata = AsyncMock()
+        service._storage.delete_by_paths_batch = AsyncMock()
+        changes = SimpleNamespace(added=[object()], modified=[], deleted=[])
+
+        await service._incremental_index("codesearch_x", changes, "/proj")
+
+        # Only the original delta; no rollback, no cleanup deletion.
+        assert service._global_vocab.update_codebase_incremental.call_count == 1
+        service._storage.delete_by_paths_batch.assert_not_awaited()

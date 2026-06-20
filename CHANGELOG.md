@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.12] - 2026-06-20
+
+### Fixed
+
+- **An incremental index that fails partway no longer double-counts the affected files in the shared vocabulary.** Incremental indexing deletes the changed files' old points, commits the additive token delta to the shared global vocabulary, and only then embeds and upserts the new points. If that upsert failed (for example a transient embedding-backend or Qdrant outage), the vocabulary delta was already durably committed and was never undone, while the changed files' points were already deleted. On the next run those files were re-detected as added and their tokens were counted a second time, inflating document frequencies and skewing IDF-based ranking for every codebase that shares the vocabulary database. The incremental path now rolls back its vocabulary delta (applying the inverse) when a batch fails, mirroring the rollback the full/force-reindex path already had, so a failed run leaves the shared vocabulary unchanged and the next run re-indexes the files cleanly.
+
 ## [1.6.11] - 2026-06-20
 
 ### Changed

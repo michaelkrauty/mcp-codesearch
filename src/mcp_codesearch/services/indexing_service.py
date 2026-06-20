@@ -333,6 +333,55 @@ class IndexingService:
                 f"full index: {e}"
             )
 
+    async def _rollback_incremental(
+        self,
+        col_name: str,
+        files_to_index: list[FileInfo],
+        added_tokens: list[set[str]],
+    ) -> None:
+        """Undo the unpersisted side effects of an incremental index that failed
+        midway, so the shared vocabulary stays consistent with Qdrant.
+
+        At the point of failure the changed files' OLD points are already deleted
+        (and their removal is reflected in the committed vocabulary delta), while
+        the new points are only partially upserted. Two steps restore consistency:
+
+        1. Delete any partially-written new points for the in-flight (added +
+           modified) files. With no points, the next run re-detects them as added
+           and re-indexes them cleanly, rather than seeing a half-written file as
+           unchanged.
+        2. Undo only the ADDED part of the vocabulary delta (remove the added
+           tokens and added doc count). The removed-token deletions are kept,
+           because they match the already-committed point deletions; restoring
+           them would strand tokens whose points are gone. The result is as if
+           the run had removed the deleted/modified files and added nothing.
+
+        Best-effort: each step's failure is logged, not raised, so the original
+        indexing error is the one that propagates.
+        """
+        try:
+            paths = [f.rel_path for f in files_to_index]
+            await self._storage.delete_by_paths_batch(col_name, paths)
+        except Exception as e:
+            logger.warning(
+                f"Failed to delete partially-written points for {col_name} "
+                f"during incremental rollback: {e}"
+            )
+
+        try:
+            self._global_vocab.update_codebase_incremental(
+                col_name,
+                added_tokens=[],
+                removed_tokens=added_tokens,
+                net_doc_change=-len(added_tokens),
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to roll back incremental vocabulary for {col_name} "
+                f"after a batch error; the shared vocabulary may over-count "
+                f"until the next force_reindex: {e}"
+            )
+
     async def delete(self, codebase_path: str) -> bool:
         """
         Delete index for a codebase.
@@ -480,20 +529,29 @@ class IndexingService:
             net_doc_change=net_doc_change,
         )
 
-        # Clear token sets to free memory
-        del added_tokens
-        del removed_tokens
-
-        # Process files in batches for embedding and storage
+        # Process files in batches for embedding and storage. The vocabulary
+        # delta above is already durably committed and the changed files' old
+        # points are already deleted; if a batch fails here, roll back the
+        # unpersisted side effects so the shared vocabulary stays consistent and
+        # the next run re-indexes the affected files cleanly. The force/full path
+        # has the equivalent rollback via _rollback_failed_full_index.
         total_chunks = 0
         languages: dict[str, int] = {}
 
-        for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
-            batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
-            batch = prepared_files[batch_start:batch_end]
+        try:
+            for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
+                batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
+                batch = prepared_files[batch_start:batch_end]
 
-            chunk_count = await self._process_batch(batch, col_name, languages)
-            total_chunks += chunk_count
+                chunk_count = await self._process_batch(batch, col_name, languages)
+                total_chunks += chunk_count
+        except Exception:
+            await self._rollback_incremental(col_name, files_to_index, added_tokens)
+            raise
+
+        # Clear token sets to free memory
+        del added_tokens
+        del removed_tokens
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         stats = IndexingStats(
