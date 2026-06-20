@@ -8,8 +8,10 @@ Tools:
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from mcp_codesearch.app import mcp
 from mcp_codesearch.helpers import to_abs_path
@@ -19,6 +21,11 @@ from mcp_codesearch.singletons import (
     get_storage,
 )
 from mcp_codesearch.tools._errors import tool_error_handler
+
+if TYPE_CHECKING:
+    from mcp_codesearch.storage.qdrant import QdrantStorage
+
+logger = logging.getLogger(__name__)
 
 # Strict regex for collection ID validation (prevents injection attacks)
 _COLLECTION_ID_PATTERN = re.compile(r"^codesearch_[a-f0-9]{12}$")
@@ -119,14 +126,61 @@ async def delete_collection(path: str = "", collection_id: str = "") -> str:
         return f"Deleted index for: {abs_path}"
 
 
+async def _classify_for_cleanup(storage: QdrantStorage, col_name: str) -> str:
+    """Classify a collection for cleanup as "valid", "orphan", or "skip".
+
+    Returns "orphan" only on positive confirmation that the codebase is gone:
+    a path was determined and is confirmed absent on disk. Any uncertainty (an
+    undeterminable path, a backend error reading it, or an inaccessible
+    location) returns "skip", so a still-valid index is never deleted.
+    """
+    try:
+        metadata = await storage.get_metadata(col_name)
+        path = metadata.get("codebase_path") if metadata else None
+        if not path:
+            path = await storage.infer_codebase_path(col_name)
+    except Exception as e:
+        logger.warning(
+            "cleanup_orphans: skipping %s, could not read its codebase path: %s",
+            col_name, e,
+        )
+        return "skip"
+
+    if not path:
+        # No stored path and none inferable: we cannot confirm the codebase is
+        # gone, so keep the collection rather than delete it blindly.
+        return "skip"
+
+    try:
+        present = Path(path).exists()
+    except OSError as e:
+        # The path is on an inaccessible location (a stale NFS handle, a
+        # permission error). We cannot confirm absence, so keep it.
+        logger.warning(
+            "cleanup_orphans: skipping %s, path %s is inaccessible: %s",
+            col_name, path, e,
+        )
+        return "skip"
+
+    return "valid" if present else "orphan"
+
+
 @mcp.tool()
 @tool_error_handler
 async def cleanup_orphans() -> str:
     """
-    Find and delete orphaned collections (where codebase path is unknown/deleted).
+    Find and delete orphaned collections whose codebase directory is gone.
+
+    A collection is deleted only when its codebase path is known and confirmed
+    absent on disk. Collections whose path cannot be determined (no stored or
+    inferable path, or a backend error reading it) or whose path is currently
+    inaccessible (for example on an unmounted removable or network volume) are
+    kept and reported as skipped, never deleted, so a temporarily unavailable
+    codebase is not mistaken for a deleted one. Run this while any removable or
+    network volumes holding indexed codebases are mounted.
 
     Returns:
-        Summary of cleaned up collections
+        Summary of cleaned up, skipped, and remaining collections
     """
     storage = await get_storage()
     collections = await storage.list_collections()
@@ -135,25 +189,22 @@ async def cleanup_orphans() -> str:
         return "No collections found."
 
     orphans: list[str] = []
-    valid: list[tuple[str, str]] = []
+    valid: list[str] = []
+    skipped: list[str] = []
+    buckets = {"valid": valid, "orphan": orphans, "skip": skipped}
 
     for col_name in collections:
-        metadata = await storage.get_metadata(col_name)
-        path = metadata.get("codebase_path") if metadata else None
-
-        if not path:
-            path = await storage.infer_codebase_path(col_name)
-
-        if path:
-            if Path(path).exists():
-                valid.append((col_name, path))
-            else:
-                orphans.append(col_name)
-        else:
-            orphans.append(col_name)
+        verdict = await _classify_for_cleanup(storage, col_name)
+        buckets[verdict].append(col_name)
 
     if not orphans:
-        return f"No orphaned collections found. All {len(valid)} collections have valid paths."
+        msg = f"No orphaned collections found. {len(valid)} collection(s) have valid paths."
+        if skipped:
+            msg += (
+                f" {len(skipped)} collection(s) skipped "
+                "(path undeterminable or inaccessible; not deleted)."
+            )
+        return msg
 
     # Delete orphans using the service
     indexing_svc = await get_indexing_service()
@@ -182,5 +233,10 @@ async def cleanup_orphans() -> str:
             lines.append(f"  ✗ {msg}")
 
     lines.append(f"\nRemaining valid collections: {len(valid)}")
+    if skipped:
+        lines.append(
+            f"Skipped {len(skipped)} collection(s) "
+            "(path undeterminable or inaccessible; not deleted)."
+        )
 
     return "\n".join(lines)
