@@ -748,3 +748,56 @@ pub struct Rectangle {
         # Unsupported language
         assert is_supported("made_up_language") is False
         assert is_supported("") is False
+
+
+class TestChunkExtractionAcrossLanguages:
+    """Tree-sitter chunk extraction must not emit phantom keyword-token chunks
+    (an anonymous 'class'/'module' token collides with the real definition's
+    point id and overwrites its content), and must extract definition names
+    across languages so find_references can resolve them."""
+
+    def test_ruby_class_has_no_phantom_keyword_chunk(self):
+        chunks = chunk_with_treesitter("class MyClass\n  def bar\n  end\nend\n", "ruby")
+        class_chunks = [c for c in chunks if c.chunk_type == "class"]
+        # Exactly one class chunk, carrying the real class body, not the bare
+        # 'class' keyword (which shares the line-1 point id and would clobber it).
+        assert len(class_chunks) == 1, [
+            (c.chunk_type, c.start_line, c.end_line, c.content[:20]) for c in chunks
+        ]
+        assert "MyClass" in class_chunks[0].content
+        assert class_chunks[0].content.strip() != "class"
+
+    def test_definition_names_extracted_across_languages(self):
+        cases = [
+            ("ruby", "class MyClass\n  def bar\n  end\nend\n", "MyClass"),
+            ("go", "func (s *S) Handle() {}\n", "Handle"),
+            ("swift", "func greet(name: String) {}\n", "greet"),
+            ("kotlin", "fun greet(x: Int) {}\n", "greet"),
+            ("cpp", "int add(int a, int b) { return a+b; }\n", "add"),
+            # C/C++ name lives in the declarator, after the return type:
+            ("cpp", "Foo bar() { return Foo(); }\n", "bar"),  # return type must not win
+            ("cpp", "int *foo() { return 0; }\n", "foo"),  # pointer declarator wrapper
+            ("cpp", "int ns::Foo::bar() { return 0; }\n", "bar"),  # qualified -> bare
+            ("cpp", "struct W { void render() {} };\n", "render"),  # method field_id
+            ("cpp", "template<class T> void foo() {}\n", "foo"),  # template wrapper
+            ("cpp", "Foo& bar() { return f; }\n", "bar"),  # reference return
+            ("cpp", "Foo&& make() { return Foo(); }\n", "make"),  # rvalue-ref return
+            ("cpp", "std::string baz() { return {}; }\n", "baz"),  # qualified return type
+            ("cpp", "void C::foo<int>() {}\n", "foo"),  # qualified template name
+            ("ruby", "class Foo::Bar\nend\n", "Bar"),  # namespaced Ruby class
+        ]
+        for lang, code, expected_name in cases:
+            chunks = chunk_with_treesitter(code, lang)
+            names = {c.name for c in chunks}
+            assert expected_name in names, (
+                f"{lang}: expected a chunk named {expected_name!r}, "
+                f"got {[(c.name, c.chunk_type) for c in chunks]}"
+            )
+
+    def test_deeply_nested_cpp_declarator_does_not_recurse(self):
+        """A deeply nested declarator (many parenthesized wrappers) must not blow
+        the recursion limit while extracting the name, mirroring the iterative
+        main chunk walker."""
+        deep = "int " + "(" * 300 + "*x" + ")" * 300 + "() { return 0; }\n"
+        # Must not raise RecursionError.
+        chunk_with_treesitter(deep, "cpp")

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.16] - 2026-06-20
+
+### Fixed
+
+- **Ruby classes and modules no longer lose their indexed content to a phantom keyword chunk.** The chunk walker treated any node whose type matched a configured definition type as a definition, but in the Ruby grammar the bare `class` and `module` keyword tokens have those exact node types. Each Ruby `class`/`module` therefore produced a second, anonymous one-line chunk containing just the keyword, which shared a point id with the real class chunk (both start on the same line) and overwrote it in the index, so searching the class returned only the five-byte keyword. The walker now treats only *named* nodes as definitions, which fixes Ruby and hardens every language against keyword-token collisions.
+- **Definition names are now extracted for Go methods, Swift and Kotlin functions, Ruby classes and modules, and C/C++ functions.** Name extraction only recognized a few child node types, so these definitions were indexed with no name and `find_references` could not recognize or exclude them. The name nodes those grammars use (`field_identifier`, `simple_identifier`, `constant`, and the identifier nested in a C/C++ `function_declarator`) are now handled.
+
 ## [1.6.15] - 2026-06-20
 
 ### Changed

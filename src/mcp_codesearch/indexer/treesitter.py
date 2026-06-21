@@ -91,18 +91,75 @@ DEFINITION_TYPES = {
 }
 
 
+# Direct-child node types that carry a definition's name, across languages.
+_NAME_NODE_TYPES = frozenset(
+    {
+        "identifier",  # most languages
+        "name",  # Ruby methods
+        "property_identifier",  # JS/TS methods
+        "type_identifier",  # Rust
+        "field_identifier",  # Go methods
+        "simple_identifier",  # Swift / Kotlin
+        "constant",  # Ruby class / module
+    }
+)
+
+
+def _declarator_name_dfs(node: Any, source: bytes) -> str | None:
+    """Find the declared name within a C/C++ declarator subtree, descending to
+    the innermost identifier through wrappers (pointer/reference/array/
+    parenthesized/template) and qualified names. Scope qualifiers are
+    ``namespace_identifier`` nodes (not matched), and parameter/template-argument
+    lists are skipped, so ``ns::C::f`` and ``C::f<int>`` both resolve to ``f``.
+
+    Iterative (like the main chunk walker) so a deeply nested declarator -- many
+    parenthesized wrappers around the name -- cannot blow the recursion limit.
+    """
+    stack: list[Any] = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
+            return source[current.start_byte:current.end_byte].decode("utf-8", errors="ignore")
+        # Push children in reverse so they pop in source order.
+        for child in reversed(current.children):
+            if child.type in ("parameter_list", "template_argument_list"):
+                continue
+            stack.append(child)
+    return None
+
+
+def _name_from_declarator(node: Any, source: bytes) -> str | None:
+    """Resolve a C/C++ definition's name by descending into its declarator child
+    (not the sibling return type) to the innermost name. Handles return types,
+    pointer/reference/array/parenthesized wrappers, template specializations, and
+    qualified names (``ns::C::f`` -> ``f``). Non-C/C++ grammars have no
+    ``*_declarator`` child, so this returns None and the caller falls back to the
+    generic name-node scan.
+    """
+    for child in node.children:
+        if child.type.endswith("_declarator"):
+            return _declarator_name_dfs(child, source)
+    return None
+
+
 def _get_node_name(node: Any, source: bytes) -> str | None:
     """Extract name from a definition node."""
-    # Look for identifier child
+    # C/C++ carry the name under the `declarator` field, after the return type;
+    # resolve that first so the return type is not mistaken for the name
+    # (e.g. `Foo bar()` -> "bar").
+    declarator_name = _name_from_declarator(node, source)
+    if declarator_name is not None:
+        return declarator_name
     for child in node.children:
-        if child.type == "identifier":
+        if child.type in _NAME_NODE_TYPES:
             return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        if child.type == "name":  # Ruby
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        if child.type == "property_identifier":  # JS methods
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        if child.type == "type_identifier":  # Rust
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+        # Ruby namespaced class/module (Foo::Bar): the name is a scope_resolution
+        # whose final constant is the unqualified name.
+        if child.type == "scope_resolution":
+            constants = [g for g in child.children if g.type == "constant"]
+            if constants:
+                last = constants[-1]
+                return source[last.start_byte:last.end_byte].decode("utf-8", errors="ignore")
     return None
 
 
@@ -291,7 +348,12 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
     while stack:
         node, context_parts = stack.pop()
 
-        if node.type not in definition_types:
+        # Only NAMED definition nodes are real definitions. Some grammars name a
+        # definition's node type identically to its keyword token (e.g. Ruby's
+        # anonymous `class`/`module` tokens have node.type == "class"/"module"),
+        # and emitting a chunk for that token would collide with the real
+        # definition's point id (same start line) and overwrite its content.
+        if not (node.is_named and node.type in definition_types):
             for child in reversed(node.children):
                 stack.append((child, context_parts))
             continue
