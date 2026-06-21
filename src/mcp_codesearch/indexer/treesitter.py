@@ -105,18 +105,51 @@ _NAME_NODE_TYPES = frozenset(
 )
 
 
+def _name_from_declarator(node: Any, source: bytes) -> str | None:
+    """Resolve the declared name from a C/C++ declarator subtree.
+
+    A function_definition's name lives inside a function_declarator, which may
+    be wrapped in pointer/reference/array declarators (e.g. ``int *foo()``). The
+    name itself can be an identifier, a field_identifier (methods), a
+    qualified_identifier (``ns::C::f``), a destructor_name, or an operator_name.
+    """
+    for child in node.children:
+        if child.type == "function_declarator":
+            for g in child.children:
+                if g.type in (
+                    "identifier",
+                    "field_identifier",
+                    "qualified_identifier",
+                    "destructor_name",
+                    "operator_name",
+                ):
+                    text = source[g.start_byte:g.end_byte].decode("utf-8", errors="ignore")
+                    # Index the bare name for qualified C++ names (ns::C::f -> f),
+                    # matching how methods are named in the other languages.
+                    return text.rsplit("::", 1)[-1]
+            return None
+        if child.type in (
+            "pointer_declarator",
+            "reference_declarator",
+            "array_declarator",
+        ):
+            inner = _name_from_declarator(child, source)
+            if inner is not None:
+                return inner
+    return None
+
+
 def _get_node_name(node: Any, source: bytes) -> str | None:
     """Extract name from a definition node."""
+    # C/C++ carry the name inside a (possibly pointer/reference-wrapped)
+    # function_declarator, AFTER the return type. Resolve that first so the
+    # return type is not mistaken for the name (e.g. `Foo bar()` -> "bar").
+    declarator_name = _name_from_declarator(node, source)
+    if declarator_name is not None:
+        return declarator_name
     for child in node.children:
         if child.type in _NAME_NODE_TYPES:
             return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        # C/C++ carry the name inside a nested function_declarator.
-        if child.type == "function_declarator":
-            for grandchild in child.children:
-                if grandchild.type in ("identifier", "field_identifier"):
-                    return source[grandchild.start_byte:grandchild.end_byte].decode(
-                        "utf-8", errors="ignore"
-                    )
     return None
 
 

@@ -774,6 +774,11 @@ class TestChunkExtractionAcrossLanguages:
             ("swift", "func greet(name: String) {}\n", "greet"),
             ("kotlin", "fun greet(x: Int) {}\n", "greet"),
             ("cpp", "int add(int a, int b) { return a+b; }\n", "add"),
+            # C/C++ name lives in the declarator, after the return type:
+            ("cpp", "Foo bar() { return Foo(); }\n", "bar"),  # return type must not win
+            ("cpp", "int *foo() { return 0; }\n", "foo"),  # pointer declarator wrapper
+            ("cpp", "int ns::Foo::bar() { return 0; }\n", "bar"),  # qualified -> bare
+            ("cpp", "struct W { void render() {} };\n", "render"),  # method field_id
         ]
         for lang, code, expected_name in cases:
             chunks = chunk_with_treesitter(code, lang)
