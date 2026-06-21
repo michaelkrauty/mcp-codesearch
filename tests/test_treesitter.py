@@ -793,3 +793,11 @@ class TestChunkExtractionAcrossLanguages:
                 f"{lang}: expected a chunk named {expected_name!r}, "
                 f"got {[(c.name, c.chunk_type) for c in chunks]}"
             )
+
+    def test_deeply_nested_cpp_declarator_does_not_recurse(self):
+        """A deeply nested declarator (many parenthesized wrappers) must not blow
+        the recursion limit while extracting the name, mirroring the iterative
+        main chunk walker."""
+        deep = "int " + "(" * 300 + "*x" + ")" * 300 + "() { return 0; }\n"
+        # Must not raise RecursionError.
+        chunk_with_treesitter(deep, "cpp")

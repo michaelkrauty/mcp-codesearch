@@ -111,15 +111,20 @@ def _declarator_name_dfs(node: Any, source: bytes) -> str | None:
     parenthesized/template) and qualified names. Scope qualifiers are
     ``namespace_identifier`` nodes (not matched), and parameter/template-argument
     lists are skipped, so ``ns::C::f`` and ``C::f<int>`` both resolve to ``f``.
+
+    Iterative (like the main chunk walker) so a deeply nested declarator -- many
+    parenthesized wrappers around the name -- cannot blow the recursion limit.
     """
-    if node.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
-        return source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
-    for child in node.children:
-        if child.type in ("parameter_list", "template_argument_list"):
-            continue
-        name = _declarator_name_dfs(child, source)
-        if name is not None:
-            return name
+    stack: list[Any] = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
+            return source[current.start_byte:current.end_byte].decode("utf-8", errors="ignore")
+        # Push children in reverse so they pop in source order.
+        for child in reversed(current.children):
+            if child.type in ("parameter_list", "template_argument_list"):
+                continue
+            stack.append(child)
     return None
 
 
