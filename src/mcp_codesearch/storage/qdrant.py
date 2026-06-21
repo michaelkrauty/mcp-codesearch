@@ -961,6 +961,13 @@ class QdrantStorage:
         matches are reached and then dropped, which would starve the lower
         tier across later scroll pages. ``scan_cap`` still bounds the scan.
         """
+        # An empty or whitespace-only query has no phrase to match. Without this
+        # guard re.escape("") yields a zero-width r"\b\b" pattern that matches
+        # every field containing a word boundary, flooding results with unrelated
+        # points (reachable via a quote-only query such as '"').
+        if not query.strip():
+            return []
+
         client = await self._get_client()
         query_lower = query.lower()
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.17] - 2026-06-20
+
+### Fixed
+
+- **A quote-only query (`"`, `""`, or `" "`) no longer floods results with unrelated matches.** Such a query was detected as a quoted exact phrase, but stripping the quotes left an empty search string that was routed to the exact-match scan. With an empty string, the word-boundary regex compiles to a zero-width `\b\b` pattern that matches every field containing any word, so the tool returned up to `limit` arbitrary results presented as exact-phrase matches. The exact-match search now returns nothing for an empty or whitespace-only query (an empty phrase matches nothing), and the query validation rejects a quote-only query up front with the standard "query cannot be empty" message.
+
 ## [1.6.16] - 2026-06-20
 
 ### Fixed

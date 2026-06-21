@@ -292,3 +292,15 @@ class TestExactMatchRankFalse:
         # Both scroll pages must be fetched, so the references survive.
         assert storage._client_mock.scroll.call_count == 2
         assert len([r for r in results if r.score == 1.0]) == 3
+
+
+class TestExactMatchEmptyQuery:
+    """An empty/quote-only phrase must not flood via the zero-width regex."""
+
+    @pytest.mark.asyncio
+    async def test_empty_query_returns_empty_without_scanning(self, storage):
+        for q in ("", "   ", "\t"):
+            results = await storage.exact_match_search(collection="c", query=q)
+            assert results == []
+        # Returned before any client/scroll work.
+        storage._get_client.assert_not_called()

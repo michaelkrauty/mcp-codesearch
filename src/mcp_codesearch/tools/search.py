@@ -88,8 +88,10 @@ async def code_search(  # noqa: PLR0911
     Returns:
         Formatted search results with file paths and relevant code
     """
-    # Validate query
-    if not query or not query.strip():
+    # Validate query. Strip surrounding quotes/whitespace too, so a quote-only
+    # query (e.g. '"', '""', '" "') is rejected here rather than routed to an
+    # empty exact-phrase search.
+    if not query or not query.strip().strip('"').strip():
         return """Error: Query cannot be empty.
 
 Examples of valid queries:
