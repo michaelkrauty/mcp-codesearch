@@ -106,16 +106,14 @@ _NAME_NODE_TYPES = frozenset(
 
 
 def _declarator_name_dfs(node: Any, source: bytes) -> str | None:
-    """Find the declared name within a C/C++ declarator subtree, descending
-    through wrappers (pointer/reference/array/parenthesized/template) but never
-    into a parameter or template-argument list."""
+    """Find the declared name within a C/C++ declarator subtree, descending to
+    the innermost identifier through wrappers (pointer/reference/array/
+    parenthesized/template) and qualified names. Scope qualifiers are
+    ``namespace_identifier`` nodes (not matched), and parameter/template-argument
+    lists are skipped, so ``ns::C::f`` and ``C::f<int>`` both resolve to ``f``.
+    """
     if node.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
         return source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
-    if node.type == "qualified_identifier":
-        text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
-        # Index the bare name for qualified C++ names (ns::C::f -> f), matching
-        # how methods are named in the other languages.
-        return text.rsplit("::", 1)[-1]
     for child in node.children:
         if child.type in ("parameter_list", "template_argument_list"):
             continue
@@ -150,6 +148,13 @@ def _get_node_name(node: Any, source: bytes) -> str | None:
     for child in node.children:
         if child.type in _NAME_NODE_TYPES:
             return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+        # Ruby namespaced class/module (Foo::Bar): the name is a scope_resolution
+        # whose final constant is the unqualified name.
+        if child.type == "scope_resolution":
+            constants = [g for g in child.children if g.type == "constant"]
+            if constants:
+                last = constants[-1]
+                return source[last.start_byte:last.end_byte].decode("utf-8", errors="ignore")
     return None
 
 

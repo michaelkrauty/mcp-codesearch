@@ -783,6 +783,8 @@ class TestChunkExtractionAcrossLanguages:
             ("cpp", "Foo& bar() { return f; }\n", "bar"),  # reference return
             ("cpp", "Foo&& make() { return Foo(); }\n", "make"),  # rvalue-ref return
             ("cpp", "std::string baz() { return {}; }\n", "baz"),  # qualified return type
+            ("cpp", "void C::foo<int>() {}\n", "foo"),  # qualified template name
+            ("ruby", "class Foo::Bar\nend\n", "Bar"),  # namespaced Ruby class
         ]
         for lang, code, expected_name in cases:
             chunks = chunk_with_treesitter(code, lang)
