@@ -106,44 +106,35 @@ _NAME_NODE_TYPES = frozenset(
 
 
 def _name_from_declarator(node: Any, source: bytes) -> str | None:
-    """Resolve the declared name from a C/C++ declarator subtree.
+    """Resolve a C/C++ definition's declared name.
 
-    A function_definition's name lives inside a function_declarator, which may
-    be wrapped in pointer/reference/array declarators (e.g. ``int *foo()``). The
-    name itself can be an identifier, a field_identifier (methods), a
-    qualified_identifier (``ns::C::f``), a destructor_name, or an operator_name.
+    The name lives under the grammar's ``declarator`` field (not as a sibling of
+    the return type), possibly behind pointer/reference/array/parenthesized
+    wrappers and template specializations. Follow that field down to the
+    innermost name, which may be an identifier, field_identifier (methods),
+    destructor_name, operator_name, or a qualified_identifier (``ns::C::f`` ->
+    ``f``). Non-C/C++ grammars have no ``declarator`` field, so this returns None
+    for them and the caller falls back to the generic name-node scan.
     """
-    for child in node.children:
-        if child.type == "function_declarator":
-            for g in child.children:
-                if g.type in (
-                    "identifier",
-                    "field_identifier",
-                    "qualified_identifier",
-                    "destructor_name",
-                    "operator_name",
-                ):
-                    text = source[g.start_byte:g.end_byte].decode("utf-8", errors="ignore")
-                    # Index the bare name for qualified C++ names (ns::C::f -> f),
-                    # matching how methods are named in the other languages.
-                    return text.rsplit("::", 1)[-1]
-            return None
-        if child.type in (
-            "pointer_declarator",
-            "reference_declarator",
-            "array_declarator",
-        ):
-            inner = _name_from_declarator(child, source)
-            if inner is not None:
-                return inner
+    decl = node.child_by_field_name("declarator")
+    while decl is not None:
+        if decl.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
+            return source[decl.start_byte:decl.end_byte].decode("utf-8", errors="ignore")
+        if decl.type == "qualified_identifier":
+            text = source[decl.start_byte:decl.end_byte].decode("utf-8", errors="ignore")
+            return text.rsplit("::", 1)[-1]
+        if decl.type == "template_function":
+            decl = decl.child_by_field_name("name")
+            continue
+        decl = decl.child_by_field_name("declarator")
     return None
 
 
 def _get_node_name(node: Any, source: bytes) -> str | None:
     """Extract name from a definition node."""
-    # C/C++ carry the name inside a (possibly pointer/reference-wrapped)
-    # function_declarator, AFTER the return type. Resolve that first so the
-    # return type is not mistaken for the name (e.g. `Foo bar()` -> "bar").
+    # C/C++ carry the name under the `declarator` field, after the return type;
+    # resolve that first so the return type is not mistaken for the name
+    # (e.g. `Foo bar()` -> "bar").
     declarator_name = _name_from_declarator(node, source)
     if declarator_name is not None:
         return declarator_name

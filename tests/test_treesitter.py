@@ -779,6 +779,7 @@ class TestChunkExtractionAcrossLanguages:
             ("cpp", "int *foo() { return 0; }\n", "foo"),  # pointer declarator wrapper
             ("cpp", "int ns::Foo::bar() { return 0; }\n", "bar"),  # qualified -> bare
             ("cpp", "struct W { void render() {} };\n", "render"),  # method field_id
+            ("cpp", "template<class T> void foo() {}\n", "foo"),  # template wrapper
         ]
         for lang, code, expected_name in cases:
             chunks = chunk_with_treesitter(code, lang)
