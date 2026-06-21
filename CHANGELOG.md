@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.14] - 2026-06-20
+
+### Fixed
+
+- **An incremental index whose old-content fetch fails for a changed file no longer over-counts the shared vocabulary.** Before deleting a changed file's points, incremental indexing fetches its old content (in parallel) to know which tokens to remove from the shared global vocabulary. A failed fetch was logged and substituted with an empty token set, but the file's points were still deleted, so its old tokens were never removed: the file then went away (or its hash matched the new content) and was never re-detected, leaving its contribution in the vocabulary permanently and inflating IDF for every codebase that shares it. The run now aborts before deleting anything when any old-content fetch fails. Nothing has been deleted or committed at that point, so the next run re-detects the same changes and retries cleanly, rather than completing with a silent inconsistency.
+
 ## [1.6.13] - 2026-06-20
 
 ### Changed

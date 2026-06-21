@@ -585,3 +585,38 @@ class TestIncrementalIndexRollback:
         # Only the original delta; no rollback, no cleanup deletion.
         assert service._global_vocab.update_codebase_incremental.call_count == 1
         service._storage.delete_by_paths_batch.assert_not_awaited()
+
+
+class TestCollectRemovedTokensFetchFailure:
+    """If fetching a changed file's OLD content fails, deleting its points while
+    dropping its tokens permanently over-counts the shared vocabulary (points
+    gone from Qdrant, tokens left in the vocab). The run must abort BEFORE
+    deleting anything, so the next run re-detects the change and retries."""
+
+    async def test_aborts_and_does_not_delete_on_fetch_failure(self):
+        service = _make_service()
+        service._storage.get_stored_content_for_path = AsyncMock(
+            side_effect=RuntimeError("scroll timeout")
+        )
+        service._storage.delete_by_paths_batch = AsyncMock()
+        changes = SimpleNamespace(deleted=["foo.py"], modified=[], added=[])
+
+        with pytest.raises(RuntimeError, match="[Aa]bort"):
+            await service._collect_removed_tokens("col", changes)
+
+        # Nothing was deleted: a clean abort leaves Qdrant and the vocab in sync.
+        service._storage.delete_by_paths_batch.assert_not_awaited()
+
+    async def test_deletes_and_returns_tokens_when_all_fetches_succeed(self):
+        service = _make_service()
+        service._storage.get_stored_content_for_path = AsyncMock(
+            return_value=["some code"]
+        )
+        service._global_vocab.tokenize = MagicMock(return_value=["some", "code"])
+        service._storage.delete_by_paths_batch = AsyncMock()
+        changes = SimpleNamespace(deleted=["foo.py"], modified=[], added=[])
+
+        tokens = await service._collect_removed_tokens("col", changes)
+
+        service._storage.delete_by_paths_batch.assert_awaited_once()
+        assert tokens == [{"some", "code"}]

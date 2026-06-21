@@ -708,14 +708,28 @@ class IndexingService:
             *[fetch_content(p) for p in all_paths], return_exceptions=True
         )
 
-        # Filter failed results and log warnings
+        # A failed fetch means we cannot know that file's old tokens. Deleting
+        # its points below while leaving those tokens in the shared vocabulary
+        # would permanently over-count it: the file is then gone (or unchanged)
+        # and never re-detected, so nothing ever subtracts it, inflating IDF for
+        # every codebase that shares the vocabulary. Abort before deleting
+        # anything -- nothing has been deleted or committed yet, so the next run
+        # re-detects the same changes and retries cleanly.
         valid_results: list[list[set[str]]] = []
-        for path, result in zip(all_paths, results):
+        failed: list[str] = []
+        for path, result in zip(all_paths, results, strict=True):
             if isinstance(result, BaseException):
                 logger.warning(f"Failed to fetch content for {path}: {result}")
-                valid_results.append([])  # Empty token set for failed file
+                failed.append(path)
             else:
                 valid_results.append(result)
+
+        if failed:
+            raise RuntimeError(
+                f"Aborting incremental index: could not fetch stored content for "
+                f"{len(failed)} of {len(all_paths)} changed file(s) "
+                f"({', '.join(failed[:5])}); will retry on the next run"
+            )
 
         # Phase 2: Batch delete all paths (much faster than individual deletes)
         await self._storage.delete_by_paths_batch(col_name, all_paths)
