@@ -91,18 +91,32 @@ DEFINITION_TYPES = {
 }
 
 
+# Direct-child node types that carry a definition's name, across languages.
+_NAME_NODE_TYPES = frozenset(
+    {
+        "identifier",  # most languages
+        "name",  # Ruby methods
+        "property_identifier",  # JS/TS methods
+        "type_identifier",  # Rust
+        "field_identifier",  # Go methods
+        "simple_identifier",  # Swift / Kotlin
+        "constant",  # Ruby class / module
+    }
+)
+
+
 def _get_node_name(node: Any, source: bytes) -> str | None:
     """Extract name from a definition node."""
-    # Look for identifier child
     for child in node.children:
-        if child.type == "identifier":
+        if child.type in _NAME_NODE_TYPES:
             return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        if child.type == "name":  # Ruby
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        if child.type == "property_identifier":  # JS methods
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
-        if child.type == "type_identifier":  # Rust
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+        # C/C++ carry the name inside a nested function_declarator.
+        if child.type == "function_declarator":
+            for grandchild in child.children:
+                if grandchild.type in ("identifier", "field_identifier"):
+                    return source[grandchild.start_byte:grandchild.end_byte].decode(
+                        "utf-8", errors="ignore"
+                    )
     return None
 
 
@@ -291,7 +305,12 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
     while stack:
         node, context_parts = stack.pop()
 
-        if node.type not in definition_types:
+        # Only NAMED definition nodes are real definitions. Some grammars name a
+        # definition's node type identically to its keyword token (e.g. Ruby's
+        # anonymous `class`/`module` tokens have node.type == "class"/"module"),
+        # and emitting a chunk for that token would collide with the real
+        # definition's point id (same start line) and overwrite its content.
+        if not (node.is_named and node.type in definition_types):
             for child in reversed(node.children):
                 stack.append((child, context_parts))
             continue
