@@ -105,28 +105,37 @@ _NAME_NODE_TYPES = frozenset(
 )
 
 
-def _name_from_declarator(node: Any, source: bytes) -> str | None:
-    """Resolve a C/C++ definition's declared name.
-
-    The name lives under the grammar's ``declarator`` field (not as a sibling of
-    the return type), possibly behind pointer/reference/array/parenthesized
-    wrappers and template specializations. Follow that field down to the
-    innermost name, which may be an identifier, field_identifier (methods),
-    destructor_name, operator_name, or a qualified_identifier (``ns::C::f`` ->
-    ``f``). Non-C/C++ grammars have no ``declarator`` field, so this returns None
-    for them and the caller falls back to the generic name-node scan.
-    """
-    decl = node.child_by_field_name("declarator")
-    while decl is not None:
-        if decl.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
-            return source[decl.start_byte:decl.end_byte].decode("utf-8", errors="ignore")
-        if decl.type == "qualified_identifier":
-            text = source[decl.start_byte:decl.end_byte].decode("utf-8", errors="ignore")
-            return text.rsplit("::", 1)[-1]
-        if decl.type == "template_function":
-            decl = decl.child_by_field_name("name")
+def _declarator_name_dfs(node: Any, source: bytes) -> str | None:
+    """Find the declared name within a C/C++ declarator subtree, descending
+    through wrappers (pointer/reference/array/parenthesized/template) but never
+    into a parameter or template-argument list."""
+    if node.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+    if node.type == "qualified_identifier":
+        text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+        # Index the bare name for qualified C++ names (ns::C::f -> f), matching
+        # how methods are named in the other languages.
+        return text.rsplit("::", 1)[-1]
+    for child in node.children:
+        if child.type in ("parameter_list", "template_argument_list"):
             continue
-        decl = decl.child_by_field_name("declarator")
+        name = _declarator_name_dfs(child, source)
+        if name is not None:
+            return name
+    return None
+
+
+def _name_from_declarator(node: Any, source: bytes) -> str | None:
+    """Resolve a C/C++ definition's name by descending into its declarator child
+    (not the sibling return type) to the innermost name. Handles return types,
+    pointer/reference/array/parenthesized wrappers, template specializations, and
+    qualified names (``ns::C::f`` -> ``f``). Non-C/C++ grammars have no
+    ``*_declarator`` child, so this returns None and the caller falls back to the
+    generic name-node scan.
+    """
+    for child in node.children:
+        if child.type.endswith("_declarator"):
+            return _declarator_name_dfs(child, source)
     return None
 
 

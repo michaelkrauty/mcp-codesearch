@@ -780,6 +780,9 @@ class TestChunkExtractionAcrossLanguages:
             ("cpp", "int ns::Foo::bar() { return 0; }\n", "bar"),  # qualified -> bare
             ("cpp", "struct W { void render() {} };\n", "render"),  # method field_id
             ("cpp", "template<class T> void foo() {}\n", "foo"),  # template wrapper
+            ("cpp", "Foo& bar() { return f; }\n", "bar"),  # reference return
+            ("cpp", "Foo&& make() { return Foo(); }\n", "make"),  # rvalue-ref return
+            ("cpp", "std::string baz() { return {}; }\n", "baz"),  # qualified return type
         ]
         for lang, code, expected_name in cases:
             chunks = chunk_with_treesitter(code, lang)
