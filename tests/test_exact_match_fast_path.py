@@ -304,3 +304,72 @@ class TestExactMatchEmptyQuery:
             assert results == []
         # Returned before any client/scroll work.
         storage._get_client.assert_not_called()
+
+
+class TestPunctuationEdgedQueries:
+    """A query whose first/last character is non-word (decorators, annotations,
+    preprocessor directives, call syntax, C++) must still match. A \\b anchor only
+    holds against a word character on the query side, so these previously returned
+    nothing even when the token was indexed."""
+
+    @pytest.mark.parametrize(
+        "query,content",
+        [
+            ("@property", "    @property\n    def x(self): ..."),
+            ("@Override", "    @Override\n    public void m() {}"),
+            ("#include", "#include <stdio.h>"),
+            ("#define", "#define MAX 10"),
+            ("foo()", "return foo() + 1"),
+            ("C++", "written in C++ here"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_punctuation_edged_query_matches(self, storage, query, content):
+        storage._client_mock.scroll = AsyncMock(
+            return_value=([_point(1, content=content)], None)
+        )
+        results = await storage.exact_match_search("col", query, mode="chunk")
+        assert [r.path for r in results] == ["src/x.py"], f"{query!r} should match"
+
+    @pytest.mark.parametrize(
+        "query,content",
+        [
+            ("property", "manage properties here"),  # whole-token, not substring
+            ("@property", "x = @property2 = 1"),
+            ("foo()", "call foobar() now"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_whole_token_not_substring(self, storage, query, content):
+        storage._client_mock.scroll = AsyncMock(
+            return_value=([_point(1, content=content)], None)
+        )
+        results = await storage.exact_match_search("col", query, mode="chunk")
+        assert results == [], f"{query!r} should not match {content!r} as a substring"
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_query_returns_empty_without_scroll(self, storage):
+        storage._client_mock.scroll = AsyncMock(return_value=([], None))
+        results = await storage.exact_match_search("col", "   ", mode="chunk")
+        assert results == []
+        storage._client_mock.scroll.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "query,content",
+        [
+            # Punctuation attached to an identifier: the edge boundary must not be
+            # constrained on the non-word side, or these regress versus the prior
+            # \b behavior that matched word-to-punctuation boundaries.
+            (".then", "promise.then(cb)"),
+            ("::vector", "std::vector<int> v;"),
+            ("std::", "std::vector<int> v;"),
+            (".map", "items.map(f)"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_punctuation_attached_to_identifier_matches(self, storage, query, content):
+        storage._client_mock.scroll = AsyncMock(
+            return_value=([_point(1, content=content)], None)
+        )
+        results = await storage.exact_match_search("col", query, mode="chunk")
+        assert [r.path for r in results] == ["src/x.py"], f"{query!r} should match {content!r}"

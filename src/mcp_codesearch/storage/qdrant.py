@@ -994,7 +994,21 @@ class QdrantStorage:
         # Pre-compile regex pattern outside loop with IGNORECASE (15-25% faster fallback search)
         # Using IGNORECASE avoids .lower() calls on each field
         try:
-            compiled_pattern = re.compile(r"\b" + re.escape(query) + r"\b", re.IGNORECASE)
+            # Constrain an edge only when it is itself a word character. A
+            # word-char edge must not sit inside a larger identifier, so
+            # "property" does not match "properties"; this is the `\b` behavior.
+            # A non-word edge is its own delimiter and must match whether it abuts
+            # whitespace, a line start, or an identifier: a plain `\b` requires a
+            # word character on the query side, so it missed line-start tokens
+            # like a `@property` decorator or `#include`, while a symmetric
+            # `(?<!\w)...(?!\w)` would wrongly reject punctuation attached to an
+            # identifier (`.then` in `promise.then`, `std::` in `std::vector`).
+            # Edge-conditional assertions handle both.
+            left = r"(?<!\w)" if re.match(r"\w", query) else ""
+            right = r"(?!\w)" if re.search(r"\w\Z", query) else ""
+            compiled_pattern = re.compile(
+                left + re.escape(query) + right, re.IGNORECASE
+            )
         except re.error as e:
             logger.warning(f"Regex compilation failed for query '{query[:50]}': {e}")
             compiled_pattern = None  # Fall back to substring search

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.19] - 2026-06-25
+
+### Fixed
+
+- **Exact-phrase search now matches queries whose first or last character is non-word.** The exact-match scan anchored the query with `\b` word boundaries, but a `\b` only holds when the character on the query side is a word character, so a query like `@property`, `@Override`, `#include`, `foo()`, or `C++` never matched at the line-start, whitespace, or bracket positions where those tokens actually appear, and the tool returned "No results found" even when the token was indexed. These are common exact-phrase targets (Python decorators, Java and Spring annotations, C preprocessor directives, call syntax). The boundary is now applied per edge: an edge that is itself a word character keeps the `\b` constraint (so `property` still does not match `properties`), while a non-word edge is treated as its own delimiter and matches whether it abuts whitespace, a line start, or an identifier. This both fixes the line-start cases above and avoids regressing punctuation attached to an identifier (`.then` in `promise.then`, `std::` in `std::vector`), which a symmetric lookaround would have broken. The empty or whitespace-only guard is unchanged.
+
 ## [1.6.18] - 2026-06-25
 
 ### Fixed
