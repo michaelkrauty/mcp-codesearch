@@ -1,6 +1,6 @@
 [project]
 name = "mcp-codesearch"
-version = "1.6.17"
+version = "1.6.18"
 description = "Semantic code search MCP server using Qdrant and OpenAI-compatible embeddings"
 readme = "README.md"
 license = "Apache-2.0"

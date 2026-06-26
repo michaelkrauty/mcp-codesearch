@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.18] - 2026-06-25
+
+### Fixed
+
+- **A method that returns a named class type is now indexed under the method name, not the return type.** `_get_node_name` returned the first child whose type carried a name, but a Java method orders its return type before its name, and a named return type is itself a name-typed node, so for example `String getName()` was indexed as `String` and `MyType build()` as `MyType`. This corrupted the exact-match name tier: a lookup of the real method name missed it while a search for the return type spuriously matched every such method. The grammar's `name` field is now preferred when present (with the existing Ruby `scope_resolution` handling), so the real name is used; grammars without a `name` field keep the previous child scan. Verified across java, python, go, rust, ruby (plain and namespaced), c, c++, typescript, php, swift, kotlin, and scala with no regression.
+
 ## [1.6.17] - 2026-06-20
 
 ### Fixed

@@ -142,6 +142,17 @@ def _name_from_declarator(node: Any, source: bytes) -> str | None:
     return None
 
 
+def _scope_resolution_name(node: Any, source: bytes) -> str | None:
+    """Ruby namespaced name (``Foo::Bar``): the unqualified name is the final
+    ``constant`` of the ``scope_resolution`` node. Returns None if it has no
+    constant child (unexpected, lets the caller fall through)."""
+    constants = [g for g in node.children if g.type == "constant"]
+    if constants:
+        last = constants[-1]
+        return source[last.start_byte:last.end_byte].decode("utf-8", errors="ignore")
+    return None
+
+
 def _get_node_name(node: Any, source: bytes) -> str | None:
     """Extract name from a definition node."""
     # C/C++ carry the name under the `declarator` field, after the return type;
@@ -150,16 +161,31 @@ def _get_node_name(node: Any, source: bytes) -> str | None:
     declarator_name = _name_from_declarator(node, source)
     if declarator_name is not None:
         return declarator_name
+    # The grammar's `name` field is authoritative when present. Preferring it over
+    # the generic child scan below avoids picking a preceding name-typed sibling
+    # such as a named RETURN TYPE: a Java method orders `<return type> name(...)`,
+    # and a named return type is itself a `type_identifier`/`identifier` (in
+    # `_NAME_NODE_TYPES`) that precedes the method name, so the scan would return
+    # the return type (e.g. `String getName()` -> "String"). The `name` field
+    # resolves the real name.
+    name_node = node.child_by_field_name("name")
+    if name_node is not None:
+        if name_node.type == "scope_resolution":
+            scoped = _scope_resolution_name(name_node, source)
+            if scoped is not None:
+                return scoped
+        else:
+            return source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
+    # Fallback for grammars whose definition node has no `name` field.
     for child in node.children:
         if child.type in _NAME_NODE_TYPES:
             return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
         # Ruby namespaced class/module (Foo::Bar): the name is a scope_resolution
         # whose final constant is the unqualified name.
         if child.type == "scope_resolution":
-            constants = [g for g in child.children if g.type == "constant"]
-            if constants:
-                last = constants[-1]
-                return source[last.start_byte:last.end_byte].decode("utf-8", errors="ignore")
+            scoped = _scope_resolution_name(child, source)
+            if scoped is not None:
+                return scoped
     return None
 
 
