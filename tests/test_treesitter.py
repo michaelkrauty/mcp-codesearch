@@ -801,3 +801,36 @@ class TestChunkExtractionAcrossLanguages:
         deep = "int " + "(" * 300 + "*x" + ")" * 300 + "() { return 0; }\n"
         # Must not raise RecursionError.
         chunk_with_treesitter(deep, "cpp")
+
+
+class TestNamedReturnTypeExtraction:
+    """A definition's name must come from the grammar's name field, not the first
+    name-typed child, so a named return type is not mistaken for the name."""
+
+    def test_java_named_return_type_method_uses_method_name(self):
+        """A Java method returning a named class type must be named after the
+        method, not the return type. The generic name scan would otherwise return
+        the leading `type_identifier` return type (e.g. `String getName()` ->
+        "String")."""
+        code = (
+            "public class Foo {\n"
+            "    public String getName() { return null; }\n"
+            "    public MyType build() { return null; }\n"
+            "    public int count() { return 0; }\n"
+            "    public List<String> items() { return null; }\n"
+            "}\n"
+        )
+        chunks = chunk_with_treesitter(code, "java")
+        names = {c.name for c in chunks}
+        assert {"getName", "build", "count", "items"} <= names
+        assert "String" not in names
+        assert "MyType" not in names
+
+    def test_ruby_namespaced_class_uses_unqualified_name(self):
+        """Guard the scope_resolution path through the new name-field branch: a
+        namespaced Ruby class keeps its unqualified name."""
+        code = "class Foo::Bar\n  def m\n  end\nend\n"
+        chunks = chunk_with_treesitter(code, "ruby")
+        names = {c.name for c in chunks}
+        assert "Bar" in names
+        assert "Foo::Bar" not in names
