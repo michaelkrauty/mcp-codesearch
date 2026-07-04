@@ -901,3 +901,55 @@ class TestFilterByParsedQueryEdgeCases:
         filtered = _filter_by_parsed_query(results, parsed)
 
         assert [r.path for r in filtered] == ["src/contest.py", "src/service.py"]
+
+
+class TestScopeFetchLimitWidening:
+    """A scope: filter is applied after retrieval (in _filter_by_parsed_query),
+    so a scope-only query must widen the candidate pool to limit*10; otherwise a
+    scope filter that rejects most chunks leaves fewer than `limit` results.
+    """
+
+    def _mocks(self):
+        storage = MagicMock()
+        storage.hybrid_search = AsyncMock(return_value=[])
+        storage.exact_match_search = AsyncMock(return_value=[])
+        storage.sparse_only_search = AsyncMock(return_value=[])
+        embedder = MagicMock()
+        embedder.embed_single_cached = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        vocab = MagicMock()
+        vocab.vectorize_query.return_value = MagicMock(indices=[0], values=[1.0])
+        return storage, embedder, vocab
+
+    @pytest.mark.asyncio
+    async def test_scope_only_query_widens_fetch_limit(self):
+        """`... scope:function` (SEMANTIC + scope) fetches limit*10 candidates."""
+        storage, embedder, vocab = self._mocks()
+
+        await search_codebase(
+            query="database connection scope:function",
+            codebase_path="/test",
+            storage=storage,
+            embedder=embedder,
+            global_vocab=vocab,
+            mode="chunk",
+            limit=10,
+        )
+
+        assert storage.hybrid_search.call_args.kwargs["limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_plain_query_uses_narrow_fetch_limit(self):
+        """Control: a query with no post-retrieval filter fetches only limit*2."""
+        storage, embedder, vocab = self._mocks()
+
+        await search_codebase(
+            query="database connection",
+            codebase_path="/test",
+            storage=storage,
+            embedder=embedder,
+            global_vocab=vocab,
+            mode="chunk",
+            limit=10,
+        )
+
+        assert storage.hybrid_search.call_args.kwargs["limit"] == 20
