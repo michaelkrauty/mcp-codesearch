@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.20] - 2026-07-04
+
+### Fixed
+
+- **Scope-filtered searches no longer drop results.** `search_codebase` widened its retrieval candidate pool to `limit * 10` when a name, path, or file filter was present, and otherwise fetched only `limit * 2`. A `scope:` filter (`scope:test`, `scope:impl`, `scope:function`, `scope:class`, and the struct/enum/interface/type/module aliases) is applied as a post-retrieval filter, so a scope-only query such as `code_search("database connection scope:function")` fetched only `limit * 2` candidates and the scope filter could then leave far fewer than `limit` results, or none, when the candidate pool was dominated by other chunk types. `parsed.scope` is now part of the pool-widening condition, so a scope-filtered query fetches the wider pool like every other post-retrieval filter.
+
 ## [1.6.19] - 2026-06-25
 
 ### Fixed
