@@ -415,8 +415,19 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
     # Create query execution plan
     plan = _plan_query(query, parsed)
 
-    # Adjust fetch limit based on filtering needs
-    if plan.name_filter or parsed.path_prefix or parsed.exclude_paths or parsed.file_pattern:
+    # Adjust fetch limit based on filtering needs. Any post-retrieval filter
+    # that discards candidates must widen the pool, or fewer than `limit`
+    # results survive. scope: (test/impl/function/class/...) is applied after
+    # retrieval in _filter_by_parsed_query, so a scope-only query needs the
+    # wider pool too; without it a scope filter that rejects most chunks
+    # silently returned far fewer than `limit` matches.
+    if (
+        plan.name_filter
+        or parsed.path_prefix
+        or parsed.exclude_paths
+        or parsed.file_pattern
+        or parsed.scope
+    ):
         fetch_limit = limit * 10  # Need more candidates for filtering
     else:
         fetch_limit = limit * 2
