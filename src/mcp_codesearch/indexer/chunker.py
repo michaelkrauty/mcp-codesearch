@@ -10,6 +10,18 @@ from .treesitter import Chunk, chunk_with_treesitter
 from .treesitter import is_supported as treesitter_supported
 
 
+def truncate_chunk_content(content: str) -> str:
+    """Bound chunk content to the exact text stored in the payload."""
+    return content[: settings.max_payload_content_chars]
+
+
+def build_chunk_vocabulary_text(content: str, imports: list[str] | None) -> str:
+    """Add imports to chunk content for embedding or vocabulary accounting."""
+    if imports:
+        return "Uses: " + ", ".join(imports) + "\n\n" + content
+    return content
+
+
 def _chunk_fixed_size(
     content: str,
     chunk_size: int = 500,

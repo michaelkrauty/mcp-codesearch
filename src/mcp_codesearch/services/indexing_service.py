@@ -25,7 +25,12 @@ from vector_core import (
 )
 
 from mcp_codesearch.indexer.change_detect import ChangeSet, detect_changes_fast
-from mcp_codesearch.indexer.chunker import chunk_file, generate_file_summary
+from mcp_codesearch.indexer.chunker import (
+    build_chunk_vocabulary_text,
+    chunk_file,
+    generate_file_summary,
+    truncate_chunk_content,
+)
 from mcp_codesearch.indexer.discovery import (
     FileInfo,
     discover_files,
@@ -82,6 +87,7 @@ class PreparedFile(BaseModel):
     chunks: list[Chunk]
     summary: str
     chunk_embedding_texts: list[str] = []  # Pre-computed embedding texts for chunks
+    chunk_vocabulary_texts: list[str] = []
 
 
 class IndexingService:
@@ -590,6 +596,12 @@ class IndexingService:
                 summary = generate_file_summary(f.content, chunks, f.language)
                 # Pre-compute chunk embedding texts (avoids recomputation in _process_batch)
                 chunk_texts = [self._chunk_embedding_text(chunk) for chunk in chunks]
+                chunk_vocabulary_texts = [
+                    build_chunk_vocabulary_text(
+                        truncate_chunk_content(chunk.content), chunk.imports
+                    )
+                    for chunk in chunks
+                ]
             except Exception as e:
                 # Chunking operates on arbitrary untrusted source; one pathological
                 # file (malformed encoding, parser crash, etc.) must not abort the
@@ -604,12 +616,13 @@ class IndexingService:
                 chunks=chunks,
                 summary=summary,
                 chunk_embedding_texts=chunk_texts,
+                chunk_vocabulary_texts=chunk_vocabulary_texts,
             ))
 
             # Tokenize summary
             tokens_per_doc.append(set(self._global_vocab.tokenize(summary)))
-            # Tokenize each chunk using pre-computed texts
-            for chunk_text in chunk_texts:
+            # Tokenize the canonical text persisted for each chunk
+            for chunk_text in chunk_vocabulary_texts:
                 tokens_per_doc.append(set(self._global_vocab.tokenize(chunk_text)))
 
         return prepared_files, tokens_per_doc
@@ -662,7 +675,7 @@ class IndexingService:
             for i, chunk in enumerate(prepared.chunks):
                 dense_vec = dense_embeddings[embed_idx]
                 sparse_vec = self._global_vocab.vectorize_document(
-                    prepared.chunk_embedding_texts[i]
+                    prepared.chunk_vocabulary_texts[i]
                 )
                 embed_idx += 1
                 chunk_count += 1
@@ -740,12 +753,7 @@ class IndexingService:
     @staticmethod
     def _chunk_embedding_text(chunk: Chunk) -> str:
         """Build embedding text for a chunk, including imports if available."""
-        text: str = chunk.content
-        # Prepend imports for better semantic matching
-        if chunk.imports:
-            import_line = "Uses: " + ", ".join(chunk.imports)
-            text = import_line + "\n\n" + text
-        return text
+        return build_chunk_vocabulary_text(chunk.content, chunk.imports)
 
     def _build_file_point(
         self,
@@ -798,7 +806,8 @@ class IndexingService:
                 "name": chunk.name,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
-                "content": chunk.content[: settings.max_payload_content_chars],
+                "content": truncate_chunk_content(chunk.content),
                 "context": chunk.context,
+                "imports": chunk.imports or [],
             },
         )

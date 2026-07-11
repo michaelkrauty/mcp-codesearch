@@ -7,11 +7,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from qdrant_client.models import Distance, VectorParams
+from vector_core import GlobalVocabulary, SparseVector
 
 from mcp_codesearch import helpers
+from mcp_codesearch.indexer.chunker import (
+    build_chunk_vocabulary_text,
+    truncate_chunk_content,
+)
 from mcp_codesearch.indexer.discovery import FileInfo
+from mcp_codesearch.indexer.treesitter import Chunk
 from mcp_codesearch.services import indexing_service as idx_svc
 from mcp_codesearch.services.indexing_service import IndexingService
+from mcp_codesearch.settings import settings
 from mcp_codesearch.storage import qdrant as storage_qdrant
 from mcp_codesearch.storage.qdrant import (
     EmbeddingDimMismatchError,
@@ -37,8 +44,8 @@ def _make_file(name: str, content: str) -> FileInfo:
 def _make_service() -> IndexingService:
     """Construct an IndexingService with stub dependencies.
 
-    _prepare_files only touches self._global_vocab.tokenize and the static
-    _chunk_embedding_text method, so the other deps can be bare mocks.
+    _prepare_files only touches self._global_vocab.tokenize and text-building
+    helpers, so the other deps can be bare mocks.
     """
     vocab = MagicMock()
     vocab.tokenize = MagicMock(return_value=[])
@@ -620,3 +627,160 @@ class TestCollectRemovedTokensFetchFailure:
 
         service._storage.delete_by_paths_batch.assert_awaited_once()
         assert tokens == [{"some", "code"}]
+
+
+class TestVocabularyAccountingInvariant:
+    """Adding and removing the same file must be an exact vocabulary inverse."""
+
+    async def test_register_then_remove_with_imports_restores_counters(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "vocabulary.db")
+        storage = QdrantStorage()
+        client = MagicMock()
+        client.delete = AsyncMock()
+        storage._get_client = AsyncMock(return_value=client)
+        service = IndexingService(
+            storage=storage,
+            embedder=MagicMock(),
+            global_vocab=vocab,
+        )
+        file_info = _make_file(
+            "imported.py",
+            "import drift_only_dependency\n\n"
+            "def calculate_result(value):\n"
+            "    return value + 1\n",
+        )
+
+        try:
+            prepared_files, added_tokens = service._prepare_files([file_info])
+            prepared = prepared_files[0]
+            empty_sparse = SparseVector(indices=[], values=[])
+            points = [
+                service._build_file_point(file_info, prepared.summary, [], empty_sparse),
+                *[
+                    service._build_chunk_point(file_info, chunk, [], empty_sparse)
+                    for chunk in prepared.chunks
+                ],
+            ]
+            client.scroll = AsyncMock(
+                return_value=(
+                    [SimpleNamespace(id=point.id, payload=point.payload) for point in points],
+                    None,
+                )
+            )
+
+            baseline_tokens = set().union(*added_tokens)
+            vocab.register_codebase("baseline", [baseline_tokens])
+            starting_doc_freq = vocab._get_doc_freq().copy()
+            starting_doc_count = vocab.total_docs
+
+            vocab.register_codebase("subject", added_tokens)
+            changes = SimpleNamespace(deleted=[file_info.rel_path], modified=[], added=[])
+            removed_tokens = await service._collect_removed_tokens("collection", changes)
+            vocab.update_codebase_incremental(
+                "subject",
+                added_tokens=[],
+                removed_tokens=removed_tokens,
+                net_doc_change=-len(removed_tokens),
+            )
+
+            assert vocab._get_doc_freq() == starting_doc_freq
+            assert vocab.total_docs == starting_doc_count
+            assert vocab.get_codebase_doc_count("subject") == 0
+        finally:
+            vocab.close()
+
+
+class TestStoredVocabularyText:
+    """Stored chunk payloads preserve the text needed for exact removal."""
+
+    def test_vocabulary_text_uses_stored_content_limit_but_dense_text_does_not(self):
+        content = "x" * settings.max_payload_content_chars + " tail_only_token"
+        chunk = Chunk(
+            content=content,
+            chunk_type="block",
+            name=None,
+            start_line=1,
+            end_line=1,
+            context=None,
+            imports=["example.module"],
+        )
+
+        stored_content = truncate_chunk_content(chunk.content)
+        vocabulary_text = build_chunk_vocabulary_text(stored_content, chunk.imports)
+
+        assert vocabulary_text == "Uses: example.module\n\n" + (
+            "x" * settings.max_payload_content_chars
+        )
+        assert "tail_only_token" not in vocabulary_text
+        assert build_chunk_vocabulary_text(chunk.content, chunk.imports).endswith(
+            "tail_only_token"
+        )
+        assert IndexingService._chunk_embedding_text(chunk).endswith("tail_only_token")
+
+    async def test_get_stored_content_paginates_past_1000_points(self):
+        storage = QdrantStorage()
+        client = MagicMock()
+        first_page = [
+            SimpleNamespace(
+                payload={"type": "chunk", "content": f"chunk {i}", "imports": []}
+            )
+            for i in range(1000)
+        ]
+        last_page = [
+            SimpleNamespace(
+                payload={"type": "chunk", "content": "chunk 1000", "imports": []}
+            )
+        ]
+        client.scroll = AsyncMock(
+            side_effect=[(first_page, "next-page"), (last_page, None)]
+        )
+        storage._get_client = AsyncMock(return_value=client)
+
+        texts = await storage.get_stored_content_for_path("collection", "large.py")
+
+        assert len(texts) == 1001
+        assert texts[-1] == "chunk 1000"
+        assert client.scroll.await_count == 2
+        assert client.scroll.await_args_list[1].kwargs["offset"] == "next-page"
+
+    async def test_stored_content_is_not_retruncated_during_removal(self):
+        storage = QdrantStorage()
+        client = MagicMock()
+        stored_content = "x" * (settings.max_payload_content_chars + 1) + " retained_tail"
+        client.scroll = AsyncMock(
+            return_value=(
+                [
+                    SimpleNamespace(
+                        payload={
+                            "type": "chunk",
+                            "content": stored_content,
+                            "imports": ["example.module"],
+                        }
+                    )
+                ],
+                None,
+            )
+        )
+        storage._get_client = AsyncMock(return_value=client)
+
+        texts = await storage.get_stored_content_for_path("collection", "older.py")
+
+        assert texts == ["Uses: example.module\n\n" + stored_content]
+
+    async def test_legacy_chunk_without_imports_degrades_to_raw_content(self, caplog):
+        storage = QdrantStorage()
+        client = MagicMock()
+        client.scroll = AsyncMock(
+            return_value=(
+                [SimpleNamespace(payload={"type": "chunk", "content": "legacy body"})],
+                None,
+            )
+        )
+        storage._get_client = AsyncMock(return_value=client)
+
+        with caplog.at_level("WARNING", logger="mcp_codesearch.storage.qdrant"):
+            texts = await storage.get_stored_content_for_path("collection", "legacy.py")
+
+        assert texts == ["legacy body"]
+        assert "legacy chunk point" in caplog.text
+        assert "may omit import or truncated-content tokens" in caplog.text

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.21] - 2026-07-10
+
+### Fixed
+
+- **Incremental indexing now removes exactly the vocabulary contribution that it added for every newly stored chunk.** Chunk registration previously tokenized the full dense-embedding text, including its `Uses:` import prefix, while removal tokenized only the truncated, import-free Qdrant payload. Repeatedly modifying or deleting files with imports therefore leaked document-frequency counts and depressed those tokens' IDF weights across every codebase sharing the vocabulary database. Chunk payloads now retain their small imports list, and vocabulary registration, sparse vectorization, and removal all use the same import-prefixed, payload-bounded text. Dense embeddings continue to use the full chunk. Existing payloads without the imports field remain readable and fall back to their stored content with a warning, so no migration or destructive reindex is required. Their first removal may still omit import or previously truncated tail tokens because those values were never stored. Previously inflated counters are not repaired automatically. After upgrading, run `force_reindex` once for every indexed codebase that may have been updated incrementally to rebuild its contribution to the shared vocabulary; there is no global repair command.
+- **Vocabulary removal now reads every stored point for very large files.** `get_stored_content_for_path` previously stopped after the first 1,000 points because it discarded Qdrant's continuation offset. It now follows offsets until the path is exhausted, so files with more than 1,000 points do not lose removal documents.
+
 ## [1.6.20] - 2026-07-04
 
 ### Fixed
