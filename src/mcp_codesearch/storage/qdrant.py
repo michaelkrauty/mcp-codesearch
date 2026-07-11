@@ -42,6 +42,7 @@ from vector_core.storage.qdrant import (
     generate_point_id,
 )
 
+from mcp_codesearch.indexer.chunker import build_chunk_vocabulary_text
 from mcp_codesearch.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -477,39 +478,66 @@ class QdrantStorage:
         self, collection: str, path: str
     ) -> list[str]:
         """
-        Get stored text content for a file path (summary + all chunk content).
+        Get vocabulary text for a file path (summary + all reconstructed chunks).
 
-        Used before deletion to retrieve tokens for vocabulary update.
+        New chunk payloads retain imports, so their registered text can be rebuilt
+        exactly from the stored content. Legacy chunks without that field fall back
+        to raw content and log a warning because their import and truncated-tail
+        tokens cannot be recovered.
 
         Returns:
-            List of text strings (file summary, chunk content) for tokenization.
+            List of text strings for tokenization.
         """
         client = await self._get_client()
 
-        points, _ = await client.scroll(
-            collection,
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="path", match=MatchValue(value=path)),
-                ],
-            ),
-            limit=1000,  # Should be enough for any file
-            with_payload=["type", "summary", "content"],
-        )
+        texts: list[str] = []
+        legacy_chunks = 0
+        offset = None
 
-        texts = []
-        for point in points:
-            if point.payload:
-                # File point has summary
+        while True:
+            points, offset = await client.scroll(
+                collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(key="path", match=MatchValue(value=path)),
+                    ],
+                ),
+                limit=1000,
+                offset=offset,
+                with_payload=["type", "summary", "content", "imports"],
+            )
+
+            for point in points:
+                if not point.payload:
+                    continue
                 if point.payload.get("type") == "file":
                     summary = point.payload.get("summary", "")
-                    if summary:
-                        texts.append(summary)
-                # Chunk point has content
+                    texts.append(summary if isinstance(summary, str) else "")
                 elif point.payload.get("type") == "chunk":
                     content = point.payload.get("content", "")
-                    if content:
+                    content = content if isinstance(content, str) else ""
+                    if "imports" not in point.payload:
+                        legacy_chunks += 1
                         texts.append(content)
+                        continue
+                    stored_imports = point.payload.get("imports")
+                    imports = (
+                        [item for item in stored_imports if isinstance(item, str)]
+                        if isinstance(stored_imports, list)
+                        else []
+                    )
+                    texts.append(build_chunk_vocabulary_text(content, imports))
+
+            if offset is None:
+                break
+
+        if legacy_chunks:
+            logger.warning(
+                "Used raw stored content for %d legacy chunk point(s) at %s; "
+                "vocabulary removal may omit import or truncated-content tokens",
+                legacy_chunks,
+                path,
+            )
 
         return texts
 
