@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.22] - 2026-07-10
+
+### Changed
+
+- **Pinned vector-core to v1.3.0.** Brings in the restored MCP tool registration verification, which had been silently skipped against current FastMCP releases and now genuinely checks that every expected tool registered at startup, and the `find_connections()` fix for duplicate paths on a self-referential fact.
+
 ## [1.6.21] - 2026-07-10
 
 ### Fixed
