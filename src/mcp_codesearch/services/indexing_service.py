@@ -680,7 +680,7 @@ class IndexingService:
                 embed_idx += 1
                 chunk_count += 1
 
-                points.append(self._build_chunk_point(file_info, chunk, dense_vec, sparse_vec))
+                points.append(self._build_chunk_point(file_info, chunk, dense_vec, sparse_vec, i))
 
         # Upsert this batch to Qdrant
         await self._storage.upsert_batch(col_name, points)
@@ -788,10 +788,18 @@ class IndexingService:
         chunk: Chunk,
         dense_vec: list[float],
         sparse_vec: SparseVector,
+        ordinal: int,
     ) -> PointStruct:
-        """Build a Qdrant point for a chunk-level entry."""
+        """Build a Qdrant point for a chunk-level entry.
+
+        ``ordinal`` is the chunk's position within its file, and it is what
+        keeps the point ID unique: several chunks of one file can share a start
+        line. See ``QdrantStorage._point_id``.
+        """
         return PointStruct(
-            id=self._storage._point_id("chunk", file_info.rel_path, chunk.start_line),
+            id=self._storage._point_id(
+                "chunk", file_info.rel_path, chunk.start_line, ordinal
+            ),
             vector={
                 "dense": dense_vec,
                 "sparse": sparse_to_qdrant(sparse_vec),

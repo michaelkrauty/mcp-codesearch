@@ -253,17 +253,34 @@ class QdrantStorage:
     # Point ID Generation - Code-search-specific (string IDs)
     # =========================================================================
 
-    def _point_id(self, point_type: str, path: str, start_line: int | None = None) -> str:
+    def _point_id(
+        self,
+        point_type: str,
+        path: str,
+        start_line: int | None = None,
+        ordinal: int | None = None,
+    ) -> str:
         """
         Generate deterministic point ID for a file or chunk.
 
         Uses UUID format for Qdrant compatibility (Qdrant only accepts UUIDs or integers).
         Point IDs are cached to eliminate redundant SHA256 operations during batch upserts.
 
+        Qdrant is keyed on point ID, so two points with the same ID cannot
+        coexist and the later upsert silently replaces the earlier one. Path and
+        start line do not identify a chunk on their own: the chunker emits a
+        chunk for a container and one for each definition inside it, so a
+        one-line declaration such as ``struct W { void render() {} };`` yields
+        several chunks that all start on the same line. Callers indexing a
+        file's chunks must therefore pass each chunk's position within that
+        file, which is unique by construction. Every path is re-indexed by
+        delete-then-upsert, so positions shifting between runs strands nothing.
+
         Args:
             point_type: "file" or "chunk"
             path: Relative file path
             start_line: Starting line number (for chunks)
+            ordinal: Position of the chunk within its file (for chunks)
 
         Returns:
             UUID-formatted string derived from SHA256 hash
@@ -271,6 +288,8 @@ class QdrantStorage:
         key = f"{point_type}:{path}"
         if start_line is not None:
             key += f":{start_line}"
+        if ordinal is not None:
+            key += f"#{ordinal}"
         return _cached_point_id(key)
 
     # =========================================================================
@@ -318,12 +337,20 @@ class QdrantStorage:
         chunk: ChunkPoint,
         dense_vector: list[float],
         sparse_vector: SparseVector,
+        ordinal: int,
     ) -> None:
-        """Upsert a chunk-level point."""
+        """Upsert a chunk-level point.
+
+        Args:
+            ordinal: Position of the chunk within its file. Required, and
+                required to be distinct across a file's chunks, because path
+                and start line do not identify a chunk on their own; see
+                ``_point_id``.
+        """
         client = await self._get_client()
 
         point = PointStruct(
-            id=self._point_id("chunk", chunk.path, chunk.start_line),
+            id=self._point_id("chunk", chunk.path, chunk.start_line, ordinal),
             vector={
                 "dense": dense_vector,
                 "sparse": QdrantSparseVector(
