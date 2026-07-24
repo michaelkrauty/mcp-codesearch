@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.24] - 2026-07-24
+
+### Changed
+
+- **Pinned vector-core to v1.3.1.** `update_codebase_incremental` can now establish a codebase document count instead of silently discarding it, so a corpus maintained purely by deltas no longer reports zero documents while contributing document frequencies. It also caps a removal at what the codebase actually contributed, keeping the shared aggregate equal to the sum of the per-codebase contributions, and floors counts and frequencies at zero: a negative value made the query weighting `log((total + 1) / (df + 1)) + 1` divide by zero or take the logarithm of a negative number, raising out of `vectorize_query` for every codebase sharing the database.
+
 ## [1.6.23] - 2026-07-24
 
 ### Fixed
