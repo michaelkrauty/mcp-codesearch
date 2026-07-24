@@ -541,7 +541,8 @@ class TestExactMatchSearch:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         results = await qdrant_storage.exact_match_search(
@@ -608,7 +609,8 @@ class TestExactMatchSearch:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         results = await qdrant_storage.exact_match_search(
@@ -654,10 +656,12 @@ class TestExactMatchSearch:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, py_chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, py_chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, ts_chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, ts_chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         results = await qdrant_storage.exact_match_search(
@@ -691,7 +695,8 @@ class TestExactMatchSearch:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         # "log" should NOT match "Dialog" (word boundary)
@@ -828,7 +833,8 @@ class TestQdrantEdgeCases:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         # Use mode="both" to avoid type filter, which allows __metadata__ to be seen
@@ -892,7 +898,8 @@ class TestQdrantEdgeCases:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         # Mock scroll to return point with large content
@@ -941,7 +948,8 @@ class TestQdrantEdgeCases:
             context=None,
         )
         await qdrant_storage.upsert_chunk(
-            test_collection, chunk, sample_dense_vector, sample_sparse_vector
+            test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+            ordinal=0,
         )
 
         # Mock re.search to raise re.error to trigger fallback path
@@ -990,7 +998,8 @@ class TestQdrantEdgeCases:
                 context=None,
             )
             await qdrant_storage.upsert_chunk(
-                test_collection, chunk, sample_dense_vector, sample_sparse_vector
+                test_collection, chunk, sample_dense_vector, sample_sparse_vector,
+                ordinal=0,
             )
 
         # Search with small limit
