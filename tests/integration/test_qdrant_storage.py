@@ -209,6 +209,7 @@ class TestChunkOperations:
             sample_chunk_point,
             sample_dense_vector,
             sample_sparse_vector,
+            ordinal=0,
         )
 
         # Verify via hybrid search (mode=chunk)
@@ -353,6 +354,7 @@ class TestHybridSearch:
             sample_chunk_point,
             sample_dense_vector,
             sample_sparse_vector,
+            ordinal=0,
         )
 
         results = await qdrant_storage.hybrid_search(
@@ -387,6 +389,7 @@ class TestHybridSearch:
             sample_chunk_point,
             sample_dense_vector,
             sample_sparse_vector,
+            ordinal=0,
         )
 
         results = await qdrant_storage.hybrid_search(
@@ -421,6 +424,7 @@ class TestHybridSearch:
             sample_chunk_point,
             sample_dense_vector,
             sample_sparse_vector,
+            ordinal=0,
         )
 
         results = await qdrant_storage.hybrid_search(

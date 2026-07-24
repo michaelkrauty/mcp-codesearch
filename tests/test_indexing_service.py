@@ -657,8 +657,8 @@ class TestVocabularyAccountingInvariant:
             points = [
                 service._build_file_point(file_info, prepared.summary, [], empty_sparse),
                 *[
-                    service._build_chunk_point(file_info, chunk, [], empty_sparse)
-                    for chunk in prepared.chunks
+                    service._build_chunk_point(file_info, chunk, [], empty_sparse, i)
+                    for i, chunk in enumerate(prepared.chunks)
                 ],
             ]
             client.scroll = AsyncMock(

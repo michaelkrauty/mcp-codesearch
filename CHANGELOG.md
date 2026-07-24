@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.23] - 2026-07-24
+
+### Fixed
+
+- **Definitions that share a source line are no longer dropped from the index.** A chunk's point ID was derived from its type, path and start line alone. The chunker emits a chunk for a container and another for each definition inside it, so a one-line declaration such as `struct W { void render() {} };`, `class A { foo() {} bar() {} }`, or two arrow functions on one line produced several chunks with identical IDs. Qdrant is keyed on point ID, so only the last one written survived and the rest were silently discarded. Chunk IDs now also carry the chunk's position within its file, which is unique by construction. The loss was invisible in the tool output because chunks are counted before the upsert, so the indexer reported storing every chunk while storing fewer. This is not limited to minified assets: idiomatic single-line C++ structs and compact Java and JavaScript classes all hit it. Python is largely immune because its syntax forces definitions onto separate lines.
+
+  Existing collections need no migration. Every path is re-indexed by delete-then-upsert, so a file picks up the new IDs the next time it changes, and file-level point IDs are unchanged. Chunks that were already lost to a collision only come back when their file is re-indexed, which `force_reindex` does immediately.
+
+### Changed
+
+- `QdrantStorage.upsert_chunk` takes a required `ordinal` argument, the chunk's position within its file, for the same reason.
+
 ## [1.6.22] - 2026-07-10
 
 ### Changed
