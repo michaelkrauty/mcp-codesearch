@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.26] - 2026-07-25
+
+### Changed
+
+- **Pinned vector-core to v1.4.0.** Every Qdrant request now carries the configured `qdrant_operation_timeout` rather than qdrant-client's five second default, which nothing had been overriding. This server felt that cap during incremental indexing: `delete_by_paths_batch` removes points for changed and deleted files in batches of 100 payload values, and the filter is evaluated without a keyword index on `path`, so the call runs longer the more the working set grows — measured at 7.55s against a collection of roughly 27k points. Past five seconds it failed with `ResponseHandlingException(ReadTimeout(''))`, so indexing a codebase with enough changed files could not complete.
+
+  The failure was not clean. Deletion proceeds batch by batch and the batches that precede the timeout have already been committed, while the incremental path has no rollback, so each failed attempt removed points that nothing then re-added. A repository that tripped this lost a little more of its index on every retry until a run succeeded.
+
 ## [1.6.25] - 2026-07-25
 
 ### Fixed
