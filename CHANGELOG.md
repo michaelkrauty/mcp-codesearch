@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.25] - 2026-07-25
+
+### Fixed
+
+- **A tool failure whose exception wraps another now names the wrapped cause instead of only the outer type.** `tool_error_handler` substitutes a message whenever an exception's own `__str__` is empty, but it named just that exception's type, which is not always enough to identify what went wrong. `qdrant_client` reports a transport failure as `ResponseHandlingException(ReadTimeout(''))`, where the wrapper and the exception it carries are both empty-messaged, so the client saw `ResponseHandlingException raised with no message` — a message that cannot distinguish a timeout from a refused connection or a malformed response, and that leaves reading the server's stderr as the only way to find out which. The chain is now walked and named, so the same failure reports `ResponseHandlingException <- ReadTimeout raised with no message`.
+
+  The chain is followed through an explicit `raise ... from`, then through a wrapper holding its cause as its sole argument, and only then through the implicit handling context, which is the order of how deliberately each states a cause. Traversal stops after four links and on any cycle, so an unusual chain cannot produce an unbounded message or fail to terminate.
+
 ## [1.6.24] - 2026-07-24
 
 ### Changed
