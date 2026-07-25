@@ -54,7 +54,13 @@ def _describe(exc: BaseException) -> str:
             break
         seen.add(id(current))
 
-        message = str(current).strip()
+        # A __str__ of its own can raise, and this runs while already handling
+        # a failure: letting that escape would replace the error being reported
+        # with an unrelated one. Degrade to the type name instead.
+        try:
+            message = str(current).strip()
+        except Exception:  # noqa: BLE001 - diagnostics must not add a failure
+            message = ""
         name = type(current).__name__
         parts.append(f"{name}: {message}" if message else name)
 
@@ -67,7 +73,9 @@ def _describe(exc: BaseException) -> str:
             first = current.args[0]
             if isinstance(first, BaseException):
                 following = first
-        if following is None:
+        # ``raise ... from None`` sets __suppress_context__ to say the context
+        # is not the cause; reporting it anyway would contradict the raiser.
+        if following is None and not current.__suppress_context__:
             following = current.__context__
         current = following
 

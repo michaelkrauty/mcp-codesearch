@@ -151,6 +151,45 @@ class TestToolErrorHandler:
         assert "Empty" in message
         assert "some detail" not in message
 
+    async def test_suppressed_context_is_not_reported(self):
+        """``raise ... from None`` states that the context is not the cause."""
+
+        @tool_error_handler
+        async def suppressing_tool() -> str:
+            try:
+                raise ConnectionResetError("inner detail")
+            except ConnectionResetError:
+                raise TimeoutError from None
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await suppressing_tool()
+
+        message = str(exc_info.value)
+        assert "TimeoutError" in message
+        assert "ConnectionResetError" not in message
+
+    async def test_cause_whose_str_raises_does_not_replace_the_error(self):
+        """Describing a failure must not itself fail.
+
+        This runs while an error is already being reported, so an exception
+        escaping here would substitute an unrelated one for the real fault.
+        """
+
+        class Exploding(Exception):
+            def __str__(self) -> str:
+                raise LookupError("stringification failed")
+
+        @tool_error_handler
+        async def exploding_tool() -> str:
+            raise TimeoutError from Exploding()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await exploding_tool()
+
+        message = str(exc_info.value)
+        assert "TimeoutError" in message
+        assert "Exploding" in message
+
     async def test_self_referential_chain_terminates(self):
         """A cycle in the chain must not hang the error path."""
 
