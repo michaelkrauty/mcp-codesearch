@@ -1,6 +1,6 @@
 [project]
 name = "mcp-codesearch"
-version = "1.6.26"
+version = "1.6.27"
 description = "Semantic code search MCP server using Qdrant and OpenAI-compatible embeddings"
 readme = "README.md"
 license = "Apache-2.0"
@@ -22,7 +22,12 @@ dependencies = [
 Homepage = "https://github.com/michaelkrauty/mcp-codesearch"
 Repository = "https://github.com/michaelkrauty/mcp-codesearch"
 
-[project.optional-dependencies]
+# A dependency group rather than an extra: `uv sync` installs it by default,
+# so `uv run pytest` finds pytest in the project environment. As an extra it
+# was omitted unless `--extra dev` was passed, and uv then fell through to
+# whatever pytest was on PATH, which runs the suite against a different
+# interpreter and a different installed vector-core than the project pins.
+[dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",

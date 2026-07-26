@@ -36,24 +36,7 @@ def error_contains(result, text: str) -> bool:
     return text_lower in str(result).lower()
 
 
-def qdrant_and_embeddings_available() -> bool:
-    """Check if both Qdrant and embedding service are running."""
-    import httpx
-    from mcp_codesearch.settings import settings
-    try:
-        # Check Qdrant
-        qdrant_ok = httpx.get(f"{settings.qdrant_url}/collections", timeout=2.0).status_code == 200
-        # Check embedding service
-        embed_ok = httpx.get(f"{settings.embedding_url}/v1/models", timeout=2.0).status_code == 200
-        return qdrant_ok and embed_ok
-    except Exception:
-        return False
-
-
-requires_full_stack = pytest.mark.skipif(
-    not qdrant_and_embeddings_available(),
-    reason="Qdrant and/or embedding service not available"
-)
+from .conftest import requires_full_stack  # noqa: E402 - re-exported for this module
 
 
 @requires_full_stack

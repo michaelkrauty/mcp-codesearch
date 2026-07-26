@@ -28,6 +28,35 @@ requires_qdrant = pytest.mark.skipif(
 )
 
 
+def qdrant_and_embeddings_available() -> bool:
+    """Check if both Qdrant and the embedding service are reachable."""
+    import httpx
+
+    from mcp_codesearch.settings import settings
+
+    try:
+        qdrant_ok = (
+            httpx.get(f"{settings.qdrant_url}/collections", timeout=2.0).status_code
+            == 200
+        )
+        embed_ok = (
+            httpx.get(f"{settings.embedding_url}/v1/models", timeout=2.0).status_code
+            == 200
+        )
+        return qdrant_ok and embed_ok
+    except Exception:
+        return False
+
+
+# Tests that index or search for real need both services. Without them the
+# work fails at the first embedding call, which says nothing about the code
+# under test, so they are skipped rather than failed.
+requires_full_stack = pytest.mark.skipif(
+    not qdrant_and_embeddings_available(),
+    reason="Qdrant and/or embedding service not available"
+)
+
+
 @pytest.fixture
 def test_collection_name():
     """Generate unique test collection name."""

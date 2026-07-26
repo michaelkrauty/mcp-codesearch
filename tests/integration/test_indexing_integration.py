@@ -14,6 +14,8 @@ from mcp_codesearch.server import (
 )
 from mcp_codesearch.storage.qdrant import collection_name
 
+from .conftest import requires_full_stack
+
 
 def is_error_result(result) -> bool:
     """Check if result is an error response (string or dict)."""
@@ -32,6 +34,7 @@ def error_contains(result, text: str) -> bool:
     return text_lower in str(result).lower()
 
 
+@requires_full_stack
 class TestIncrementalIndexing:
     """Tests for incremental indexing with file changes."""
 
@@ -275,6 +278,7 @@ class TestCleanupOrphans:
         assert isinstance(result, str)
 
 
+@requires_full_stack
 class TestSearchChanged:
     """Tests for search_changed with git integration."""
 
@@ -384,6 +388,7 @@ def second_function():
         assert "No matches" in result or "changed" in result.lower()
 
 
+@requires_full_stack
 class TestVocabularyGrowth:
     """Tests for vocabulary growth and reindexing triggers."""
 
@@ -418,6 +423,7 @@ def xylophone_kaleidoscope_function():
         await delete_collection(path=str(tmp_path))
 
 
+@requires_full_stack
 class TestBatchProcessing:
     """Tests for batch processing of large codebases."""
 

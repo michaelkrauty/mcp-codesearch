@@ -1,6 +1,21 @@
 """Shared pytest fixtures for mcp-codesearch tests."""
 
-import pytest
+import os
+
+# Settings read the environment once, at import, and an unset embedding
+# dimension leaves collection creation raising "embedding_dim not yet
+# initialized" for any test that stores a vector. Tests that build vectors
+# themselves only need the dimension to be *some* consistent number, so
+# default one here rather than leaving the suite dependent on whatever the
+# developer happens to export. This must run before anything imports the
+# settings object.
+#
+# setdefault, not assignment: a developer running the suite against a real
+# embedding service exports the dimension that service actually returns, and
+# overriding it would guarantee a mismatch.
+os.environ.setdefault("VECTOR_EMBEDDING_DIM", "128")
+
+import pytest  # noqa: E402 - must follow the environment default above
 
 
 @pytest.fixture
