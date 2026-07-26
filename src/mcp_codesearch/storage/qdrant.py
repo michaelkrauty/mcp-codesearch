@@ -449,6 +449,18 @@ class QdrantStorage:
             # Raise with a message so the MCP tool layer doesn't surface an
             # empty-string TimeoutError to the client.
             raise TimeoutError(msg) from e
+        except BaseException:
+            # gather() re-raises the first failure without stopping the others,
+            # so a sibling task can still be writing after this returns. The
+            # caller treats a raised upsert as "this batch did not land" and
+            # removes the batch's points; a task that outlives that cleanup
+            # puts some of them back, leaving points the vocabulary no longer
+            # accounts for and a file that looks indexed to the next run.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def delete_by_path(self, collection: str, path: str) -> None:
         """Delete all points for a file path."""
