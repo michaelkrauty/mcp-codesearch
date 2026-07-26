@@ -34,7 +34,6 @@ def error_contains(result, text: str) -> bool:
     return text_lower in str(result).lower()
 
 
-@requires_full_stack
 class TestIncrementalIndexing:
     """Tests for incremental indexing with file changes."""
 
@@ -103,6 +102,7 @@ def helper():
         except Exception:
             pass
 
+    @requires_full_stack
     async def test_initial_indexing(self, git_codebase):
         """Initial indexing creates collection."""
         result = await code_search(
@@ -114,6 +114,7 @@ def helper():
         # Should index files
         assert "[Indexed" in result or "main" in result.lower()
 
+    @requires_full_stack
     async def test_incremental_add_file(self, git_codebase):
         """Adding a file triggers incremental indexing."""
         # Initial index
@@ -137,6 +138,7 @@ def unique_function_xyzabc():
         # Incremental indexing should find the new file
         assert "unique" in result.lower() or "xyzabc" in result.lower() or "Indexed" in result
 
+    @requires_full_stack
     async def test_incremental_modify_file(self, git_codebase):
         """Modifying a file triggers re-indexing via incremental path."""
         # Initial index
@@ -185,6 +187,7 @@ if __name__ == "__main__":
         # Should complete without error - incremental indexing handles deletions
         assert isinstance(result, str)
 
+    @requires_full_stack
     async def test_incremental_no_changes(self, git_codebase):
         """Incremental index with no changes returns early."""
         # Initial index
@@ -199,6 +202,7 @@ if __name__ == "__main__":
         # Should return results without re-indexing
         assert "main" in result.lower()
 
+    @requires_full_stack
     async def test_incremental_deletions_only(self, git_codebase):
         """Incremental index with only deletions (no adds/modifies)."""
         # Initial index - ensure both files are indexed
@@ -278,7 +282,6 @@ class TestCleanupOrphans:
         assert isinstance(result, str)
 
 
-@requires_full_stack
 class TestSearchChanged:
     """Tests for search_changed with git integration."""
 
@@ -344,6 +347,7 @@ def second_function():
         except Exception:
             pass
 
+    @requires_full_stack
     async def test_search_changed_finds_recent(self, git_repo_with_history):
         """Search changed finds recently modified files."""
         from mcp_codesearch.server import search_changed
@@ -373,6 +377,7 @@ def second_function():
         assert is_error_result(result)
         assert error_contains(result, "git")
 
+    @requires_full_stack
     async def test_search_changed_no_changes(self, git_repo_with_history):
         """Search changed with no matching files."""
         from mcp_codesearch.server import search_changed

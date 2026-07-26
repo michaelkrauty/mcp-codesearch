@@ -29,21 +29,35 @@ requires_qdrant = pytest.mark.skipif(
 
 
 def qdrant_and_embeddings_available() -> bool:
-    """Check if both Qdrant and the embedding service are reachable."""
+    """Whether the full stack can actually serve these tests.
+
+    The embedding half is checked by embedding something, not by pinging
+    /v1/models: a service can list models while rejecting the configured one,
+    and only a real response reveals the vector width. That width has to match
+    what settings expect, because a mismatch fails every upsert for reasons
+    that say nothing about the code under test.
+    """
     import httpx
 
     from mcp_codesearch.settings import settings
 
     try:
-        qdrant_ok = (
+        if (
             httpx.get(f"{settings.qdrant_url}/collections", timeout=2.0).status_code
-            == 200
+            != 200
+        ):
+            return False
+
+        response = httpx.post(
+            f"{settings.embedding_url.rstrip('/')}/v1/embeddings",
+            json={"model": settings.embedding_model, "input": "probe"},
+            timeout=10.0,
         )
-        embed_ok = (
-            httpx.get(f"{settings.embedding_url}/v1/models", timeout=2.0).status_code
-            == 200
+        if response.status_code != 200:
+            return False
+        return (
+            len(response.json()["data"][0]["embedding"]) == settings.embedding_dim
         )
-        return qdrant_ok and embed_ok
     except Exception:
         return False
 
