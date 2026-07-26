@@ -536,52 +536,145 @@ class TestForceReindexRollback:
         assert chunks == 1
 
 
-class TestIncrementalIndexRollback:
-    """An incremental index deletes the changed files' old points, commits the
-    additive global-vocab delta, then upserts the new points. If a batch fails
-    after the commit, the unpersisted side effects must be rolled back so the
-    shared vocabulary stays consistent with Qdrant: only the ADDED part of the
-    delta is undone (the removed-token deletions match the already-deleted old
-    points and must stay), and the in-flight files' partial points are deleted so
-    the next run re-detects them as added (the force/full path has the equivalent
-    rollback)."""
+def _prepared(rel_path: str):
+    """A stand-in for a PreparedFile with no chunks (one document: its summary)."""
+    return SimpleNamespace(file_info=SimpleNamespace(rel_path=rel_path), chunks=[])
 
-    async def test_batch_failure_undoes_added_part_and_keeps_removals(
-        self, monkeypatch
-    ):
+
+class TestIncrementalIndexRollback:
+    """An incremental index applies one batch at a time: it commits that batch's
+    vocabulary delta, builds its points, then swaps them in for the ones they
+    replace. The delta has to precede the points because the sparse vectors are
+    computed from it, so a batch that fails must give the delta back -- and what
+    "giving it back" means depends on whether the outgoing points had already
+    been removed by then."""
+
+    async def test_embedding_failure_leaves_the_existing_points_alone(self):
+        """Failing before the swap must not delete anything.
+
+        Embedding is the slow, network-dependent step. When it fails the
+        previous points are all still in place and still answering queries, so
+        the whole delta is reversed and nothing is removed. Deleting here is
+        precisely the destruction this ordering exists to prevent.
+        """
         service = _make_service()
-        service._collect_removed_tokens = AsyncMock(return_value=[{"old"}])
-        modified = SimpleNamespace(rel_path="mod.py")
-        service._prepare_files = MagicMock(return_value=([object()], [{"new"}]))
+        service._collect_removed_tokens = AsyncMock(return_value={"mod.py": [{"old"}]})
+        service._prepare_files = MagicMock(
+            return_value=([_prepared("mod.py")], [{"new"}])
+        )
         service._process_batch = AsyncMock(
             side_effect=RuntimeError("transient embed failure")
         )
         service._storage.delete_by_paths_batch = AsyncMock()
-        # A modified file: its old tokens are removed, its new tokens are added.
-        changes = SimpleNamespace(added=[], modified=[modified], deleted=[])
+        changes = SimpleNamespace(
+            added=[], modified=[SimpleNamespace(rel_path="mod.py")], deleted=[]
+        )
 
         with pytest.raises(RuntimeError, match="transient embed failure"):
             await service._incremental_index("codesearch_x", changes, "/proj")
 
+        # Nothing was deleted: the file still has the points it started with.
+        service._storage.delete_by_paths_batch.assert_not_awaited()
+
         calls = service._global_vocab.update_codebase_incremental.call_args_list
         assert len(calls) == 2
         orig, undo = calls[0].kwargs, calls[1].kwargs
-        # Original committed delta: add new tokens, remove old tokens.
         assert orig["added_tokens"] == [{"new"}] and orig["removed_tokens"] == [{"old"}]
-        # Rollback undoes ONLY the added part; it does NOT restore {"old"}
-        # (whose points are already deleted).
-        assert undo["added_tokens"] == []
+        # The delta is reversed in full: the old tokens go back, because the
+        # documents they were counted from were never removed.
+        assert undo["added_tokens"] == [{"old"}]
         assert undo["removed_tokens"] == [{"new"}]
-        assert undo["net_doc_change"] == -1
-        # The in-flight file's partial points are deleted so the next run
-        # re-detects it as added.
+        assert undo["net_doc_change"] == 0
+
+    async def test_failure_after_the_swap_clears_that_batch(self):
+        """Failing once the outgoing points are gone leaves the paths empty.
+
+        The affected paths now hold neither their old points nor a complete set
+        of new ones, so they are cleared and the next run re-detects them as
+        added. The removed-token deletions stand, because they match points
+        that really are gone.
+        """
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(return_value={"mod.py": [{"old"}]})
+        service._prepare_files = MagicMock(
+            return_value=([_prepared("mod.py")], [{"new"}])
+        )
+
+        async def fail_after_swap(batch, col_name, languages, stale_paths, progress):
+            progress.stale_points_removed = True
+            raise RuntimeError("upsert failure")
+
+        service._process_batch = AsyncMock(side_effect=fail_after_swap)
+        service._storage.delete_by_paths_batch = AsyncMock()
+        changes = SimpleNamespace(
+            added=[], modified=[SimpleNamespace(rel_path="mod.py")], deleted=[]
+        )
+
+        with pytest.raises(RuntimeError, match="upsert failure"):
+            await service._incremental_index("codesearch_x", changes, "/proj")
+
         service._storage.delete_by_paths_batch.assert_awaited_once()
         assert service._storage.delete_by_paths_batch.await_args.args[1] == ["mod.py"]
 
+        undo = service._global_vocab.update_codebase_incremental.call_args_list[1].kwargs
+        assert undo["added_tokens"] == []
+        assert undo["removed_tokens"] == [{"new"}]
+        assert undo["net_doc_change"] == -1
+
+    async def test_a_failed_batch_does_not_start_the_next_one(self, monkeypatch):
+        """Files in later batches keep their points, so the index stays whole."""
+        monkeypatch.setattr(idx_svc, "INDEXING_BATCH_SIZE", 1)
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(
+            return_value={"a.py": [{"old_a"}], "b.py": [{"old_b"}]}
+        )
+        service._prepare_files = MagicMock(
+            return_value=([_prepared("a.py"), _prepared("b.py")], [{"new_a"}, {"new_b"}])
+        )
+        service._process_batch = AsyncMock(side_effect=RuntimeError("embed failure"))
+        service._storage.delete_by_paths_batch = AsyncMock()
+        changes = SimpleNamespace(
+            added=[],
+            modified=[SimpleNamespace(rel_path="a.py"), SimpleNamespace(rel_path="b.py")],
+            deleted=[],
+        )
+
+        with pytest.raises(RuntimeError, match="embed failure"):
+            await service._incremental_index("codesearch_x", changes, "/proj")
+
+        # Only the first batch ran; b.py was never touched at all.
+        assert service._process_batch.await_count == 1
+        assert service._process_batch.await_args.args[0][0].file_info.rel_path == "a.py"
+        # And only the first batch's delta was committed, then reversed.
+        calls = service._global_vocab.update_codebase_incremental.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["added_tokens"] == [{"new_a"}]
+
+    async def test_deleted_files_are_removed_without_waiting_for_a_batch(self):
+        """A file gone from disk has no replacement to wait for."""
+        service = _make_service()
+        service._collect_removed_tokens = AsyncMock(return_value={"gone.py": [{"old"}]})
+        service._prepare_files = MagicMock(
+            return_value=([_prepared("new.py")], [{"new"}])
+        )
+        service._process_batch = AsyncMock(return_value=1)
+        service._storage.store_metadata = AsyncMock()
+        service._storage.delete_by_paths_batch = AsyncMock()
+        changes = SimpleNamespace(
+            added=[SimpleNamespace(rel_path="new.py")], modified=[], deleted=["gone.py"]
+        )
+
+        await service._incremental_index("codesearch_x", changes, "/proj")
+
+        service._storage.delete_by_paths_batch.assert_awaited_once()
+        assert service._storage.delete_by_paths_batch.await_args.args[1] == ["gone.py"]
+
     async def test_successful_incremental_does_not_roll_back(self, monkeypatch):
         service = _make_service()
-        service._collect_removed_tokens = AsyncMock(return_value=[])
-        service._prepare_files = MagicMock(return_value=([object()], [{"tok"}]))
+        service._collect_removed_tokens = AsyncMock(return_value={})
+        service._prepare_files = MagicMock(
+            return_value=([_prepared("new.py")], [{"tok"}])
+        )
         service._process_batch = AsyncMock(return_value=1)
         service._storage.store_metadata = AsyncMock()
         service._storage.delete_by_paths_batch = AsyncMock()
@@ -614,7 +707,12 @@ class TestCollectRemovedTokensFetchFailure:
         # Nothing was deleted: a clean abort leaves Qdrant and the vocab in sync.
         service._storage.delete_by_paths_batch.assert_not_awaited()
 
-    async def test_deletes_and_returns_tokens_when_all_fetches_succeed(self):
+    async def test_returns_tokens_per_path_and_deletes_nothing(self):
+        """Collecting is a read. Removal is deferred to the swap.
+
+        Keyed by path because the vocabulary delta is committed per batch, and
+        a batch may only account for the files it actually replaced.
+        """
         service = _make_service()
         service._storage.get_stored_content_for_path = AsyncMock(
             return_value=["some code"]
@@ -625,8 +723,8 @@ class TestCollectRemovedTokensFetchFailure:
 
         tokens = await service._collect_removed_tokens("col", changes)
 
-        service._storage.delete_by_paths_batch.assert_awaited_once()
-        assert tokens == [{"some", "code"}]
+        service._storage.delete_by_paths_batch.assert_not_awaited()
+        assert tokens == {"foo.py": [{"some", "code"}]}
 
 
 class TestVocabularyAccountingInvariant:
@@ -675,7 +773,10 @@ class TestVocabularyAccountingInvariant:
 
             vocab.register_codebase("subject", added_tokens)
             changes = SimpleNamespace(deleted=[file_info.rel_path], modified=[], added=[])
-            removed_tokens = await service._collect_removed_tokens("collection", changes)
+            removed_by_path = await service._collect_removed_tokens(
+                "collection", changes
+            )
+            removed_tokens = [t for toks in removed_by_path.values() for t in toks]
             vocab.update_codebase_incremental(
                 "subject",
                 added_tokens=[],

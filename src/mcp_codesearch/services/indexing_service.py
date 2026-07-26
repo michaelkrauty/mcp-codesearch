@@ -78,6 +78,21 @@ class IndexingStats(BaseModel):
         }
 
 
+class BatchProgress:
+    """How far a batch got, so a failure can be undone with the right remedy.
+
+    Whether the stale points were already removed decides what recovery means:
+    before that, the previous index is intact and must be left alone; after it,
+    the affected paths hold neither their old points nor a complete set of new
+    ones and have to be cleared so the next run re-indexes them.
+    """
+
+    __slots__ = ("stale_points_removed",)
+
+    def __init__(self) -> None:
+        self.stale_points_removed = False
+
+
 class PreparedFile(BaseModel):
     """A file prepared for indexing with its chunks and summary."""
 
@@ -339,47 +354,56 @@ class IndexingService:
                 f"full index: {e}"
             )
 
-    async def _rollback_incremental(
+    async def _rollback_batch(
         self,
         col_name: str,
-        files_to_index: list[FileInfo],
+        batch: list[PreparedFile],
         added_tokens: list[set[str]],
+        removed_tokens: list[set[str]],
+        progress: BatchProgress,
     ) -> None:
-        """Undo the unpersisted side effects of an incremental index that failed
-        midway, so the shared vocabulary stays consistent with Qdrant.
+        """Undo one batch's vocabulary delta after it failed to apply.
 
-        At the point of failure the changed files' OLD points are already deleted
-        (and their removal is reflected in the committed vocabulary delta), while
-        the new points are only partially upserted. Two steps restore consistency:
+        The delta is committed before the points because the sparse vectors are
+        computed from it, so a batch that fails has to give it back. Which
+        remedy is correct depends on how far the batch got, which is why
+        progress is tracked rather than assumed.
 
-        1. Delete any partially-written new points for the in-flight (added +
-           modified) files. With no points, the next run re-detects them as added
-           and re-indexes them cleanly, rather than seeing a half-written file as
-           unchanged.
-        2. Undo only the ADDED part of the vocabulary delta (remove the added
-           tokens and added doc count). The removed-token deletions are kept,
-           because they match the already-committed point deletions; restoring
-           them would strand tokens whose points are gone. The result is as if
-           the run had removed the deleted/modified files and added nothing.
+        Before the stale points were removed, the batch had changed nothing but
+        the vocabulary: the previous points are all still in place, so the whole
+        delta is reversed. The added tokens come back out and the removed ones
+        go back in, because the documents they were counted from are still
+        there. Nothing is deleted -- deleting here is precisely the destruction
+        this ordering exists to avoid.
 
-        Best-effort: each step's failure is logged, not raised, so the original
-        indexing error is the one that propagates.
+        Once removal has happened, the affected paths hold neither their old
+        points nor a complete set of new ones, so they are cleared. The
+        removed-token deletions then stand, because they match points that
+        really are gone; only the added tokens are taken back. With no points
+        at all, the next run re-detects those files as added and indexes them
+        cleanly.
+
+        Best-effort: a failure here is logged rather than raised, so the error
+        that caused the rollback is the one that reaches the caller.
         """
-        try:
-            paths = [f.rel_path for f in files_to_index]
-            await self._storage.delete_by_paths_batch(col_name, paths)
-        except Exception as e:
-            logger.warning(
-                f"Failed to delete partially-written points for {col_name} "
-                f"during incremental rollback: {e}"
-            )
+        restored_tokens: list[set[str]] = removed_tokens
+        if progress.stale_points_removed:
+            restored_tokens = []
+            try:
+                paths = [p.file_info.rel_path for p in batch]
+                await self._storage.delete_by_paths_batch(col_name, paths)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to delete partially-written points for {col_name} "
+                    f"during incremental rollback: {e}"
+                )
 
         try:
             self._global_vocab.update_codebase_incremental(
                 col_name,
-                added_tokens=[],
+                added_tokens=restored_tokens,
                 removed_tokens=added_tokens,
-                net_doc_change=-len(added_tokens),
+                net_doc_change=len(restored_tokens) - len(added_tokens),
             )
         except Exception as e:
             logger.warning(
@@ -491,8 +515,10 @@ class IndexingService:
         """Perform incremental indexing with memory-efficient batching."""
         start_time = time.time()
 
-        # Collect tokens from files being removed/modified BEFORE deleting
-        removed_tokens = await self._collect_removed_tokens(col_name, changes)
+        # Read the outgoing files' tokens. Nothing is removed yet: each file's
+        # points are dropped only once its replacement is ready to be written.
+        removed_by_path = await self._collect_removed_tokens(col_name, changes)
+        removed_tokens = list(chain.from_iterable(removed_by_path.values()))
 
         # Index new and modified files
         files_to_index = changes.added + changes.modified
@@ -508,6 +534,7 @@ class IndexingService:
 
         # Handle case where only deletions occurred
         if not files_to_index:
+            await self._storage.delete_by_paths_batch(col_name, list(removed_by_path))
             self._global_vocab.update_codebase_incremental(
                 col_name,
                 added_tokens=[],
@@ -526,34 +553,69 @@ class IndexingService:
         # Prepare file data and collect tokens for vocabulary update
         prepared_files, added_tokens = self._prepare_files(files_to_index)
 
-        # Update vocabulary: add new tokens, remove old tokens
-        net_doc_change = len(added_tokens) - len(removed_tokens)
-        new_tokens = self._global_vocab.update_codebase_incremental(
-            col_name,
-            added_tokens=added_tokens,
-            removed_tokens=removed_tokens,
-            net_doc_change=net_doc_change,
-        )
-
-        # Process files in batches for embedding and storage. The vocabulary
-        # delta above is already durably committed and the changed files' old
-        # points are already deleted; if a batch fails here, roll back the
-        # unpersisted side effects so the shared vocabulary stays consistent and
-        # the next run re-indexes the affected files cleanly. The force/full path
-        # has the equivalent rollback via _rollback_failed_full_index.
         total_chunks = 0
         languages: dict[str, int] = {}
+        new_tokens = 0
 
-        try:
-            for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
-                batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
-                batch = prepared_files[batch_start:batch_end]
+        # A file that no longer exists has no replacement to wait for, so its
+        # points and its share of the vocabulary go together, now.
+        modified_paths = {f.rel_path for f in changes.modified}
+        gone = [p for p in removed_by_path if p not in modified_paths]
+        if gone:
+            await self._storage.delete_by_paths_batch(col_name, gone)
+            gone_tokens = [t for p in gone for t in removed_by_path[p]]
+            self._global_vocab.update_codebase_incremental(
+                col_name,
+                added_tokens=[],
+                removed_tokens=gone_tokens,
+                net_doc_change=-len(gone_tokens),
+            )
 
-                chunk_count = await self._process_batch(batch, col_name, languages)
-                total_chunks += chunk_count
-        except Exception:
-            await self._rollback_incremental(col_name, files_to_index, added_tokens)
-            raise
+        # Each batch is applied as a unit: commit its vocabulary delta, build
+        # its points, then swap them in for the ones they replace. A batch that
+        # fails is undone by itself, and the batches after it are never started,
+        # so those files keep the points they already had. The index stays
+        # queryable throughout, and a failure costs at most one batch instead of
+        # every changed file in the run.
+        #
+        # The vocabulary delta has to precede the points, because the sparse
+        # vectors are computed from it. That is what bounds the exposure to a
+        # single batch rather than eliminating it.
+        doc_offset = 0
+        for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
+            batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
+            batch = prepared_files[batch_start:batch_end]
+
+            # tokens_per_doc holds one entry for a file's summary followed by one
+            # per chunk, in file order, so a batch's share is a contiguous slice.
+            doc_count = sum(1 + len(p.chunks) for p in batch)
+            batch_added = added_tokens[doc_offset : doc_offset + doc_count]
+            doc_offset += doc_count
+
+            batch_stale = [
+                p.file_info.rel_path
+                for p in batch
+                if p.file_info.rel_path in removed_by_path
+            ]
+            batch_removed = [t for p in batch_stale for t in removed_by_path[p]]
+
+            new_tokens += self._global_vocab.update_codebase_incremental(
+                col_name,
+                added_tokens=batch_added,
+                removed_tokens=batch_removed,
+                net_doc_change=len(batch_added) - len(batch_removed),
+            )
+
+            progress = BatchProgress()
+            try:
+                total_chunks += await self._process_batch(
+                    batch, col_name, languages, batch_stale, progress
+                )
+            except Exception:
+                await self._rollback_batch(
+                    col_name, batch, batch_added, batch_removed, progress
+                )
+                raise
 
         # Clear token sets to free memory
         del added_tokens
@@ -632,6 +694,8 @@ class IndexingService:
         batch: list[PreparedFile],
         col_name: str,
         languages: dict[str, int],
+        stale_paths: list[str] | None = None,
+        progress: BatchProgress | None = None,
     ) -> int:
         """
         Process a batch of prepared files: generate embeddings and upsert to Qdrant.
@@ -640,6 +704,11 @@ class IndexingService:
             batch: List of PreparedFile objects
             col_name: Collection name
             languages: Dict to track language counts (mutated in place)
+            stale_paths: Paths whose existing points this batch replaces. They
+                are removed only once the new points are built and ready to be
+                written, so that embedding -- by far the slowest and most
+                failure-prone step here -- cannot leave a file with neither its
+                old points nor its new ones.
 
         Returns:
             Number of chunks indexed
@@ -682,6 +751,24 @@ class IndexingService:
 
                 points.append(self._build_chunk_point(file_info, chunk, dense_vec, sparse_vec, i))
 
+        # The replacement points exist now, so the ones they supersede can go.
+        # Deleting here rather than before embedding is what keeps a failed run
+        # non-destructive: everything above this line can fail with the existing
+        # index untouched and still answering queries.
+        if progress is not None:
+            # Marked before the request, not after: a delete that raises may
+            # still have been applied before the response was lost, and
+            # recovery has to assume the points are gone. Treating an
+            # ambiguous failure as "not deleted" would restore the vocabulary
+            # for documents Qdrant no longer holds, stranding that count with
+            # no path left for a later run to rediscover and subtract.
+            #
+            # Set even when there is nothing to delete, because the upsert
+            # below can still write points partially.
+            progress.stale_points_removed = True
+        if stale_paths:
+            await self._storage.delete_by_paths_batch(col_name, stale_paths)
+
         # Upsert this batch to Qdrant
         await self._storage.upsert_batch(col_name, points)
 
@@ -691,21 +778,25 @@ class IndexingService:
         self,
         col_name: str,
         changes: ChangeSet,
-    ) -> list[set[str]]:
+    ) -> dict[str, list[set[str]]]:
         """
-        Collect tokens from files being deleted/modified and delete from Qdrant.
+        Collect the tokens currently stored for files being deleted or modified.
 
-        This must happen BEFORE indexing new content to properly update vocabulary.
-        Uses parallel I/O for content fetching, then batch deletion for efficiency.
+        Reads only. Removing a file's points is deferred to the point where its
+        replacement is ready to take their place, so that a failure between here
+        and there leaves the existing index serving queries.
+
+        Keyed by path because the vocabulary delta is now committed per batch,
+        and a batch may only account for the files it actually replaced.
 
         Returns:
-            List of token sets from removed content
+            Mapping of path to the token sets of its stored documents
         """
         # Collect all paths to process
         all_paths = list(changes.deleted) + [f.rel_path for f in changes.modified]
 
         if not all_paths:
-            return []
+            return {}
 
         # Phase 1: Collect content from all paths in parallel (for vocabulary update)
         # Semaphore limits concurrent Qdrant reads
@@ -721,21 +812,21 @@ class IndexingService:
             *[fetch_content(p) for p in all_paths], return_exceptions=True
         )
 
-        # A failed fetch means we cannot know that file's old tokens. Deleting
-        # its points below while leaving those tokens in the shared vocabulary
+        # A failed fetch means we cannot know that file's old tokens. Removing
+        # its points later while leaving those tokens in the shared vocabulary
         # would permanently over-count it: the file is then gone (or unchanged)
         # and never re-detected, so nothing ever subtracts it, inflating IDF for
-        # every codebase that shares the vocabulary. Abort before deleting
-        # anything -- nothing has been deleted or committed yet, so the next run
-        # re-detects the same changes and retries cleanly.
-        valid_results: list[list[set[str]]] = []
+        # every codebase that shares the vocabulary. Abort before anything is
+        # deleted or committed, so the next run re-detects the same changes and
+        # retries cleanly.
+        by_path: dict[str, list[set[str]]] = {}
         failed: list[str] = []
         for path, result in zip(all_paths, results, strict=True):
             if isinstance(result, BaseException):
                 logger.warning(f"Failed to fetch content for {path}: {result}")
                 failed.append(path)
             else:
-                valid_results.append(result)
+                by_path[path] = result
 
         if failed:
             raise RuntimeError(
@@ -744,11 +835,7 @@ class IndexingService:
                 f"({', '.join(failed[:5])}); will retry on the next run"
             )
 
-        # Phase 2: Batch delete all paths (much faster than individual deletes)
-        await self._storage.delete_by_paths_batch(col_name, all_paths)
-
-        # Flatten results into single list using itertools.chain
-        return list(chain.from_iterable(valid_results))
+        return by_path
 
     @staticmethod
     def _chunk_embedding_text(chunk: Chunk) -> str:

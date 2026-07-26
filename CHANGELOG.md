@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.6.28] - 2026-07-25
+
+### Fixed
+
+- **A failed incremental index no longer takes the existing index down with it.** Indexing removed every changed file's points first and embedded afterwards, so a failure at the embedding step — the slowest part of the run, and the one that depends on a remote service — left those files with no points at all until some later run happened to succeed. Measured against a real collection, a single injected embedding failure took it from 8 points to 1. Retrying did not help: each attempt removed another set of points that nothing added back, so a repository that kept failing kept losing more of its index.
+
+  A batch's outgoing points are now removed only once its replacements have been built and are ready to be written. Everything that can realistically fail happens before anything is destroyed, so the previous index stays queryable throughout. The same injected failure now leaves the collection exactly as it was.
+
+- **A batch upsert that fails no longer leaves its sibling writes running.** `asyncio.gather` re-raises the first failure without stopping the others, and only the timeout path cancelled them. Since the caller treats a raised upsert as "this batch did not land" and clears the batch's points, a task outliving that cleanup could write some of them back — leaving points the vocabulary no longer accounts for, and a file that looks indexed to the next run. Any failure now cancels the rest of the batch before propagating.
+
+### Changed
+
+- **Recovery is scoped to the batch that failed, and depends on how far it got.** The vocabulary delta is committed per batch and must precede that batch's points, because the sparse vectors are computed from it. If the batch fails before its outgoing points were removed, the delta is reversed in full and nothing is deleted — the previous points are all still in place, and the tokens counted from them are still accurate. If it fails after, the affected paths are cleared and only the added tokens are taken back, matching points that really are gone; the next run then re-detects those files as added. A delete that raises is treated as having happened, since Qdrant may have applied it before the response was lost.
+
+  Batches that already completed are not unwound, and batches after the failure are never started, so a failure costs at most one batch rather than every changed file in the run.
+
+
 ## [1.6.27] - 2026-07-25
 
 ### Fixed
