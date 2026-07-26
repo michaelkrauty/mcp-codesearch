@@ -12,6 +12,8 @@ from mcp_codesearch.server import (
 )
 from mcp_codesearch.storage.qdrant import collection_name
 
+from .conftest import requires_full_stack
+
 
 def is_error_result(result) -> bool:
     """Check if result is an error response (string or dict)."""
@@ -45,6 +47,7 @@ class TestFindSimilarErrorPaths:
         assert is_error_result(result)
         assert error_contains(result, "empty")
 
+    @requires_full_stack
     async def test_invalid_limit_zero_clamps_to_default(self, temp_codebase):
         """Zero limit is clamped to default (10), not rejected."""
         # First index so we have something to search
@@ -58,6 +61,7 @@ class TestFindSimilarErrorPaths:
         # Should not error - clamped to default
         assert not is_error_result(result) or error_contains(result, "no similar")
 
+    @requires_full_stack
     async def test_invalid_limit_negative_clamps_to_default(self, temp_codebase):
         """Negative limit is clamped to default (10), not rejected."""
         await code_search(query="test", path=str(temp_codebase))
@@ -92,6 +96,7 @@ class TestFindSimilarErrorPaths:
         assert is_error_result(result)
         assert error_contains(result, "directory")
 
+    @requires_full_stack
     async def test_find_similar_with_language_filter(self, temp_codebase):
         """Find similar with language filter."""
         # First index
@@ -149,6 +154,7 @@ class TestFindReferencesErrorPaths:
         assert is_error_result(result)
         assert error_contains(result, "empty")
 
+    @requires_full_stack
     async def test_invalid_limit_zero_clamps_to_default(self, temp_codebase):
         """Zero limit is clamped to default (20), not rejected."""
         await code_search(query="test", path=str(temp_codebase))
@@ -161,6 +167,7 @@ class TestFindReferencesErrorPaths:
         # Should not error - clamped to default
         assert not is_error_result(result) or error_contains(result, "not found") or error_contains(result, "no references")
 
+    @requires_full_stack
     async def test_invalid_limit_negative_clamps_to_default(self, temp_codebase):
         """Negative limit is clamped to default (20), not rejected."""
         await code_search(query="test", path=str(temp_codebase))
@@ -189,6 +196,7 @@ class TestFindReferencesErrorPaths:
         assert is_error_result(result)
         assert error_contains(result, "directory")
 
+    @requires_full_stack
     async def test_symbol_not_found(self, temp_codebase):
         """Non-existent symbol returns helpful message."""
         await code_search(query="test", path=str(temp_codebase))
@@ -243,6 +251,7 @@ class TestDeleteCollectionEdgeCases:
         )
         assert "not found" in result.lower() or "Collection not found" in result
 
+    @requires_full_stack
     async def test_delete_by_collection_id_success(self, temp_codebase):
         """Delete by collection ID works when collection exists."""
         # First index to create collection
@@ -321,6 +330,7 @@ class TestCodeSearchErrorPaths:
         assert is_error_result(result)
         assert error_contains(result, "directory")
 
+    @requires_full_stack
     async def test_invalid_limit_zero_clamps_to_default(self, temp_codebase):
         """Zero limit is clamped to default (10), not rejected."""
         result = await code_search(
@@ -331,6 +341,7 @@ class TestCodeSearchErrorPaths:
         # Should not error - clamped to default
         assert not is_error_result(result) or error_contains(result, "no results")
 
+    @requires_full_stack
     async def test_invalid_limit_negative_clamps_to_default(self, temp_codebase):
         """Negative limit is clamped to default (10), not rejected."""
         result = await code_search(

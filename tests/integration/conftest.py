@@ -28,6 +28,49 @@ requires_qdrant = pytest.mark.skipif(
 )
 
 
+def qdrant_and_embeddings_available() -> bool:
+    """Whether the full stack can actually serve these tests.
+
+    The embedding half is checked by embedding something, not by pinging
+    /v1/models: a service can list models while rejecting the configured one,
+    and only a real response reveals the vector width. That width has to match
+    what settings expect, because a mismatch fails every upsert for reasons
+    that say nothing about the code under test.
+    """
+    import httpx
+
+    from mcp_codesearch.settings import settings
+
+    try:
+        if (
+            httpx.get(f"{settings.qdrant_url}/collections", timeout=2.0).status_code
+            != 200
+        ):
+            return False
+
+        response = httpx.post(
+            f"{settings.embedding_url.rstrip('/')}/v1/embeddings",
+            json={"model": settings.embedding_model, "input": "probe"},
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            return False
+        return (
+            len(response.json()["data"][0]["embedding"]) == settings.embedding_dim
+        )
+    except Exception:
+        return False
+
+
+# Tests that index or search for real need both services. Without them the
+# work fails at the first embedding call, which says nothing about the code
+# under test, so they are skipped rather than failed.
+requires_full_stack = pytest.mark.skipif(
+    not qdrant_and_embeddings_available(),
+    reason="Qdrant and/or embedding service not available"
+)
+
+
 @pytest.fixture
 def test_collection_name():
     """Generate unique test collection name."""

@@ -1,6 +1,62 @@
 """Shared pytest fixtures for mcp-codesearch tests."""
 
-import pytest
+import os
+
+# Settings read the environment once, at import, and an unset embedding
+# dimension leaves collection creation raising "embedding_dim not yet
+# initialized" for any test that stores a vector. The suite therefore needs a
+# dimension established before anything imports the settings object, which is
+# why this runs at the top of the root conftest.
+#
+# It cannot simply be a constant. Leaving the dimension unset is what lets the
+# library auto-detect it from the first embedding call, so hardcoding one would
+# silently pin the suite to a width the configured service may not return, and
+# every collection built from it would be incompatible. So: ask the service.
+# One request settles both questions this suite needs answered — whether the
+# service is usable at all, and how wide its vectors are.
+
+_FALLBACK_EMBEDDING_DIM = 128
+
+
+def _probe_embedding_service() -> int | None:
+    """Return the configured service's embedding width, or None if unusable.
+
+    Deliberately a real embedding request rather than a liveness ping: a
+    service can serve /v1/models while rejecting the configured model, and a
+    ping cannot report a dimension. Any failure means the full-stack tests
+    could not have run anyway.
+    """
+    url = os.environ.get("VECTOR_EMBEDDING_URL", "http://localhost:8080")
+    model = os.environ.get("VECTOR_EMBEDDING_MODEL", "")
+    try:
+        import httpx
+
+        response = httpx.post(
+            f"{url.rstrip('/')}/v1/embeddings",
+            json={"model": model, "input": "probe"},
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            return None
+        return len(response.json()["data"][0]["embedding"]) or None
+    except Exception:
+        return None
+
+
+# Exposed so the integration conftest can gate on a service that genuinely
+# embeds, rather than one that merely answers a health check.
+EMBEDDING_DIM_FROM_SERVICE = (
+    None if os.environ.get("VECTOR_EMBEDDING_DIM") else _probe_embedding_service()
+)
+
+# An explicitly exported dimension always wins: a developer pointing the suite
+# at a specific service has already said what width to expect.
+os.environ.setdefault(
+    "VECTOR_EMBEDDING_DIM",
+    str(EMBEDDING_DIM_FROM_SERVICE or _FALLBACK_EMBEDDING_DIM),
+)
+
+import pytest  # noqa: E402 - must follow the environment default above
 
 
 @pytest.fixture
