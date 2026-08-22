@@ -1,4 +1,4 @@
-"""FastMCP server with code search tools."""
+"""MCP server with code search tools."""
 
 from __future__ import annotations
 
@@ -49,17 +49,17 @@ from mcp_codesearch.singletons import (  # noqa: E402, F401
 
 # Expected tools for verification (catches silent import failures)
 EXPECTED_TOOLS = [
+    "list_collections",
+    "delete_collection",
+    "cleanup_orphans",
+    "index_status",
+    "force_reindex",
+    "preview_index",
     "code_search",
     "search_multiple",
     "search_changed",
     "find_similar",
     "find_references",
-    "index_status",
-    "force_reindex",
-    "preview_index",
-    "list_collections",
-    "delete_collection",
-    "cleanup_orphans",
 ]
 
 # Re-export tools for backward compatibility with tests
@@ -93,7 +93,11 @@ def _sync_cleanup() -> None:
     handling across all MCP servers.
     """
     singletons: list[AsyncSingleton[Any]] = [
-        _storage, _embedder, _global_vocab, _indexing_service, _search_service
+        _storage,
+        _embedder,
+        _global_vocab,
+        _indexing_service,
+        _search_service,
     ]
     if not any(s.is_initialized for s in singletons):
         return

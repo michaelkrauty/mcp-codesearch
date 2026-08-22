@@ -8,9 +8,9 @@ from mcp_codesearch.tools._errors import tool_error_handler
 
 
 class TestToolErrorHandler:
-    """The decorator must never let FastMCP see an exception with empty __str__.
+    """The decorator must never let MCPServer see an exception with empty __str__.
 
-    FastMCP's Tool.run wraps exceptions as `f"Error executing tool {name}: {e}"`,
+    MCPServer's tool runner wraps exceptions as `f"Error executing tool {name}: {e}"`,
     so a bare `TimeoutError()` or `BrokenPipeError()` turns into a useless
     "Error executing tool X: " at the client. The decorator's job is to
     (a) log the full traceback, and (b) make sure the re-raised exception
@@ -35,8 +35,7 @@ class TestToolErrorHandler:
 
         # Full traceback should be logged to stderr for post-mortem.
         assert any(
-            "raising_tool" in r.message and "ValueError" in r.message
-            for r in caplog.records
+            "raising_tool" in r.message and "ValueError" in r.message for r in caplog.records
         )
 
     async def test_wraps_empty_message_exception_with_type_name(self, caplog):
@@ -57,8 +56,7 @@ class TestToolErrorHandler:
 
         # And the full traceback must still hit stderr.
         assert any(
-            "timing_out_tool" in r.message and "TimeoutError" in r.message
-            for r in caplog.records
+            "timing_out_tool" in r.message and "TimeoutError" in r.message for r in caplog.records
         )
 
     async def test_wraps_broken_pipe_error(self):
@@ -217,7 +215,7 @@ class TestToolErrorHandler:
             await cancellable_tool()
 
     async def test_preserves_function_metadata(self):
-        """functools.wraps means FastMCP's signature introspection keeps working."""
+        """functools.wraps means MCPServer's signature introspection keeps working."""
 
         @tool_error_handler
         async def documented_tool(x: int, y: str = "default") -> str:
