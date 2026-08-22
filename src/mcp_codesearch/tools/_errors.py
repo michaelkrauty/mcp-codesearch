@@ -1,13 +1,13 @@
 """Error handling wrapper for MCP tool entry points.
 
-FastMCP's Tool.run catches tool exceptions and raises::
+MCPServer's tool runner catches tool exceptions and raises::
 
     ToolError(f"Error executing tool {name}: {e}")
 
 For exceptions whose ``__str__`` returns an empty string (bare ``TimeoutError()``,
 ``BrokenPipeError()``, many asyncio/network errors constructed with no args),
 this produces a useless ``"Error executing tool X: "`` at the MCP client with
-no trailing detail, and the root cause is invisible because FastMCP doesn't log
+no trailing detail, and the root cause is invisible because MCPServer doesn't log
 the traceback either.
 
 The ``tool_error_handler`` decorator closes both gaps: it logs the full traceback
@@ -87,7 +87,7 @@ def tool_error_handler[**P, R](
 ) -> Callable[P, Awaitable[R]]:
     """Log full tracebacks and ensure MCP tool errors are never empty strings.
 
-    Place this decorator BELOW ``@mcp.tool()`` in the stack so FastMCP registers
+    Place this decorator BELOW ``@mcp.tool()`` in the stack so MCPServer registers
     the wrapped function::
 
         @mcp.tool()
@@ -102,7 +102,7 @@ def tool_error_handler[**P, R](
       the original exception unchanged (preserving type + chain).
     - On exception with an empty ``str(e)``: logs the traceback, then re-raises
       inside a ``RuntimeError`` whose message contains ``type(e).__name__`` so
-      FastMCP's ``f"...: {e}"`` produces something useful. The original
+      MCPServer's ``f"...: {e}"`` produces something useful. The original
       exception is chained via ``__cause__``.
     """
 
@@ -113,9 +113,7 @@ def tool_error_handler[**P, R](
         except Exception as e:
             # Full traceback to stderr for post-mortem even when the MCP client
             # message is terse.
-            logger.exception(
-                f"Tool {fn.__name__} raised {type(e).__name__}: {e!r}"
-            )
+            logger.exception(f"Tool {fn.__name__} raised {type(e).__name__}: {e!r}")
             if str(e):
                 raise
             raise RuntimeError(

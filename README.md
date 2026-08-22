@@ -2,6 +2,8 @@
 
 MCP server for semantic code search with AST-aware chunking, hybrid vectors, and query syntax.
 
+Supports stateless MCP `2026-07-28` requests and legacy MCP clients from the same stdio server through the official Python SDK v2.
+
 ## Prerequisites
 
 - **Python 3.12+**
@@ -14,7 +16,7 @@ MCP server for semantic code search with AST-aware chunking, hybrid vectors, and
 Requires [vector-core](https://github.com/michaelkrauty/vector-core).
 
 ```bash
-pip install git+https://github.com/michaelkrauty/vector-core.git@v1.4.0
+pip install git+https://github.com/michaelkrauty/vector-core.git@v1.4.2
 pip install git+https://github.com/michaelkrauty/mcp-codesearch.git
 ```
 
