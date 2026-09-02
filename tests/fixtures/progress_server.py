@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
+import time
 
 from mcp.server import MCPServer
 
 from mcp_codesearch.progress import ToolProgressMiddleware
+from mcp_codesearch.services.indexing_service import _run_sync
 
 server = MCPServer(
     "progress-test",
@@ -16,7 +17,7 @@ server = MCPServer(
 
 @server.tool()
 async def slow_tool() -> str:
-    await asyncio.sleep(0.08)
+    await _run_sync(time.sleep, 0.08)
     return "complete"
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,23 @@ logger = logging.getLogger(__name__)
 
 # Batch size for memory-efficient streaming indexing
 INDEXING_BATCH_SIZE = 50  # Files per batch
+
+
+async def _run_sync[**P, R](fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    """Run blocking work off-loop without abandoning it on cancellation.
+
+    Some callers mutate the shared vocabulary. Waiting for the worker before
+    propagating cancellation preserves the old synchronous contract: no write
+    can outlive the indexing request and race its rollback or lock release.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        finally:
+            raise
 
 
 class IndexingStats(BaseModel):
@@ -176,7 +194,7 @@ class IndexingService:
                 # roll back to a clean "not indexed" state instead.
                 if exists:
                     # Unregister vocab FIRST, then delete collection
-                    self._safe_unregister_vocab(col_name)
+                    await self._safe_unregister_vocab(col_name)
                     await self._storage.delete_collection(col_name)
 
                 # Everything from collection (re)creation onward can fail and
@@ -186,7 +204,7 @@ class IndexingService:
                 # error), so guard the whole rebuild and roll back on any failure.
                 try:
                     await self._storage.create_collection(col_name)
-                    files = list(discover_files(codebase_path))
+                    files = await _run_sync(lambda: list(discover_files(codebase_path)))
                     return await self._full_index(col_name, files, abs_path)
                 except Exception:
                     await self._rollback_failed_full_index(col_name)
@@ -200,7 +218,7 @@ class IndexingService:
 
                 # Incremental index with fast change detection
                 indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
-                changes = detect_changes_fast(codebase_path, indexed_metadata)
+                changes = await _run_sync(detect_changes_fast, codebase_path, indexed_metadata)
 
                 if not changes.has_changes:
                     return 0, 0, None
@@ -296,7 +314,7 @@ class IndexingService:
             }
 
         indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
-        changes = detect_changes_fast(abs_path, indexed_metadata)
+        changes = await _run_sync(detect_changes_fast, abs_path, indexed_metadata)
         metadata = await self._storage.get_metadata(col_name)
         updated = metadata.get("updated_at", "unknown") if metadata else "unknown"
 
@@ -318,13 +336,13 @@ class IndexingService:
             },
         }
 
-    def _safe_unregister_vocab(self, col_name: str) -> bool:
+    async def _safe_unregister_vocab(self, col_name: str) -> bool:
         """Safely unregister a codebase from the vocabulary.
 
         Returns: True if succeeded, False if failed (vocab may be stale)
         """
         try:
-            self._global_vocab.unregister_codebase(col_name)
+            await _run_sync(self._global_vocab.unregister_codebase, col_name)
             return True
         except Exception as e:
             logger.warning(f"Failed to unregister vocabulary for {col_name}: {e}")
@@ -345,13 +363,12 @@ class IndexingService:
         Best-effort: each step is independent and its failure is logged, not
         raised, so the original indexing error is the one that propagates.
         """
-        self._safe_unregister_vocab(col_name)
+        await self._safe_unregister_vocab(col_name)
         try:
             await self._storage.delete_collection(col_name)
         except Exception as e:
             logger.warning(
-                f"Failed to drop partial collection {col_name} after a failed "
-                f"full index: {e}"
+                f"Failed to drop partial collection {col_name} after a failed full index: {e}"
             )
 
     async def _rollback_batch(
@@ -399,7 +416,8 @@ class IndexingService:
                 )
 
         try:
-            self._global_vocab.update_codebase_incremental(
+            await _run_sync(
+                self._global_vocab.update_codebase_incremental,
                 col_name,
                 added_tokens=restored_tokens,
                 removed_tokens=added_tokens,
@@ -432,7 +450,7 @@ class IndexingService:
             # Unregister vocab FIRST, then delete collection
             # This prevents orphaned vocabulary data if collection delete succeeds
             # but vocab unregister fails
-            self._safe_unregister_vocab(col_name)
+            await self._safe_unregister_vocab(col_name)
             await self._storage.delete_collection(col_name)
             return True
 
@@ -453,7 +471,7 @@ class IndexingService:
             # Unregister vocab FIRST, then delete collection
             # This prevents orphaned vocabulary data if collection delete succeeds
             # but vocab unregister fails
-            self._safe_unregister_vocab(collection_id)
+            await self._safe_unregister_vocab(collection_id)
             await self._storage.delete_collection(collection_id)
             return True
 
@@ -476,8 +494,8 @@ class IndexingService:
             return 0, 0, IndexingStats(files_indexed=0, chunks_indexed=0, languages={})
 
         # Phase 1: Prepare files and register tokens with global vocabulary
-        prepared_files, tokens_per_doc = self._prepare_files(files)
-        new_tokens = self._global_vocab.register_codebase(col_name, tokens_per_doc)
+        prepared_files, tokens_per_doc = await _run_sync(self._prepare_files, files)
+        new_tokens = await _run_sync(self._global_vocab.register_codebase, col_name, tokens_per_doc)
         del tokens_per_doc  # Free memory
 
         # Phase 2: Process files in batches for embedding and storage
@@ -535,7 +553,8 @@ class IndexingService:
         # Handle case where only deletions occurred
         if not files_to_index:
             await self._storage.delete_by_paths_batch(col_name, list(removed_by_path))
-            self._global_vocab.update_codebase_incremental(
+            await _run_sync(
+                self._global_vocab.update_codebase_incremental,
                 col_name,
                 added_tokens=[],
                 removed_tokens=removed_tokens,
@@ -551,7 +570,7 @@ class IndexingService:
             return 0, 0, stats
 
         # Prepare file data and collect tokens for vocabulary update
-        prepared_files, added_tokens = self._prepare_files(files_to_index)
+        prepared_files, added_tokens = await _run_sync(self._prepare_files, files_to_index)
 
         total_chunks = 0
         languages: dict[str, int] = {}
@@ -564,7 +583,8 @@ class IndexingService:
         if gone:
             await self._storage.delete_by_paths_batch(col_name, gone)
             gone_tokens = [t for p in gone for t in removed_by_path[p]]
-            self._global_vocab.update_codebase_incremental(
+            await _run_sync(
+                self._global_vocab.update_codebase_incremental,
                 col_name,
                 added_tokens=[],
                 removed_tokens=gone_tokens,
@@ -593,13 +613,12 @@ class IndexingService:
             doc_offset += doc_count
 
             batch_stale = [
-                p.file_info.rel_path
-                for p in batch
-                if p.file_info.rel_path in removed_by_path
+                p.file_info.rel_path for p in batch if p.file_info.rel_path in removed_by_path
             ]
             batch_removed = [t for p in batch_stale for t in removed_by_path[p]]
 
-            new_tokens += self._global_vocab.update_codebase_incremental(
+            new_tokens += await _run_sync(
+                self._global_vocab.update_codebase_incremental,
                 col_name,
                 added_tokens=batch_added,
                 removed_tokens=batch_removed,
@@ -612,9 +631,7 @@ class IndexingService:
                     batch, col_name, languages, batch_stale, progress
                 )
             except Exception:
-                await self._rollback_batch(
-                    col_name, batch, batch_added, batch_removed, progress
-                )
+                await self._rollback_batch(col_name, batch, batch_added, batch_removed, progress)
                 raise
 
         # Clear token sets to free memory
@@ -668,18 +685,18 @@ class IndexingService:
                 # Chunking operates on arbitrary untrusted source; one pathological
                 # file (malformed encoding, parser crash, etc.) must not abort the
                 # whole indexing run. Log and skip.
-                logger.warning(
-                    f"Failed to chunk {f.rel_path}: {type(e).__name__}: {e}"
-                )
+                logger.warning(f"Failed to chunk {f.rel_path}: {type(e).__name__}: {e}")
                 continue
 
-            prepared_files.append(PreparedFile(
-                file_info=f,
-                chunks=chunks,
-                summary=summary,
-                chunk_embedding_texts=chunk_texts,
-                chunk_vocabulary_texts=chunk_vocabulary_texts,
-            ))
+            prepared_files.append(
+                PreparedFile(
+                    file_info=f,
+                    chunks=chunks,
+                    summary=summary,
+                    chunk_embedding_texts=chunk_texts,
+                    chunk_vocabulary_texts=chunk_vocabulary_texts,
+                )
+            )
 
             # Tokenize summary
             tokens_per_doc.append(set(self._global_vocab.tokenize(summary)))
@@ -722,7 +739,45 @@ class IndexingService:
         # Generate embeddings for this batch
         dense_embeddings = await self._embedder.embed_all(batch_texts)
 
-        # Build points for this batch
+        # Sparse vectorization and point construction are CPU-bound, and a
+        # large batch must not prevent the MCP progress heartbeat from running.
+        points, chunk_count = await _run_sync(
+            self._build_batch_points,
+            batch,
+            dense_embeddings,
+            languages,
+        )
+
+        # The replacement points exist now, so the ones they supersede can go.
+        # Deleting here rather than before embedding is what keeps a failed run
+        # non-destructive: everything above this line can fail with the existing
+        # index untouched and still answering queries.
+        if progress is not None:
+            # Marked before the request, not after: a delete that raises may
+            # still have been applied before the response was lost, and
+            # recovery has to assume the points are gone. Treating an
+            # ambiguous failure as "not deleted" would restore the vocabulary
+            # for documents Qdrant no longer holds, stranding that count with
+            # no path left for a later run to rediscover and subtract.
+            #
+            # Set even when there is nothing to delete, because the upsert
+            # below can still write points partially.
+            progress.stale_points_removed = True
+        if stale_paths:
+            await self._storage.delete_by_paths_batch(col_name, stale_paths)
+
+        # Upsert this batch to Qdrant
+        await self._storage.upsert_batch(col_name, points)
+
+        return chunk_count
+
+    def _build_batch_points(
+        self,
+        batch: list[PreparedFile],
+        dense_embeddings: list[list[float]],
+        languages: dict[str, int],
+    ) -> tuple[list[PointStruct], int]:
+        """Build dense/sparse Qdrant points for one prepared batch."""
         points = []
         embed_idx = 0
         chunk_count = 0
@@ -750,29 +805,7 @@ class IndexingService:
                 chunk_count += 1
 
                 points.append(self._build_chunk_point(file_info, chunk, dense_vec, sparse_vec, i))
-
-        # The replacement points exist now, so the ones they supersede can go.
-        # Deleting here rather than before embedding is what keeps a failed run
-        # non-destructive: everything above this line can fail with the existing
-        # index untouched and still answering queries.
-        if progress is not None:
-            # Marked before the request, not after: a delete that raises may
-            # still have been applied before the response was lost, and
-            # recovery has to assume the points are gone. Treating an
-            # ambiguous failure as "not deleted" would restore the vocabulary
-            # for documents Qdrant no longer holds, stranding that count with
-            # no path left for a later run to rediscover and subtract.
-            #
-            # Set even when there is nothing to delete, because the upsert
-            # below can still write points partially.
-            progress.stale_points_removed = True
-        if stale_paths:
-            await self._storage.delete_by_paths_batch(col_name, stale_paths)
-
-        # Upsert this batch to Qdrant
-        await self._storage.upsert_batch(col_name, points)
-
-        return chunk_count
+        return points, chunk_count
 
     async def _collect_removed_tokens(
         self,
@@ -806,7 +839,9 @@ class IndexingService:
             """Fetch stored content and tokenize it."""
             async with semaphore:
                 stored_texts = await self._storage.get_stored_content_for_path(col_name, path)
-                return [set(self._global_vocab.tokenize(text)) for text in stored_texts]
+                return await _run_sync(
+                    lambda: [set(self._global_vocab.tokenize(text)) for text in stored_texts]
+                )
 
         results = await asyncio.gather(
             *[fetch_content(p) for p in all_paths], return_exceptions=True
@@ -884,9 +919,7 @@ class IndexingService:
         line. See ``QdrantStorage._point_id``.
         """
         return PointStruct(
-            id=self._storage._point_id(
-                "chunk", file_info.rel_path, chunk.start_line, ordinal
-            ),
+            id=self._storage._point_id("chunk", file_info.rel_path, chunk.start_line, ordinal),
             vector={
                 "dense": dense_vec,
                 "sparse": sparse_to_qdrant(sparse_vec),
