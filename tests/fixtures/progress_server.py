@@ -17,7 +17,7 @@ server = MCPServer(
 
 @server.tool()
 async def slow_tool() -> str:
-    await _run_sync(time.sleep, 0.08)
+    await _run_sync(time.sleep, 0.2)
     return "complete"
 
 
