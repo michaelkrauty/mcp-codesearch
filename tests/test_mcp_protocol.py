@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
 
@@ -37,17 +36,8 @@ def test_progress_middleware_rejects_nonpositive_interval() -> None:
 
 
 @pytest.mark.asyncio
-async def test_long_tool_emits_repeated_progress_until_completion() -> None:
-    server = MCPServer(
-        "progress-test",
-        middleware=[ToolProgressMiddleware(interval_seconds=0.01)],
-    )
-
-    @server.tool()
-    async def slow_tool() -> str:
-        await asyncio.sleep(0.08)
-        return "complete"
-
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_long_tool_emits_repeated_progress_over_stdio(mode: str) -> None:
     progress: list[tuple[float, float | None, str | None]] = []
 
     async def capture_progress(
@@ -57,7 +47,12 @@ async def test_long_tool_emits_repeated_progress_until_completion() -> None:
     ) -> None:
         progress.append((current, total, message))
 
-    async with Client(server, cache=None) as client:
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(ROOT / "tests" / "fixtures" / "progress_server.py")],
+        cwd=ROOT,
+    )
+    async with Client(stdio_client(params), mode=mode, cache=None) as client:
         result = await client.call_tool(
             "slow_tool",
             progress_callback=capture_progress,
