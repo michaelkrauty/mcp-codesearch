@@ -58,6 +58,7 @@ claude mcp add codesearch -- mcp-codesearch
 - **18 Languages with AST Support**: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, PHP, Swift, Kotlin, Scala, C#, SQL, JSON, YAML, TOML (line-based fallback for Bash, HTML, CSS, and other file types)
 - **Query Syntax**: `function:name`, `class:name`, `file:pattern`, `path:prefix`, `-path:exclude`
 - **Incremental Indexing**: Change detection via mtime+size before hashing
+- **Progress-Aware Operations**: Long tool calls emit MCP progress heartbeats so compatible clients can extend request deadlines while indexing continues
 - **Query Preprocessing**: Synonym expansion (`fn` → `function`, `db` → `database`)
 - **Flexible Ignores**: Nested `.gitignore`, `.git/info/exclude`, and `.codesearchignore` (gitignore syntax) honored at every directory level
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from mcp.server import MCPServer
 
 from mcp_codesearch import __version__
+from mcp_codesearch.progress import ToolProgressMiddleware
 
 mcp = MCPServer(
     "codesearch",
@@ -14,4 +15,5 @@ mcp = MCPServer(
         "More powerful than grep for understanding code behavior, finding "
         "implementations by concept, or exploring unfamiliar codebases."
     ),
+    middleware=[ToolProgressMiddleware()],
 )

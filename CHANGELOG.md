@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.1] - 2026-09-01
+
+### Fixed
+
+- Long-running tool calls now report MCP progress every 15 seconds. Clients that reset their request timeout on progress no longer abandon a healthy first index or large incremental update at a fixed deadline, then collide with the still-running index on retry. The heartbeat is a no-op when the client did not request progress and does not add notifications to fast calls.
+
 ## [1.7.0] - 2026-08-21
 
 ### Added
