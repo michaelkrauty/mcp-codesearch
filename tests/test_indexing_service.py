@@ -76,6 +76,10 @@ async def test_run_sync_waits_for_worker_before_propagating_cancellation() -> No
     await asyncio.sleep(0.01)
     assert not task.done()
 
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done()
+
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task

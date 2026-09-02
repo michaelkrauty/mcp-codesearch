@@ -59,13 +59,19 @@ async def _run_sync[**P, R](fn: Callable[P, R], *args: P.args, **kwargs: P.kwarg
     can outlive the indexing request and race its rollback or lock release.
     """
     worker = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
+    cancellation: asyncio.CancelledError | None = None
+    while True:
         try:
-            await worker
-        finally:
-            raise
+            result = await asyncio.shield(worker)
+            break
+        except asyncio.CancelledError as exc:
+            # More than one cancellation can arrive while a server or task
+            # group is shutting down. Every wait stays shielded until the
+            # underlying thread has really finished.
+            cancellation = exc
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 class IndexingStats(BaseModel):

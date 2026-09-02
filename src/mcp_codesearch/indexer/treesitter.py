@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # Protected by lock for thread safety during concurrent indexing
 _parser_cache: dict[str, Any] = {}
 _parser_cache_lock = threading.Lock()
+_parser_locks: dict[str, threading.Lock] = {}
 
 
 class Chunk(BaseModel):
@@ -60,15 +61,24 @@ LANGUAGE_MAP = {
 # Node types that represent top-level definitions
 DEFINITION_TYPES = {
     "python": [
-        "function_definition", "async_function_definition",
-        "class_definition", "decorated_definition",
+        "function_definition",
+        "async_function_definition",
+        "class_definition",
+        "decorated_definition",
     ],
     "javascript": [
-        "function_declaration", "class_declaration", "arrow_function", "method_definition"
+        "function_declaration",
+        "class_declaration",
+        "arrow_function",
+        "method_definition",
     ],
     "typescript": [
-        "function_declaration", "class_declaration", "arrow_function", "method_definition",
-        "interface_declaration", "type_alias_declaration"
+        "function_declaration",
+        "class_declaration",
+        "arrow_function",
+        "method_definition",
+        "interface_declaration",
+        "type_alias_declaration",
     ],
     "go": ["function_declaration", "method_declaration", "type_declaration"],
     "rust": ["function_item", "impl_item", "struct_item", "enum_item", "trait_item"],
@@ -82,8 +92,13 @@ DEFINITION_TYPES = {
     "scala": ["function_definition", "class_definition", "object_definition"],
     "csharp": ["method_declaration", "class_declaration", "interface_declaration"],
     # SQL: CREATE statements for schemas
-    "sql": ["create_table_statement", "create_view_statement", "create_function_statement",
-            "create_procedure_statement", "create_index_statement"],
+    "sql": [
+        "create_table_statement",
+        "create_view_statement",
+        "create_function_statement",
+        "create_procedure_statement",
+        "create_index_statement",
+    ],
     # JSON/YAML/TOML: data structures (will fall back to line chunking if no definitions found)
     "json": ["object", "array"],  # Top-level structures
     "yaml": ["block_mapping", "block_sequence"],  # Top-level YAML structures
@@ -119,7 +134,7 @@ def _declarator_name_dfs(node: Any, source: bytes) -> str | None:
     while stack:
         current = stack.pop()
         if current.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
-            return source[current.start_byte:current.end_byte].decode("utf-8", errors="ignore")
+            return source[current.start_byte : current.end_byte].decode("utf-8", errors="ignore")
         # Push children in reverse so they pop in source order.
         for child in reversed(current.children):
             if child.type in ("parameter_list", "template_argument_list"):
@@ -149,7 +164,7 @@ def _scope_resolution_name(node: Any, source: bytes) -> str | None:
     constants = [g for g in node.children if g.type == "constant"]
     if constants:
         last = constants[-1]
-        return source[last.start_byte:last.end_byte].decode("utf-8", errors="ignore")
+        return source[last.start_byte : last.end_byte].decode("utf-8", errors="ignore")
     return None
 
 
@@ -175,11 +190,13 @@ def _get_node_name(node: Any, source: bytes) -> str | None:
             if scoped is not None:
                 return scoped
         else:
-            return source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
+            return source[name_node.start_byte : name_node.end_byte].decode(
+                "utf-8", errors="ignore"
+            )
     # Fallback for grammars whose definition node has no `name` field.
     for child in node.children:
         if child.type in _NAME_NODE_TYPES:
-            return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore")
+            return source[child.start_byte : child.end_byte].decode("utf-8", errors="ignore")
         # Ruby namespaced class/module (Foo::Bar): the name is a scope_resolution
         # whose final constant is the unqualified name.
         if child.type == "scope_resolution":
@@ -235,6 +252,12 @@ def _get_cached_parser(ts_language: str) -> Any | None:
         return _parser_cache[ts_language]
 
 
+def _get_parser_lock(ts_language: str) -> threading.Lock:
+    """Return the per-language lock protecting a cached parser instance."""
+    with _parser_cache_lock:
+        return _parser_locks.setdefault(ts_language, threading.Lock())
+
+
 def _build_context_path(context_parts: list[str]) -> str | None:
     """Build hierarchical context path from parts.
 
@@ -263,7 +286,7 @@ def _extract_docstring(source: bytes, node: Any, language: str) -> str | None:
     if language == "python":
         # Current grammar: string node directly in block
         if first_stmt.type == "string":
-            raw = source[first_stmt.start_byte:first_stmt.end_byte]
+            raw = source[first_stmt.start_byte : first_stmt.end_byte]
             text = raw.decode("utf-8", errors="ignore")
             # Clean up triple quotes
             text = text.strip("'\"")
@@ -272,7 +295,7 @@ def _extract_docstring(source: bytes, node: Any, language: str) -> str | None:
         elif first_stmt.type == "expression_statement":
             for child in first_stmt.children:
                 if child.type == "string":
-                    raw = source[child.start_byte:child.end_byte]
+                    raw = source[child.start_byte : child.end_byte]
                     text = raw.decode("utf-8", errors="ignore")
                     text = text.strip("'\"")
                     return text[:300]
@@ -294,7 +317,7 @@ def _generate_class_overview(node: Any, source: bytes, name: str | None, languag
     parts = []
 
     # Get class declaration line
-    class_line = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+    class_line = source[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
     # Extract just the first line (class definition)
     lines = class_line.split("\n")
     first_line = lines[0].rstrip() if lines else ""
@@ -313,7 +336,7 @@ def _generate_class_overview(node: Any, source: bytes, name: str | None, languag
             for stmt in child.children:
                 # Look for function definitions
                 if "function" in stmt.type or "method" in stmt.type:
-                    raw = source[stmt.start_byte:stmt.end_byte]
+                    raw = source[stmt.start_byte : stmt.end_byte]
                     method_text = raw.decode("utf-8", errors="ignore")
                     # Extract first line (signature)
                     method_lines = method_text.split("\n")
@@ -323,7 +346,7 @@ def _generate_class_overview(node: Any, source: bytes, name: str | None, languag
                 elif stmt.type == "decorated_definition":
                     for dec_child in stmt.children:
                         if "function" in dec_child.type or "method" in dec_child.type:
-                            raw = source[dec_child.start_byte:dec_child.end_byte]
+                            raw = source[dec_child.start_byte : dec_child.end_byte]
                             method_text = raw.decode("utf-8", errors="ignore")
                             dec_lines = method_text.split("\n")
                             sig_line = dec_lines[0].rstrip() if dec_lines else ""
@@ -361,7 +384,11 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
         return []
 
     source = content.encode("utf-8")
-    tree = parser.parse(source)
+    # tree-sitter Parser instances are stateful and not safe to drive from two
+    # worker threads concurrently. Different languages retain independent
+    # locks so unrelated parsers can still run in parallel.
+    with _get_parser_lock(ts_language):
+        tree = parser.parse(source)
 
     definition_types = set(DEFINITION_TYPES.get(language, []))
     chunks: list[Chunk] = []
@@ -384,7 +411,7 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
                 stack.append((child, context_parts))
             continue
 
-        text = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+        text = source[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
         name = _get_node_name(node, source)
 
         # Handle decorated definitions (Python). The wrapper node carries the
@@ -406,9 +433,7 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
         full_context = _build_context_path(context_parts)
 
         is_container = (
-            "class" in type_node.type
-            or "struct" in type_node.type
-            or "impl" in type_node.type
+            "class" in type_node.type or "struct" in type_node.type or "impl" in type_node.type
         )
         lines = node.end_point[0] - node.start_point[0] + 1
 
@@ -418,33 +443,35 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
             # @decorator lines that precede it; prepend them so the overview
             # chunk still contains the class decorators. The slice is empty for
             # an undecorated class (where type_node is node), making this a no-op.
-            decorators = source[node.start_byte:type_node.start_byte].decode(
+            decorators = source[node.start_byte : type_node.start_byte].decode(
                 "utf-8", errors="ignore"
             )
             overview_content = decorators + overview_content
-            chunks.append(Chunk(
-                content=overview_content,
-                chunk_type="class_overview",
-                name=name,
-                start_line=node.start_point[0] + 1,
-                end_line=node.end_point[0] + 1,
-                context=full_context,
-            ))
+            chunks.append(
+                Chunk(
+                    content=overview_content,
+                    chunk_type="class_overview",
+                    name=name,
+                    start_line=node.start_point[0] + 1,
+                    end_line=node.end_point[0] + 1,
+                    context=full_context,
+                )
+            )
         else:
-            chunks.append(Chunk(
-                content=text,
-                chunk_type=chunk_type,
-                name=name,
-                start_line=node.start_point[0] + 1,
-                end_line=node.end_point[0] + 1,
-                context=full_context,
-            ))
+            chunks.append(
+                Chunk(
+                    content=text,
+                    chunk_type=chunk_type,
+                    name=name,
+                    start_line=node.start_point[0] + 1,
+                    end_line=node.end_point[0] + 1,
+                    context=full_context,
+                )
+            )
 
         if is_container:
             type_prefix = "class" if "class" in type_node.type else chunk_type
-            new_context = (
-                context_parts + [f"{type_prefix}:{name}"] if name else context_parts
-            )
+            new_context = context_parts + [f"{type_prefix}:{name}"] if name else context_parts
             for child in reversed(type_node.children):
                 stack.append((child, new_context))
 
