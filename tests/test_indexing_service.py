@@ -1,5 +1,7 @@
 """Unit tests for IndexingService helpers that do not require Qdrant/embeddings."""
 
+import asyncio
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +56,34 @@ def _make_service() -> IndexingService:
         embedder=MagicMock(),
         global_vocab=vocab,
     )
+
+
+async def test_run_sync_waits_for_worker_before_propagating_cancellation() -> None:
+    """A cancelled request cannot leave a vocabulary mutation running."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_write() -> None:
+        started.set()
+        release.wait()
+        finished.set()
+
+    task = asyncio.create_task(idx_svc._run_sync(blocking_write))
+    assert await asyncio.to_thread(started.wait, 1.0)
+
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done()
+
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
 
 
 class TestPrepareFilesFaultIsolation:
@@ -155,24 +185,18 @@ class TestGetDenseDim:
     @staticmethod
     def _storage_with_vectors(monkeypatch, vectors):
         storage = QdrantStorage(url="http://localhost:6333")
-        info = SimpleNamespace(
-            config=SimpleNamespace(params=SimpleNamespace(vectors=vectors))
-        )
+        info = SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(vectors=vectors)))
         client = MagicMock()
         client.get_collection = AsyncMock(return_value=info)
         monkeypatch.setattr(storage, "_get_client", AsyncMock(return_value=client))
         return storage
 
     async def test_reads_named_dense_vector_size(self, monkeypatch):
-        storage = self._storage_with_vectors(
-            monkeypatch, {"dense": SimpleNamespace(size=4096)}
-        )
+        storage = self._storage_with_vectors(monkeypatch, {"dense": SimpleNamespace(size=4096)})
         assert await storage.get_dense_dim("codesearch_abc") == 4096
 
     async def test_returns_none_when_dense_vector_absent(self, monkeypatch):
-        storage = self._storage_with_vectors(
-            monkeypatch, {"other": SimpleNamespace(size=128)}
-        )
+        storage = self._storage_with_vectors(monkeypatch, {"other": SimpleNamespace(size=128)})
         assert await storage.get_dense_dim("codesearch_abc") is None
 
     async def test_returns_none_for_single_unnamed_vector(self, monkeypatch):
@@ -230,7 +254,8 @@ class TestIndexGuardBranch:
         service._verify_embedding_model = AsyncMock()
         # No changes detected -> index() returns after the guard runs.
         monkeypatch.setattr(
-            idx_svc, "detect_changes_fast",
+            idx_svc,
+            "detect_changes_fast",
             lambda path, meta: SimpleNamespace(has_changes=False),
         )
 
@@ -246,9 +271,7 @@ class TestAutoIndexDimMismatchSurface:
     async def test_maps_dim_mismatch_to_force_reindex_hint(self, monkeypatch):
         svc = MagicMock()
         svc.index = AsyncMock(
-            side_effect=EmbeddingDimMismatchError(
-                "codesearch_abc", expected=4096, actual=768
-            )
+            side_effect=EmbeddingDimMismatchError("codesearch_abc", expected=4096, actual=768)
         )
 
         async def fake_get_indexing_service():
@@ -271,7 +294,8 @@ class TestVerifyEmbeddingModel:
     def _service_with_metadata(monkeypatch, metadata, model="Qwen3-Embedding-8B", dim=4096):
         service = _make_service()
         monkeypatch.setattr(
-            idx_svc, "settings",
+            idx_svc,
+            "settings",
             SimpleNamespace(embedding_model=model, embedding_dim=dim),
         )
         service._storage.get_metadata = AsyncMock(return_value=metadata)
@@ -383,7 +407,8 @@ class TestIndexBranchInvokesModelGuard:
         service._verify_embedding_dim = AsyncMock()
         service._verify_embedding_model = AsyncMock()
         monkeypatch.setattr(
-            idx_svc, "detect_changes_fast",
+            idx_svc,
+            "detect_changes_fast",
             lambda path, meta: SimpleNamespace(has_changes=False),
         )
 
@@ -430,9 +455,7 @@ class TestStoreMetadataRecordsModel:
         storage = QdrantStorage(url="http://localhost:6333")
         storage._core = MagicMock()
         storage._core.store_metadata = AsyncMock()
-        monkeypatch.setattr(
-            storage_qdrant, "settings", SimpleNamespace(embedding_model=model)
-        )
+        monkeypatch.setattr(storage_qdrant, "settings", SimpleNamespace(embedding_model=model))
         return storage
 
     async def test_records_model_when_configured(self, monkeypatch):
@@ -559,12 +582,8 @@ class TestIncrementalIndexRollback:
         """
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={"mod.py": [{"old"}]})
-        service._prepare_files = MagicMock(
-            return_value=([_prepared("mod.py")], [{"new"}])
-        )
-        service._process_batch = AsyncMock(
-            side_effect=RuntimeError("transient embed failure")
-        )
+        service._prepare_files = MagicMock(return_value=([_prepared("mod.py")], [{"new"}]))
+        service._process_batch = AsyncMock(side_effect=RuntimeError("transient embed failure"))
         service._storage.delete_by_paths_batch = AsyncMock()
         changes = SimpleNamespace(
             added=[], modified=[SimpleNamespace(rel_path="mod.py")], deleted=[]
@@ -596,9 +615,7 @@ class TestIncrementalIndexRollback:
         """
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={"mod.py": [{"old"}]})
-        service._prepare_files = MagicMock(
-            return_value=([_prepared("mod.py")], [{"new"}])
-        )
+        service._prepare_files = MagicMock(return_value=([_prepared("mod.py")], [{"new"}]))
 
         async def fail_after_swap(batch, col_name, languages, stale_paths, progress):
             progress.stale_points_removed = True
@@ -654,9 +671,7 @@ class TestIncrementalIndexRollback:
         """A file gone from disk has no replacement to wait for."""
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={"gone.py": [{"old"}]})
-        service._prepare_files = MagicMock(
-            return_value=([_prepared("new.py")], [{"new"}])
-        )
+        service._prepare_files = MagicMock(return_value=([_prepared("new.py")], [{"new"}]))
         service._process_batch = AsyncMock(return_value=1)
         service._storage.store_metadata = AsyncMock()
         service._storage.delete_by_paths_batch = AsyncMock()
@@ -672,9 +687,7 @@ class TestIncrementalIndexRollback:
     async def test_successful_incremental_does_not_roll_back(self, monkeypatch):
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={})
-        service._prepare_files = MagicMock(
-            return_value=([_prepared("new.py")], [{"tok"}])
-        )
+        service._prepare_files = MagicMock(return_value=([_prepared("new.py")], [{"tok"}]))
         service._process_batch = AsyncMock(return_value=1)
         service._storage.store_metadata = AsyncMock()
         service._storage.delete_by_paths_batch = AsyncMock()
@@ -714,9 +727,7 @@ class TestCollectRemovedTokensFetchFailure:
         a batch may only account for the files it actually replaced.
         """
         service = _make_service()
-        service._storage.get_stored_content_for_path = AsyncMock(
-            return_value=["some code"]
-        )
+        service._storage.get_stored_content_for_path = AsyncMock(return_value=["some code"])
         service._global_vocab.tokenize = MagicMock(return_value=["some", "code"])
         service._storage.delete_by_paths_batch = AsyncMock()
         changes = SimpleNamespace(deleted=["foo.py"], modified=[], added=[])
@@ -743,9 +754,7 @@ class TestVocabularyAccountingInvariant:
         )
         file_info = _make_file(
             "imported.py",
-            "import drift_only_dependency\n\n"
-            "def calculate_result(value):\n"
-            "    return value + 1\n",
+            "import drift_only_dependency\n\ndef calculate_result(value):\n    return value + 1\n",
         )
 
         try:
@@ -773,9 +782,7 @@ class TestVocabularyAccountingInvariant:
 
             vocab.register_codebase("subject", added_tokens)
             changes = SimpleNamespace(deleted=[file_info.rel_path], modified=[], added=[])
-            removed_by_path = await service._collect_removed_tokens(
-                "collection", changes
-            )
+            removed_by_path = await service._collect_removed_tokens("collection", changes)
             removed_tokens = [t for toks in removed_by_path.values() for t in toks]
             vocab.update_codebase_incremental(
                 "subject",
@@ -813,28 +820,20 @@ class TestStoredVocabularyText:
             "x" * settings.max_payload_content_chars
         )
         assert "tail_only_token" not in vocabulary_text
-        assert build_chunk_vocabulary_text(chunk.content, chunk.imports).endswith(
-            "tail_only_token"
-        )
+        assert build_chunk_vocabulary_text(chunk.content, chunk.imports).endswith("tail_only_token")
         assert IndexingService._chunk_embedding_text(chunk).endswith("tail_only_token")
 
     async def test_get_stored_content_paginates_past_1000_points(self):
         storage = QdrantStorage()
         client = MagicMock()
         first_page = [
-            SimpleNamespace(
-                payload={"type": "chunk", "content": f"chunk {i}", "imports": []}
-            )
+            SimpleNamespace(payload={"type": "chunk", "content": f"chunk {i}", "imports": []})
             for i in range(1000)
         ]
         last_page = [
-            SimpleNamespace(
-                payload={"type": "chunk", "content": "chunk 1000", "imports": []}
-            )
+            SimpleNamespace(payload={"type": "chunk", "content": "chunk 1000", "imports": []})
         ]
-        client.scroll = AsyncMock(
-            side_effect=[(first_page, "next-page"), (last_page, None)]
-        )
+        client.scroll = AsyncMock(side_effect=[(first_page, "next-page"), (last_page, None)])
         storage._get_client = AsyncMock(return_value=client)
 
         texts = await storage.get_stored_content_for_path("collection", "large.py")

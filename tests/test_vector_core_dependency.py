@@ -3,6 +3,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import mcp_codesearch
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -27,15 +29,13 @@ def test_readme_install_example_uses_current_vector_core_pin() -> None:
     assert "mcp-codesearch.git@v1.0.0" not in readme
 
 
-def test_project_version_is_v1_7_0() -> None:
+def test_project_version_is_v1_7_1() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert pyproject["project"]["version"] == "1.7.0"
+    assert pyproject["project"]["version"] == "1.7.1"
 
 
 def test_runtime_version_matches_project_metadata() -> None:
-    import mcp_codesearch
-
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert mcp_codesearch.__version__ == pyproject["project"]["version"]

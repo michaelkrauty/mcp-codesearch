@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from mcp.server import MCPServer
 from mcp.types import TextContent
 
 from mcp_codesearch import __version__
+from mcp_codesearch.progress import ToolProgressMiddleware
 from mcp_codesearch.server import EXPECTED_TOOLS, mcp
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +29,84 @@ def test_server_uses_public_sdk_v2_metadata() -> None:
     assert isinstance(mcp, MCPServer)
     assert mcp.name == "codesearch"
     assert mcp.version == __version__
+
+
+def test_progress_middleware_rejects_nonpositive_interval() -> None:
+    with pytest.raises(ValueError, match="interval_seconds must be positive"):
+        ToolProgressMiddleware(interval_seconds=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_long_tool_emits_progress_over_stdio(mode: str) -> None:
+    progress: list[tuple[float, float | None, str | None]] = []
+
+    async def capture_progress(
+        current: float,
+        total: float | None,
+        message: str | None,
+    ) -> None:
+        progress.append((current, total, message))
+
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(ROOT / "tests" / "fixtures" / "progress_server.py")],
+        cwd=ROOT,
+    )
+    async with Client(stdio_client(params), mode=mode, cache=None) as client:
+        result = await client.call_tool(
+            "slow_tool",
+            progress_callback=capture_progress,
+        )
+
+    assert not result.is_error
+    assert isinstance(result.content[0], TextContent)
+    assert result.content[0].text == "complete"
+    assert progress
+    assert all(total is None for _current, total, _message in progress)
+    assert all(message == "slow_tool is still running" for _current, _total, message in progress)
+
+
+@pytest.mark.asyncio
+async def test_progress_repeats_until_tool_completion() -> None:
+    server = MCPServer(
+        "progress-repeat-test",
+        middleware=[ToolProgressMiddleware(interval_seconds=0.01)],
+    )
+    release = asyncio.Event()
+
+    @server.tool()
+    async def wait_for_progress() -> str:
+        await release.wait()
+        return "complete"
+
+    progress: list[tuple[float, float | None, str | None]] = []
+
+    async def capture_progress(
+        current: float,
+        total: float | None,
+        message: str | None,
+    ) -> None:
+        progress.append((current, total, message))
+        if len(progress) == 3:
+            release.set()
+
+    async with Client(server, cache=None) as client:
+        async with asyncio.timeout(1.0):
+            result = await client.call_tool(
+                "wait_for_progress",
+                progress_callback=capture_progress,
+            )
+
+    assert not result.is_error
+    assert len(progress) == 3
+    assert [current for current, _total, _message in progress] == sorted(
+        current for current, _total, _message in progress
+    )
+    assert all(total is None for _current, total, _message in progress)
+    assert all(
+        message == "wait_for_progress is still running" for _current, _total, message in progress
+    )
 
 
 @pytest.mark.asyncio

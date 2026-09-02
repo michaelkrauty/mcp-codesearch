@@ -8,6 +8,7 @@ Tools:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from vector_core import (
@@ -90,7 +91,8 @@ async def force_reindex(path: str = ".") -> str:
 
 {e}
 
-Cannot re-index without the embedding service. Ensure your OpenAI-compatible embedding server is running."""
+Cannot re-index without the embedding service. Ensure your OpenAI-compatible
+embedding server is running."""
 
     # Invalidate search cache
     search_svc = await get_search_service()
@@ -139,7 +141,8 @@ async def preview_index(
     total_size = 0
     file_count = 0
 
-    for rel_path, _mtime, size in scan_file_metadata(abs_path):
+    metadata = await asyncio.to_thread(lambda: list(scan_file_metadata(abs_path)))
+    for rel_path, _mtime, size in metadata:
         file_count += 1
         total_size += size
 
