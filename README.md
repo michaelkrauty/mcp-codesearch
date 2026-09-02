@@ -16,7 +16,7 @@ Supports stateless MCP `2026-07-28` requests and legacy MCP clients from the sam
 Requires [vector-core](https://github.com/michaelkrauty/vector-core).
 
 ```bash
-pip install git+https://github.com/michaelkrauty/vector-core.git@v1.4.2
+pip install git+https://github.com/michaelkrauty/vector-core.git@v1.4.3
 pip install git+https://github.com/michaelkrauty/mcp-codesearch.git
 ```
 

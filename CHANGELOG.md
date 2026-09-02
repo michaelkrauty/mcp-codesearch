@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.2] - 2026-09-01
+
+### Fixed
+
+- **Pinned vector-core to v1.4.3 so collection locks retain a stable inode for the lifetime of their lock namespace.** The lock context managers previously unlinked the pathname after release, so a waiter that had already opened the old inode could later acquire it while a new index or delete caller acquired a replacement inode. Both callers could then enter the same collection's protected section concurrently. Normal release and cleanup now leave the empty lock file in place; `flock` is still released when its descriptor closes, including after process death.
+
 ## [1.7.1] - 2026-09-01
 
 ### Fixed
