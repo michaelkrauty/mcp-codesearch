@@ -12,6 +12,7 @@ from vector_core.storage.qdrant import QdrantConnectionError
 
 from mcp_codesearch.singletons import get_embedder, get_indexing_service
 from mcp_codesearch.storage.qdrant import (
+    EmbeddingDeploymentMismatchError,
     EmbeddingDimMismatchError,
     EmbeddingModelMismatchError,
 )
@@ -63,9 +64,7 @@ _GIT_SINCE_PATTERN = re.compile(
 )
 
 # Pattern for valid .ago formats only (used for safe transformation)
-_GIT_SINCE_AGO_PATTERN = re.compile(
-    r"^\d+\.(second|minute|hour|day|week|month|year)s?\.ago$"
-)
+_GIT_SINCE_AGO_PATTERN = re.compile(r"^\d+\.(second|minute|hour|day|week|month|year)s?\.ago$")
 
 
 def validate_git_since(since: str) -> tuple[bool, str]:
@@ -153,7 +152,11 @@ async def auto_index(path: str) -> tuple[int, int, IndexingStats | None, str]:
         files, chunks, stats = await indexing_svc.index(path)
         return files, chunks, stats, ""
     except EmbeddingDimMismatchError as e:
-        return 0, 0, None, f"""Error: this codebase was indexed with a different embedding model.
+        return (
+            0,
+            0,
+            None,
+            f"""Error: this codebase was indexed with a different embedding model.
 
 {e}.
 
@@ -163,9 +166,14 @@ codebase's index with the current model:
 
   force_reindex(path="{path}")
 
-Only this codebase's collection is affected; other indexed codebases are left as-is."""
+Only this codebase's collection is affected; other indexed codebases are left as-is.""",
+        )
     except EmbeddingModelMismatchError as e:
-        return 0, 0, None, f"""Error: this codebase was indexed with a different embedding model.
+        return (
+            0,
+            0,
+            None,
+            f"""Error: this codebase was indexed with a different embedding model.
 
 {e}.
 
@@ -176,23 +184,50 @@ codebase's index with the current model:
 
   force_reindex(path="{path}")
 
-Only this codebase's collection is affected; other indexed codebases are left as-is."""
+Only this codebase's collection is affected; other indexed codebases are left as-is.""",
+        )
+    except EmbeddingDeploymentMismatchError as e:
+        return (
+            0,
+            0,
+            None,
+            f"""Error: this codebase was indexed by a different embedding deployment.
+
+{e}.
+
+The model name and vector dimension still match, but the configured deployment
+identity changed. Rebuild this codebase's index before mixing vectors:
+
+  force_reindex(path="{path}")
+
+Only this codebase's collection is affected; other indexed codebases are left as-is.""",
+        )
     except QdrantConnectionError as e:
-        return 0, 0, None, f"""Error: Qdrant vector database unavailable.
+        return (
+            0,
+            0,
+            None,
+            f"""Error: Qdrant vector database unavailable.
 
 {e}
 
 To fix this:
 1. Ensure Qdrant is running (typically on port 6333)
 2. Check VECTOR_QDRANT_URL environment variable if using non-default address
-3. Try again once Qdrant is ready"""
+3. Try again once Qdrant is ready""",
+        )
     except EmbeddingServiceError as e:
         embedder = await get_embedder()
-        return 0, 0, None, f"""Error: Embedding service unavailable.
+        return (
+            0,
+            0,
+            None,
+            f"""Error: Embedding service unavailable.
 
 {e}
 
 To fix this:
 1. Start an OpenAI-compatible embedding server
 2. Ensure it's running on {embedder.base_url}
-3. Try again once the service is ready"""
+3. Try again once the service is ready""",
+        )

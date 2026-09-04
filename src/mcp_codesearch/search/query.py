@@ -7,14 +7,23 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
-__all__ = ["search_codebase", "format_results", "QueryType", "QueryPlan"]
+__all__ = [
+    "DenseQueryPreparation",
+    "QueryPlan",
+    "QueryType",
+    "format_results",
+    "prepare_dense_query",
+    "prepare_sparse_query",
+    "search_codebase",
+]
 
 from pydantic import BaseModel, ConfigDict
-from vector_core import EmbeddingClient, GlobalVocabulary
+from vector_core import EmbeddingClient, GlobalVocabulary, SparseVector
 from vector_core.embeddings.client import CircuitBreakerOpenError
 
 from mcp_codesearch.search.preprocess import (
@@ -34,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 class QueryType(Enum):
     """Query classification for routing optimization."""
+
     NAME_ONLY = auto()  # fn:X, class:X with no semantic text
     NAME_SEMANTIC = auto()  # fn:X + additional text to search
     SEMANTIC = auto()  # Pure natural language query
@@ -58,6 +68,14 @@ class QueryPlan(BaseModel):
     name_filter: str | None  # Function/class name to filter on
     skip_embedding: bool  # Can skip expensive embedding generation
     use_exact_first: bool  # Prioritize exact match search
+
+
+@dataclass(frozen=True)
+class DenseQueryPreparation:
+    """Dense query work completed before entering a shared index snapshot."""
+
+    vector: list[float] | None = None
+    degraded_reason: str | None = None
 
 
 def _plan_query(query: str, parsed: ParsedQuery) -> QueryPlan:
@@ -115,6 +133,34 @@ def _plan_query(query: str, parsed: ParsedQuery) -> QueryPlan:
         skip_embedding=False,
         use_exact_first=False,
     )
+
+
+async def prepare_dense_query(
+    query: str,
+    embedder: EmbeddingClient,
+) -> DenseQueryPreparation:
+    """Embed semantic query text without holding an index consistency lock."""
+    processed_query, parsed = preprocess_query(query)
+    plan = _plan_query(query, parsed)
+    if plan.skip_embedding:
+        return DenseQueryPreparation()
+    try:
+        vector = await embedder.embed_single_cached(processed_query or plan.search_text)
+        return DenseQueryPreparation(vector=vector)
+    except CircuitBreakerOpenError as exc:
+        return DenseQueryPreparation(degraded_reason=str(exc))
+
+
+def prepare_sparse_query(
+    query: str,
+    global_vocab: GlobalVocabulary,
+) -> SparseVector | None:
+    """Build the sparse vector under one global vocabulary generation."""
+    processed_query, parsed = preprocess_query(query)
+    plan = _plan_query(query, parsed)
+    if plan.skip_embedding:
+        return None
+    return global_vocab.vectorize_query(processed_query or plan.search_text)
 
 
 def _apply_path_boost(results: list[SearchResult]) -> list[SearchResult]:
@@ -178,9 +224,7 @@ def _normalize_scores(results: list[SearchResult]) -> list[SearchResult]:
 # TestUserService, FooSpec, tests.py, foo.test.ts and bar.spec.js are all
 # detected, while substrings such as "contest", "latest", "attestation",
 # "protest" or "fastest" are not misclassified as tests.
-_WORD_SPLIT_RE = re.compile(
-    r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
-)
+_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _TEST_WORDS = frozenset({"test", "tests", "spec", "specs"})
 
 
@@ -228,7 +272,7 @@ def _filter_by_parsed_query(  # noqa: PLR0912
     #   path:embeddings  → matches "src/mcp_codesearch/embeddings/foo.py"
     #   path:mcp         → matches "src/mcp_codesearch/foo.py" (substring of component)
     if parsed.path_prefix:
-        prefix = parsed.path_prefix.strip('/')
+        prefix = parsed.path_prefix.strip("/")
 
         def matches_path(path: str) -> bool:
             # Fast exit if prefix not in path at all
@@ -236,14 +280,14 @@ def _filter_by_parsed_query(  # noqa: PLR0912
                 return False
 
             # Find component boundaries once (O(n) instead of O(n²))
-            component_starts = [0] + [i + 1 for i, c in enumerate(path) if c == '/']
+            component_starts = [0] + [i + 1 for i, c in enumerate(path) if c == "/"]
 
             for start in component_starts[:-1]:  # Exclude filename
                 # Check if path from this component starts with prefix
-                if path[start:].startswith(prefix) or path[start:].startswith(prefix + '/'):
+                if path[start:].startswith(prefix) or path[start:].startswith(prefix + "/"):
                     return True
                 # Find component end for substring match
-                end = path.find('/', start)
+                end = path.find("/", start)
                 if end == -1:
                     end = len(path)
                 # Substring match within single component
@@ -258,7 +302,8 @@ def _filter_by_parsed_query(  # noqa: PLR0912
         if len(parsed.exclude_paths) <= 3:
             # Small list: simple iteration is fast enough
             filtered = [
-                r for r in filtered
+                r
+                for r in filtered
                 if not any(exclude in r.path for exclude in parsed.exclude_paths)
             ]
         else:
@@ -273,8 +318,7 @@ def _filter_by_parsed_query(  # noqa: PLR0912
     if parsed.file_pattern:
         pattern = parsed.file_pattern.lower()
         filtered = [
-            r for r in filtered
-            if fnmatch.fnmatch(r.path.rsplit('/', 1)[-1].lower(), pattern)
+            r for r in filtered if fnmatch.fnmatch(r.path.rsplit("/", 1)[-1].lower(), pattern)
         ]
 
     # Filter by function/class name - strict filtering, not just boosting
@@ -296,8 +340,7 @@ def _filter_by_parsed_query(  # noqa: PLR0912
         elif parsed.scope == "function":
             # Only function/method chunks
             filtered = [
-                r for r in filtered
-                if r.chunk_type and r.chunk_type in ("function", "method")
+                r for r in filtered if r.chunk_type and r.chunk_type in ("function", "method")
             ]
         elif parsed.scope == "class":
             # Only class-like chunks. Includes the structural and type-definition
@@ -313,10 +356,7 @@ def _filter_by_parsed_query(  # noqa: PLR0912
                 "type",
                 "module",
             )
-            filtered = [
-                r for r in filtered
-                if r.chunk_type and r.chunk_type in class_types
-            ]
+            filtered = [r for r in filtered if r.chunk_type and r.chunk_type in class_types]
 
     return filtered
 
@@ -372,6 +412,8 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
     path_prefix: str | None = None,
     exclude_paths: list[str] | None = None,
     restrict_paths: list[str] | None = None,
+    dense_preparation: DenseQueryPreparation | None = None,
+    sparse_preparation: SparseVector | None = None,
 ) -> list[SearchResult]:
     """
     Search indexed codebase with intelligent query planning.
@@ -414,6 +456,10 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
 
     # Create query execution plan
     plan = _plan_query(query, parsed)
+    if dense_preparation is None and not plan.skip_embedding:
+        dense_preparation = await prepare_dense_query(query, embedder)
+    if sparse_preparation is None and not plan.skip_embedding:
+        sparse_preparation = global_vocab.vectorize_query(processed_query or plan.search_text)
 
     # Adjust fetch limit based on filtering needs. Any post-retrieval filter
     # that discards candidates must widen the pool, or fewer than `limit`
@@ -519,31 +565,29 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
             )
 
             # 2. Semantic search for context (with graceful degradation)
-            try:
-                dense_query = await embedder.embed_single_cached(
-                    processed_query or plan.search_text
-                )
-                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+            if dense_preparation and dense_preparation.vector is not None:
+                assert sparse_preparation is not None
 
                 semantic_results = await storage.hybrid_search(
                     collection=col_name,
-                    dense_query=dense_query,
-                    sparse_query=sparse_query,
+                    dense_query=dense_preparation.vector,
+                    sparse_query=sparse_preparation,
                     mode=mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
                     path_text_tokens=path_tokens,
                 )
-            except CircuitBreakerOpenError as e:
+            else:
                 # Embedding service unavailable - fall back to sparse-only search
                 logger.warning(
-                    f"Embedding service unavailable, falling back to sparse-only search: {e}"
+                    "Embedding service unavailable, falling back to sparse-only search: %s",
+                    dense_preparation.degraded_reason if dense_preparation else "unknown",
                 )
-                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+                assert sparse_preparation is not None
                 semantic_results = await storage.sparse_only_search(
                     collection=col_name,
-                    sparse_query=sparse_query,
+                    sparse_query=sparse_preparation,
                     mode=mode,
                     language=language,
                     limit=fetch_limit,
@@ -556,31 +600,29 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
 
         else:  # QueryType.SEMANTIC
             # Full semantic search with exact match fallback (with graceful degradation)
-            try:
-                dense_query = await embedder.embed_single_cached(
-                    processed_query or plan.search_text
-                )
-                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+            if dense_preparation and dense_preparation.vector is not None:
+                assert sparse_preparation is not None
 
                 results = await storage.hybrid_search(
                     collection=col_name,
-                    dense_query=dense_query,
-                    sparse_query=sparse_query,
+                    dense_query=dense_preparation.vector,
+                    sparse_query=sparse_preparation,
                     mode=mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
                     path_text_tokens=path_tokens,
                 )
-            except CircuitBreakerOpenError as e:
+            else:
                 # Embedding service unavailable - fall back to sparse-only search
                 logger.warning(
-                    f"Embedding service unavailable, falling back to sparse-only search: {e}"
+                    "Embedding service unavailable, falling back to sparse-only search: %s",
+                    dense_preparation.degraded_reason if dense_preparation else "unknown",
                 )
-                sparse_query = global_vocab.vectorize_query(processed_query or plan.search_text)
+                assert sparse_preparation is not None
                 results = await storage.sparse_only_search(
                     collection=col_name,
-                    sparse_query=sparse_query,
+                    sparse_query=sparse_preparation,
                     mode=mode,
                     language=language,
                     limit=fetch_limit,
@@ -652,23 +694,26 @@ def format_results(  # noqa: PLR0912
         return "No results found." if output_format != "json" else "[]"
 
     if output_format == "json":
-        return json.dumps([
-            {
-                "path": r.path,
-                "score": round(r.score, 4),
-                "type": r.point_type,
-                "language": r.language,
-                "summary": r.summary,
-                "line_count": r.line_count,
-                "chunk_type": r.chunk_type,
-                "name": r.name,
-                "start_line": r.start_line,
-                "end_line": r.end_line,
-                "content": r.content,
-                "degraded": r.degraded,
-            }
-            for r in results
-        ], indent=2)
+        return json.dumps(
+            [
+                {
+                    "path": r.path,
+                    "score": round(r.score, 4),
+                    "type": r.point_type,
+                    "language": r.language,
+                    "summary": r.summary,
+                    "line_count": r.line_count,
+                    "chunk_type": r.chunk_type,
+                    "name": r.name,
+                    "start_line": r.start_line,
+                    "end_line": r.end_line,
+                    "content": r.content,
+                    "degraded": r.degraded,
+                }
+                for r in results
+            ],
+            indent=2,
+        )
 
     if output_format == "markdown":
         lines = []

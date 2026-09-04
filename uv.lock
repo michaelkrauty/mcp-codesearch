@@ -545,7 +545,7 @@ wheels = [
 
 [[package]]
 name = "mcp-codesearch"
-version = "1.7.2"
+version = "1.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -575,7 +575,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = "~=2.0" },
     { name = "qdrant-client", specifier = "~=1.16.0" },
     { name = "tree-sitter-language-pack", specifier = ">=0.13.0" },
-    { name = "vector-core", git = "https://github.com/michaelkrauty/vector-core?tag=v1.4.3" },
+    { name = "vector-core", git = "https://github.com/michaelkrauty/vector-core?tag=v1.5.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -1321,8 +1321,8 @@ wheels = [
 
 [[package]]
 name = "vector-core"
-version = "1.4.3"
-source = { git = "https://github.com/michaelkrauty/vector-core?tag=v1.4.3#413cc40c11d06c95cb19793650951d869d68ae5a" }
+version = "1.5.0"
+source = { git = "https://github.com/michaelkrauty/vector-core?tag=v1.5.0#60177c1dad7cfe9feb4d60289f3b3f0e82fc3414" }
 dependencies = [
     { name = "httpx" },
     { name = "pathspec" },

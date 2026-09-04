@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from vector_core import EmbeddingServiceError
@@ -77,13 +78,26 @@ def _boundaries(
     The storage/embedder/vocabulary singletons are always replaced with trivial async
     mocks; callers override only the pieces a given test cares about.
     """
+    embedder = MagicMock()
+    embedder.embed_single_cached = AsyncMock(return_value=[0.1])
+
+    @asynccontextmanager
+    async def consistent_read(_collections=None, prepare=None):
+        yield SimpleNamespace(
+            generation=0,
+            prepared=prepare() if prepare else None,
+        )
+
+    indexing = MagicMock()
+    indexing.consistent_read = consistent_read
     mocks = {
         "auto_index": auto_index,
         "get_search_service": get_search_service or AsyncMock(return_value=MagicMock()),
         "search_codebase": search_codebase or AsyncMock(return_value=[]),
         "get_storage": AsyncMock(return_value=MagicMock()),
-        "get_embedder": AsyncMock(return_value=MagicMock()),
+        "get_embedder": AsyncMock(return_value=embedder),
         "get_global_vocab": AsyncMock(return_value=MagicMock()),
+        "get_indexing_service": AsyncMock(return_value=indexing),
     }
     with ExitStack() as stack:
         for name, mock in mocks.items():
@@ -174,9 +188,7 @@ async def test_grouped_error_in_one_codebase_isolated(tmp_path):
         return (0, 0, _stats(), "")
 
     svc = MagicMock()
-    svc.search = AsyncMock(
-        return_value=SearchResponse(formatted_output="HIT_B\n", results_count=1)
-    )
+    svc.search = AsyncMock(return_value=SearchResponse(formatted_output="HIT_B\n", results_count=1))
 
     with _boundaries(
         auto_index=AsyncMock(side_effect=fake_index),
@@ -219,9 +231,7 @@ async def test_grouped_shows_cached_results(tmp_path):
     # A cached SearchResponse carries formatted_output but leaves results_count at 0.
     svc = MagicMock()
     svc.search = AsyncMock(
-        return_value=SearchResponse(
-            formatted_output="1. [python] cached.py:1-5\n", was_cached=True
-        )
+        return_value=SearchResponse(formatted_output="1. [python] cached.py:1-5\n", was_cached=True)
     )
 
     with _boundaries(
@@ -252,9 +262,7 @@ async def test_global_ranking_merges_and_tags_sources(tmp_path):
         auto_index=AsyncMock(return_value=(0, 0, _stats(), "")),
         search_codebase=AsyncMock(side_effect=fake_codebase),
     ):
-        out = await search_multiple(
-            query="anything", paths=[a, b], global_ranking=True
-        )
+        out = await search_multiple(query="anything", paths=[a, b], global_ranking=True)
 
     assert "=== " not in out  # single global list, not per-codebase sections
     assert "alpha" in out and "beta" in out and "gamma" in out
@@ -329,9 +337,7 @@ async def test_global_ranking_all_codebases_failed(tmp_path):
         auto_index=AsyncMock(return_value=(0, 0, None, "Error: boom")),
         search_codebase=AsyncMock(return_value=[]),
     ):
-        out = await search_multiple(
-            query="anything", paths=[a, b], global_ranking=True
-        )
+        out = await search_multiple(query="anything", paths=[a, b], global_ranking=True)
 
     assert "No results found" in out
     assert "Skipped 2 codebase(s)" in out

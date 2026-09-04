@@ -23,16 +23,44 @@ class CodeSearchSettings(VectorCoreSettingsMixin, BaseSettings):
 
     # Code file extensions to index
     code_extensions: set[str] = {
-        ".py", ".ipynb", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
-        ".c", ".cpp", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-        ".scala", ".cs", ".vue", ".svelte", ".md", ".sql", ".sh",
-        ".yaml", ".yml", ".json", ".toml", ".html", ".css", ".scss",
+        ".py",
+        ".ipynb",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".rb",
+        ".php",
+        ".swift",
+        ".kt",
+        ".scala",
+        ".cs",
+        ".vue",
+        ".svelte",
+        ".md",
+        ".sql",
+        ".sh",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".toml",
+        ".html",
+        ".css",
+        ".scss",
     }
 
     # Qdrant tuning
     upsert_concurrency: int = 1  # Max concurrent upsert batches (1 for stability)
     upsert_batch_timeout: float = 300.0  # Timeout for batch upsert operations (5 minutes)
     deletion_concurrency: int = 50  # Max concurrent deletion operations during incremental indexing
+    consistency_namespace: str | None = None  # Override cross-process journal/lock identity
 
     # Search result cache settings
     search_cache_max_size: int = 100  # Maximum cached search results
@@ -95,4 +123,3 @@ PATH_BOOST_PATTERNS: dict[str, float] = {
 
 # Maximum total adjustment from path boosting (prevents score inversion)
 PATH_BOOST_MAX: float = 0.30
-

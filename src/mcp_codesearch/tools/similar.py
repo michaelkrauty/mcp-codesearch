@@ -24,6 +24,7 @@ from mcp_codesearch.search.query import format_results
 from mcp_codesearch.singletons import (
     get_embedder,
     get_global_vocab,
+    get_indexing_service,
     get_storage,
 )
 from mcp_codesearch.storage.qdrant import collection_name
@@ -81,38 +82,51 @@ async def find_similar(
     embedder = await get_embedder()
     global_vocab = await get_global_vocab()
 
-    # Search for similar code with graceful degradation
-    sparse_query = global_vocab.vectorize_query(code)
     fetch_limit = limit + (5 if exclude_self else 0)
+    indexing_svc = await get_indexing_service()
 
+    dense_query: list[float] | None = None
+    embedding_error: EmbeddingServiceError | CircuitBreakerOpenError | None = None
     try:
-        dense_query = await embedder.embed_single(code)
-        # Full hybrid search with dense + sparse
-        results = await storage.hybrid_search(
-            collection=col_name,
-            dense_query=dense_query,
-            sparse_query=sparse_query,
-            mode="chunk",
-            language=language,
-            limit=fetch_limit,
-        )
-    except (EmbeddingServiceError, CircuitBreakerOpenError) as e:
-        # Embedding service unavailable - fall back to sparse-only search
-        logger.warning(f"Embedding service unavailable, falling back to sparse-only search: {e}")
-        results = await storage.sparse_only_search(
-            collection=col_name,
-            sparse_query=sparse_query,
-            mode="chunk",
-            language=language,
-            limit=fetch_limit,
-        )
+        dense_query = await embedder.embed_single_cached(code)
+    except (EmbeddingServiceError, CircuitBreakerOpenError) as exc:
+        embedding_error = exc
+
+    async with indexing_svc.consistent_read(
+        [col_name],
+        prepare=lambda: global_vocab.vectorize_query(code),
+    ) as snapshot:
+        # Search for similar code with graceful degradation.
+        sparse_query = snapshot.prepared
+        if sparse_query is None:
+            raise RuntimeError("Sparse query preparation returned no vector")
+        if dense_query is not None:
+            results = await storage.hybrid_search(
+                collection=col_name,
+                dense_query=dense_query,
+                sparse_query=sparse_query,
+                mode="chunk",
+                language=language,
+                limit=fetch_limit,
+            )
+        else:
+            logger.warning(
+                "Embedding service unavailable, falling back to sparse-only search: %s",
+                embedding_error,
+            )
+            results = await storage.sparse_only_search(
+                collection=col_name,
+                sparse_query=sparse_query,
+                mode="chunk",
+                language=language,
+                limit=fetch_limit,
+            )
 
     # Optionally exclude exact matches
     if exclude_self:
         code_normalized = code.strip().lower()
         results = [
-            r for r in results
-            if not r.content or r.content.strip().lower() != code_normalized
+            r for r in results if not r.content or r.content.strip().lower() != code_normalized
         ][:limit]
 
     formatted = format_results(results, output_format=output_format)
@@ -163,18 +177,20 @@ async def find_references(
         index_msg = f"[Indexed {files_indexed} files, {chunks_indexed} chunks]\n\n"
 
     storage = await get_storage()
+    indexing_svc = await get_indexing_service()
 
     # Use exact match search. rank=False keeps matches in scroll order rather
     # than ranking name matches (the definition, score 3.0) to the front: this
     # search drops the definition to surface usages, so a ranked pool of
     # same-named definitions would crowd out the content references it wants.
-    results = await storage.exact_match_search(
-        collection=col_name,
-        query=symbol,
-        mode="chunk",
-        limit=limit * 3,
-        rank=False,
-    )
+    async with indexing_svc.consistent_read([col_name]):
+        results = await storage.exact_match_search(
+            collection=col_name,
+            query=symbol,
+            mode="chunk",
+            limit=limit * 3,
+            rank=False,
+        )
 
     # Filter results
     filtered_results = []
