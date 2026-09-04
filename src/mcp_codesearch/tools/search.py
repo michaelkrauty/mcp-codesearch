@@ -33,18 +33,26 @@ from mcp_codesearch.helpers import (
     validate_git_since,
 )
 from mcp_codesearch.search.preprocess import parse_query
-from mcp_codesearch.search.query import format_results, search_codebase
+from mcp_codesearch.search.query import (
+    DenseQueryPreparation,
+    format_results,
+    prepare_dense_query,
+    prepare_sparse_query,
+    search_codebase,
+)
 from mcp_codesearch.services import SearchQuery
 from mcp_codesearch.singletons import (
     get_embedder,
     get_global_vocab,
+    get_indexing_service,
     get_search_service,
     get_storage,
 )
+from mcp_codesearch.storage.qdrant import collection_name
 from mcp_codesearch.tools._errors import tool_error_handler
 
 if TYPE_CHECKING:
-    from vector_core import EmbeddingClient, GlobalVocabulary
+    from vector_core import EmbeddingClient, GlobalVocabulary, SparseVector
     from vector_core.search import RankFusionResult
 
     from mcp_codesearch.search.query import SearchResult
@@ -212,12 +220,8 @@ async def search_multiple(
         return "Error: Invalid paths:\n  • " + "\n  • ".join(invalid_paths)
 
     if global_ranking:
-        return await _search_multiple_global(
-            query, paths, mode, limit, language, output_format
-        )
-    return await _search_multiple_grouped(
-        query, paths, mode, limit, language, output_format
-    )
+        return await _search_multiple_global(query, paths, mode, limit, language, output_format)
+    return await _search_multiple_grouped(query, paths, mode, limit, language, output_format)
 
 
 async def _grouped_section(
@@ -346,6 +350,8 @@ async def _search_one(
     storage: QdrantStorage,
     embedder: EmbeddingClient,
     global_vocab: GlobalVocabulary,
+    dense_preparation: DenseQueryPreparation,
+    sparse_preparation: SparseVector | None,
 ) -> tuple[str, str, list[SearchResult], str]:
     """Search one already-indexed codebase for raw ranked results.
 
@@ -362,6 +368,8 @@ async def _search_one(
             mode=mode,
             language=language,
             limit=limit,
+            dense_preparation=dense_preparation,
+            sparse_preparation=sparse_preparation,
         )
         return path, abs_path, results, ""
     except EmbeddingServiceError as e:
@@ -392,6 +400,7 @@ async def _search_multiple_global(
     storage = await get_storage()
     embedder = await get_embedder()
     global_vocab = await get_global_vocab()
+    indexing_svc = await get_indexing_service()
 
     # Phase 1 — index everything (concurrent; the vocabulary's cross-process lock
     # serializes the actual writes).
@@ -401,12 +410,39 @@ async def _search_multiple_global(
     # vocabulary. ``searchable`` keeps each codebase's index into ``paths`` so the
     # outcomes can be reassembled in input order regardless of which phase failed.
     searchable = [(i, p, ap) for i, (p, ap, reason) in enumerate(indexed) if not reason]
-    searched = await asyncio.gather(
-        *(
-            _search_one(p, ap, query, mode, limit, language, storage, embedder, global_vocab)
-            for _i, p, ap in searchable
+    try:
+        dense_preparation = (
+            await prepare_dense_query(query, embedder) if searchable else DenseQueryPreparation()
         )
-    )
+    except EmbeddingServiceError as exc:
+        logger.error("Global search embedding failed: %s", exc)
+        embedding_errors = [
+            (path, reason or "embedding service unavailable") for path, _abs_path, reason in indexed
+        ]
+        return _format_global([], output_format, embedding_errors)
+    collections = [collection_name(abs_path) for _i, _path, abs_path in searchable]
+    async with indexing_svc.consistent_read(
+        collections,
+        prepare=lambda: prepare_sparse_query(query, global_vocab),
+    ) as snapshot:
+        searched = await asyncio.gather(
+            *(
+                _search_one(
+                    p,
+                    ap,
+                    query,
+                    mode,
+                    limit,
+                    language,
+                    storage,
+                    embedder,
+                    global_vocab,
+                    dense_preparation,
+                    snapshot.prepared,
+                )
+                for _i, p, ap in searchable
+            )
+        )
     search_by_index = {searchable[k][0]: searched[k] for k in range(len(searched))}
 
     # Reassemble in input order: errors and result lists both follow ``paths``.
@@ -494,9 +530,7 @@ def _format_global_text(
                 lines.append(f"   ({r.line_count} lines)")
         else:
             name = r.name or "unnamed"
-            lines.append(
-                f"{rank}. [{r.language}] ({src}) {r.path}:{r.start_line}-{r.end_line}"
-            )
+            lines.append(f"{rank}. [{r.language}] ({src}) {r.path}:{r.start_line}-{r.end_line}")
             lines.append(f"   {r.chunk_type}: {name}")
             if r.content:
                 preview = r.content[:content_length].replace("\n", " ")
@@ -547,8 +581,11 @@ def _changed_files_since(  # noqa: PLR0911
     try:
         git_root_result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            check=False, cwd=abs_path,
-            capture_output=True, text=True, timeout=10,
+            check=False,
+            cwd=abs_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if git_root_result.returncode != 0:
             return set(), f"Error: {path} is not within a git repository"
@@ -574,7 +611,8 @@ def _changed_files_since(  # noqa: PLR0911
             # since then.
             git_result = subprocess.run(
                 ["git", "log", "--since", validated_result, "--name-only", "--pretty=format:"],
-                check=False, cwd=git_root,
+                check=False,
+                cwd=git_root,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -592,7 +630,8 @@ def _changed_files_since(  # noqa: PLR0911
             # the merge-base is the revision itself, so the result is unchanged.
             base_result = subprocess.run(
                 ["git", "merge-base", since, "HEAD"],
-                check=False, cwd=git_root,
+                check=False,
+                cwd=git_root,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -602,7 +641,8 @@ def _changed_files_since(  # noqa: PLR0911
             merge_base = base_result.stdout.strip()
             git_result = subprocess.run(
                 ["git", "diff", "--name-only", merge_base],
-                check=False, cwd=git_root,
+                check=False,
+                cwd=git_root,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -619,7 +659,7 @@ def _changed_files_since(  # noqa: PLR0911
             return raw_files, ""
         # Indexed path is a subdirectory — strip the prefix
         prefix = rel_prefix + "/"
-        return {f[len(prefix):] for f in raw_files if f.startswith(prefix)}, ""
+        return {f[len(prefix) :] for f in raw_files if f.startswith(prefix)}, ""
 
     except subprocess.TimeoutExpired:
         return set(), "Error: Git command timed out."
@@ -714,20 +754,27 @@ async def search_changed(  # noqa: PLR0911
         candidate_pool = min(limit * 20, 200)
         restrict_paths = None
     try:
-        results = await search_codebase(
-            query=query,
-            codebase_path=abs_path,
-            storage=storage,
-            embedder=embedder,
-            global_vocab=global_vocab,
-            mode="both",
-            limit=candidate_pool,
-            restrict_paths=restrict_paths,
-        )
+        indexing_svc = await get_indexing_service()
+        dense_preparation = await prepare_dense_query(query, embedder)
+        async with indexing_svc.consistent_read(
+            [collection_name(abs_path)],
+            prepare=lambda: prepare_sparse_query(query, global_vocab),
+        ) as snapshot:
+            results = await search_codebase(
+                query=query,
+                codebase_path=abs_path,
+                storage=storage,
+                embedder=embedder,
+                global_vocab=global_vocab,
+                mode="both",
+                limit=candidate_pool,
+                restrict_paths=restrict_paths,
+                dense_preparation=dense_preparation,
+                sparse_preparation=snapshot.prepared,
+            )
     except EmbeddingServiceError as e:
         return (
-            f"Error during search: {e}\n\n"
-            "Ensure the embedding service is running and accessible."
+            f"Error during search: {e}\n\nEnsure the embedding service is running and accessible."
         )
 
     # Intersect with the changed-file set. Under pushdown this is

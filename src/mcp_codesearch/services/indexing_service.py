@@ -7,14 +7,18 @@ vocabulary management, and batch processing.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from itertools import chain
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qdrant_client.models import PointStruct
 from vector_core import (
     EmbeddingClient,
@@ -36,9 +40,14 @@ from mcp_codesearch.indexer.discovery import (
     FileInfo,
     discover_files,
 )
+from mcp_codesearch.indexer.journal import (
+    IndexIntentStore,
+    IntentOperation,
+)
 from mcp_codesearch.indexer.treesitter import Chunk
 from mcp_codesearch.settings import settings
 from mcp_codesearch.storage.qdrant import (
+    EmbeddingDeploymentMismatchError,
     EmbeddingDimMismatchError,
     EmbeddingModelMismatchError,
     QdrantStorage,
@@ -49,6 +58,19 @@ logger = logging.getLogger(__name__)
 
 # Batch size for memory-efficient streaming indexing
 INDEXING_BATCH_SIZE = 50  # Files per batch
+CONSISTENCY_LOCK_NAME = "codesearch_global_consistency"
+
+
+def _canonical_qdrant_identity(url: str) -> str:
+    """Normalize common aliases that address the same local Qdrant endpoint."""
+    parsed = urlsplit(url.rstrip("/"))
+    host = (parsed.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        host = "loopback"
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    port = parsed.port or default_port
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme.lower()}://{host}:{port}{path}"
 
 
 async def _run_sync[**P, R](fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
@@ -65,13 +87,31 @@ async def _run_sync[**P, R](fn: Callable[P, R], *args: P.args, **kwargs: P.kwarg
             result = await asyncio.shield(worker)
             break
         except asyncio.CancelledError as exc:
+            cancellation = exc
+            if worker.done():
+                result = worker.result()
+                break
             # More than one cancellation can arrive while a server or task
             # group is shutting down. Every wait stays shielded until the
             # underlying thread has really finished.
-            cancellation = exc
     if cancellation is not None:
         raise cancellation
     return result
+
+
+async def _finish_recovery(awaitable: Any) -> None:
+    """Finish recovery despite repeated cancellation of the request task."""
+    worker = asyncio.create_task(awaitable)
+    while True:
+        try:
+            await asyncio.shield(worker)
+            return
+        except asyncio.CancelledError:
+            if worker.done():
+                # Distinguish cancellation of the recovery operation itself
+                # from cancellation of only the caller waiting on shield.
+                await worker
+            continue
 
 
 class IndexingStats(BaseModel):
@@ -102,19 +142,30 @@ class IndexingStats(BaseModel):
         }
 
 
-class BatchProgress:
-    """How far a batch got, so a failure can be undone with the right remedy.
+class VocabularyRepairStats(BaseModel):
+    """Summary of a vocabulary consistency audit or repair."""
 
-    Whether the stale points were already removed decides what recovery means:
-    before that, the previous index is intact and must be left alone; after it,
-    the affected paths hold neither their old points nor a complete set of new
-    ones and have to be cleared so the next run re-indexes them.
-    """
+    collections_checked: int = 0
+    mismatches_found: int = 0
+    collections_repaired: int = 0
+    stale_registrations: int = 0
+    registrations_removed: int = 0
+    pending_intents: int = 0
+    intents_recovered: int = 0
+    aggregate_frequencies_rebuilt: bool = False
+    documents_before: int = 0
+    documents_after: int = 0
+    failures: list[str] = Field(default_factory=list)
 
-    __slots__ = ("stale_points_removed",)
 
-    def __init__(self) -> None:
-        self.stale_points_removed = False
+class ConsistentReadSnapshot:
+    """Generation plus optional work prepared under its vocabulary lock."""
+
+    __slots__ = ("generation", "prepared")
+
+    def __init__(self, generation: int, prepared: Any = None) -> None:
+        self.generation = generation
+        self.prepared = prepared
 
 
 class PreparedFile(BaseModel):
@@ -141,12 +192,64 @@ class IndexingService:
         storage: QdrantStorage,
         embedder: EmbeddingClient,
         global_vocab: GlobalVocabulary,
+        journal: IndexIntentStore | None = None,
     ):
         self._storage = storage
         self._embedder = embedder
         self._global_vocab = global_vocab
+        storage_identity = settings.consistency_namespace or "\0".join(
+            (
+                _canonical_qdrant_identity(str(storage.url)),
+                str(Path(global_vocab.db_path).resolve()),
+            )
+        )
+        self._consistency_scope = hashlib.sha256(storage_identity.encode()).hexdigest()[:16]
+        self._consistency_lock_name = f"{CONSISTENCY_LOCK_NAME}_{self._consistency_scope}"
+        self._admission_lock_name = f"{self._consistency_lock_name}_admission"
+        self._consistency_timeout = max(60.0, settings.upsert_batch_timeout + 60.0)
+        self._collection_timeout = max(3600.0, self._consistency_timeout)
+        self._journal = journal or IndexIntentStore(namespace=self._consistency_scope)
+        self._observed_generation: int | None = None
         self._stale_locks_cleaned = False
         self._stale_locks_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _admitted_lock(
+        self,
+        name: str,
+        *,
+        shared: bool,
+        timeout: float,
+    ) -> AsyncIterator[None]:
+        """Queue behind one admission gate, then release it after lock acquisition."""
+        async with AsyncExitStack() as held:
+            async with async_file_lock(f"{name}_admission", timeout=timeout):
+                await held.enter_async_context(
+                    async_file_lock(name, timeout=timeout, shared=shared)
+                )
+            yield
+
+    def _consistency_lock(self, *, shared: bool) -> AbstractAsyncContextManager[None]:
+        """Acquire the global lock with writer-friendly admission ordering."""
+        return self._admitted_lock(
+            self._consistency_lock_name,
+            shared=shared,
+            timeout=self._consistency_timeout,
+        )
+
+    def _collection_lock(
+        self,
+        collection: str,
+        *,
+        shared: bool = False,
+        timeout: float | None = None,
+    ) -> AbstractAsyncContextManager[None]:
+        """Acquire one collection lock without allowing new readers to starve writers."""
+        return self._admitted_lock(
+            collection,
+            shared=shared,
+            timeout=timeout or self._collection_timeout,
+        )
 
     async def _ensure_stale_locks_cleaned(self) -> None:
         """One-time cleanup of stale lock files (thread-safe)."""
@@ -161,7 +264,7 @@ class IndexingService:
                             f"Cleaned up {removed} stale lock file(s) from previous sessions"
                         )
 
-    async def index(
+    async def index(  # noqa: PLR0912, PLR0915
         self,
         codebase_path: str,
         force: bool = False,
@@ -183,53 +286,107 @@ class IndexingService:
 
         abs_path = str(Path(codebase_path).resolve())
         col_name = collection_name(abs_path)
+        await self.recover_pending_intents(skip={col_name} if force else None)
 
         # Acquire cross-process lock for this collection
-        async with async_file_lock(col_name):
+        async with self._collection_lock(col_name):
+            # Close the gap between the pre-lock sweep and collection-lock
+            # acquisition: another owner may have died and left an intent while
+            # this request was waiting.
+            if not force:
+                async with self._consistency_lock(shared=False):
+                    await self._recover_pending_intent(col_name)
             # Check if collection exists (inside lock to prevent TOCTOU)
             exists = await self._storage.collection_exists(col_name)
-
-            if not exists or force:
-                # Full index. The existing collection is destroyed before the
-                # rebuild, so a failure partway through must not leave a corrupt
-                # state behind: the shared global vocabulary would otherwise keep
-                # this codebase's full token contribution (skewing IDF for every
-                # other indexed codebase) and a surviving partial collection
-                # would make the next access run an *incremental* index that
-                # double-counts those already-registered tokens. On any failure
-                # roll back to a clean "not indexed" state instead.
-                if exists:
-                    # Unregister vocab FIRST, then delete collection
-                    await self._safe_unregister_vocab(col_name)
-                    await self._storage.delete_collection(col_name)
-
-                # Everything from collection (re)creation onward can fail and
-                # leave a partial or empty collection plus a stale vocabulary
-                # registration behind (file discovery can raise on a malformed
-                # ignore pattern, the batch loop on a transient embed/Qdrant
-                # error), so guard the whole rebuild and roll back on any failure.
+            target_intent = await _run_sync(self._journal.get, col_name)
+            metadata = await self._storage.get_metadata(col_name) if exists else None
+            resume_build = bool(
+                target_intent is None and metadata and metadata.get("indexing_in_progress") is True
+            )
+            compatibility_verified = False
+            if force and resume_build:
                 try:
-                    await self._storage.create_collection(col_name)
-                    files = await _run_sync(lambda: list(discover_files(codebase_path)))
-                    return await self._full_index(col_name, files, abs_path)
-                except Exception:
-                    await self._rollback_failed_full_index(col_name)
-                    raise
+                    await self._verify_embedding_dim(col_name)
+                    await self._verify_embedding_model(col_name, abs_path)
+                    await self._verify_embedding_deployment(col_name, abs_path)
+                    compatibility_verified = True
+                except (
+                    EmbeddingDeploymentMismatchError,
+                    EmbeddingDimMismatchError,
+                    EmbeddingModelMismatchError,
+                ):
+                    # force=True is the escape hatch. An interrupted build is
+                    # resumable only in the same embedding space; otherwise
+                    # discard it and start the requested rebuild from scratch.
+                    resume_build = False
+
+            if not exists or (force and not resume_build):
+                if exists:
+                    async with self._write_intent(
+                        col_name,
+                        abs_path,
+                        "index",
+                        recover_existing=target_intent is None,
+                    ):
+                        if not await self._safe_unregister_vocab(col_name):
+                            raise RuntimeError(
+                                f"Could not unregister vocabulary for {col_name}; "
+                                "the existing collection was left untouched"
+                            )
+                        await self._storage.delete_collection(col_name)
+                else:
+                    registered = col_name in await _run_sync(self._global_vocab.get_codebase_ids)
+                    if registered or target_intent is not None:
+                        async with self._write_intent(
+                            col_name,
+                            abs_path,
+                            "index",
+                            recover_existing=target_intent is None,
+                        ):
+                            if registered and not await self._safe_unregister_vocab(col_name):
+                                raise RuntimeError(
+                                    f"Could not remove stale vocabulary for {col_name}"
+                                )
+
+                await self._storage.create_collection(col_name)
+                await self._storage.store_metadata(
+                    col_name,
+                    abs_path,
+                    indexing_in_progress=True,
+                )
+                files = await _run_sync(lambda: list(discover_files(codebase_path)))
+                return await self._full_index(col_name, files, abs_path)
             else:
                 # Reuse of an existing collection: make sure its stored vectors
                 # are still compatible with the current embedding model before
                 # we index into or search against it.
-                await self._verify_embedding_dim(col_name)
-                await self._verify_embedding_model(col_name, abs_path)
+                if not compatibility_verified:
+                    await self._verify_embedding_dim(col_name)
+                    await self._verify_embedding_model(col_name, abs_path)
+                    await self._verify_embedding_deployment(col_name, abs_path)
+                await self._reconcile_if_count_mismatch(col_name)
 
                 # Incremental index with fast change detection
                 indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
                 changes = await _run_sync(detect_changes_fast, codebase_path, indexed_metadata)
 
                 if not changes.has_changes:
+                    if resume_build:
+                        await self._storage.store_metadata(
+                            col_name,
+                            abs_path,
+                            indexing_in_progress=False,
+                        )
                     return 0, 0, None
 
-                return await self._incremental_index(col_name, changes, abs_path)
+                result = await self._incremental_index(col_name, changes, abs_path)
+                if resume_build:
+                    await self._storage.store_metadata(
+                        col_name,
+                        abs_path,
+                        indexing_in_progress=False,
+                    )
+                return result
 
     async def _verify_embedding_dim(self, col_name: str) -> None:
         """Refuse to reuse a collection whose dense vectors no longer match the
@@ -299,6 +456,28 @@ class IndexingService:
         if isinstance(stored, str) and stored != expected:
             raise EmbeddingModelMismatchError(col_name, expected=expected, actual=stored)
 
+    async def _verify_embedding_deployment(
+        self,
+        col_name: str,
+        codebase_path: str,
+    ) -> None:
+        """Guard same-name model revisions through the explicit cache namespace."""
+        expected = settings.embedding_cache_namespace
+        if not expected:
+            return
+        metadata = await self._storage.get_metadata(col_name)
+        stored = metadata.get("embedding_cache_namespace") if metadata else None
+        if stored is None:
+            if settings.embedding_dim:
+                await self._storage.store_metadata(col_name, codebase_path)
+            return
+        if isinstance(stored, str) and stored != expected:
+            raise EmbeddingDeploymentMismatchError(
+                col_name,
+                expected=expected,
+                actual=stored,
+            )
+
     async def get_status(self, codebase_path: str) -> dict[str, Any]:
         """
         Get indexing status for a codebase.
@@ -311,36 +490,329 @@ class IndexingService:
         """
         abs_path = str(Path(codebase_path).resolve())
         col_name = collection_name(abs_path)
+        await self.recover_pending_intents()
 
-        if not await self._storage.collection_exists(col_name):
+        async with self.consistent_read([col_name]):
+            if not await self._storage.collection_exists(col_name):
+                return {
+                    "indexed": False,
+                    "path": abs_path,
+                    "message": "Not indexed. Run code_search to auto-index.",
+                }
+
+            indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
+            changes = await _run_sync(detect_changes_fast, abs_path, indexed_metadata)
+            metadata = await self._storage.get_metadata(col_name)
+            updated = metadata.get("updated_at", "unknown") if metadata else "unknown"
+
             return {
-                "indexed": False,
+                "indexed": True,
                 "path": abs_path,
-                "message": "Not indexed. Run code_search to auto-index.",
+                "collection": col_name,
+                "files_indexed": len(indexed_metadata),
+                "last_updated": updated,
+                "pending_changes": {
+                    "added": len(changes.added),
+                    "modified": len(changes.modified),
+                    "deleted": len(changes.deleted),
+                },
+                "vocabulary": {
+                    "total_tokens": self._global_vocab.vocab_size,
+                    "total_docs": self._global_vocab.total_docs,
+                    "codebase_docs": self._global_vocab.get_codebase_doc_count(col_name),
+                },
             }
 
-        indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
-        changes = await _run_sync(detect_changes_fast, abs_path, indexed_metadata)
-        metadata = await self._storage.get_metadata(col_name)
-        updated = metadata.get("updated_at", "unknown") if metadata else "unknown"
+    async def _mark_intent(
+        self,
+        col_name: str,
+        codebase_path: str,
+        operation: IntentOperation,
+    ) -> None:
+        """Durably record an operation before either backing store changes."""
+        await _run_sync(self._journal.mark, col_name, codebase_path, operation)
 
-        return {
-            "indexed": True,
-            "path": abs_path,
-            "collection": col_name,
-            "files_indexed": len(indexed_metadata),
-            "last_updated": updated,
-            "pending_changes": {
-                "added": len(changes.added),
-                "modified": len(changes.modified),
-                "deleted": len(changes.deleted),
-            },
-            "vocabulary": {
-                "total_tokens": self._global_vocab.vocab_size,
-                "total_docs": self._global_vocab.total_docs,
-                "codebase_docs": self._global_vocab.get_codebase_doc_count(col_name),
-            },
+    async def _clear_intent(self, col_name: str) -> None:
+        """Clear an intent only after Qdrant and vocabulary state agree."""
+        await _run_sync(self._journal.clear, col_name)
+
+    async def _set_pending_paths(self, col_name: str, paths: list[str]) -> None:
+        """Record a batch immediately before its first Qdrant mutation."""
+        await _run_sync(self._journal.set_pending_paths, col_name, paths)
+
+    async def _clear_pending_paths(self, col_name: str) -> None:
+        """Record that the current Qdrant batch completed in full."""
+        await _run_sync(self._journal.clear_pending_paths, col_name)
+
+    async def recover_pending_intents(self, *, skip: set[str] | None = None) -> int:
+        """Recover writes whose process exited before its final journal clear."""
+        recovered = 0
+        for intent in await _run_sync(self._journal.list):
+            if skip and intent.collection in skip:
+                continue
+            deadline = asyncio.get_running_loop().time() + self._consistency_timeout
+            while await _run_sync(self._journal.get, intent.collection):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timeout waiting to recover {intent.collection}")
+                try:
+                    async with self._collection_lock(
+                        intent.collection,
+                        timeout=min(0.5, remaining),
+                    ):
+                        async with self._consistency_lock(shared=False):
+                            if await self._recover_pending_intent(intent.collection):
+                                recovered += 1
+                    break
+                except TimeoutError:
+                    # A live indexer holds the collection lock across embedding
+                    # phases but exposes an intent only for its short commit.
+                    # Once that intent disappears there is nothing to recover.
+                    if not await _run_sync(self._journal.get, intent.collection):
+                        break
+        return recovered
+
+    @asynccontextmanager
+    async def _write_intent(
+        self,
+        col_name: str,
+        codebase_path: str,
+        operation: IntentOperation,
+        *,
+        recover_existing: bool = True,
+    ) -> AsyncIterator[None]:
+        """Run a cross-store mutation as one recoverable consistency window."""
+        async with self._consistency_lock(shared=False):
+            if recover_existing:
+                await self._recover_pending_intent(col_name)
+            await self._mark_intent(col_name, codebase_path, operation)
+            try:
+                yield
+                # This is the commit record and therefore the final I/O before
+                # releasing the global writer lock.
+                await self._clear_intent(col_name)
+            except BaseException:
+                try:
+                    await _finish_recovery(self._recover_pending_intent(col_name))
+                except BaseException as recovery_error:
+                    logger.error(
+                        "Recovery failed for %s after an interrupted %s: %s",
+                        col_name,
+                        operation,
+                        recovery_error,
+                    )
+                raise
+
+    @asynccontextmanager
+    async def consistent_read(
+        self,
+        collections: list[str] | None = None,
+        prepare: Callable[[], Any] | None = None,
+    ) -> AsyncIterator[ConsistentReadSnapshot]:
+        """Prepare under a global snapshot, then retain only collection locks."""
+        while True:
+            retry = False
+            generation = 0
+            prepared: Any = None
+            async with AsyncExitStack() as stack:
+                for collection in sorted(set(collections or [])):
+                    await stack.enter_async_context(self._collection_lock(collection, shared=True))
+                async with self._consistency_lock(shared=True):
+                    if await _run_sync(self._journal.list):
+                        retry = True
+                    else:
+                        generation = await _run_sync(self._journal.generation)
+                        if generation != self._observed_generation:
+                            await _run_sync(self._global_vocab.invalidate_cache)
+                            self._observed_generation = generation
+                        prepared = await _run_sync(prepare) if prepare else None
+                if not retry:
+                    yield ConsistentReadSnapshot(generation, prepared)
+                    return
+            # A writer that died releases flock but leaves its intent. Repair it
+            # under the exclusive lock, then retry the shared acquisition.
+            await self.recover_pending_intents()
+
+    async def _reconcile_collection_vocab(self, col_name: str) -> int:
+        """Replace one vocabulary contribution from Qdrant's actual points.
+
+        Token IDs remain append-only inside ``GlobalVocabulary``. Re-registering
+        changes only this codebase's document frequencies and count, so existing
+        sparse vectors keep referring to the same indices.
+        """
+        doc_frequencies: Counter[str] = Counter()
+        doc_count = 0
+        async for index_batch in self._storage.iter_stored_sparse_indices(col_name):
+            token_sets = await self._token_sets_from_indices(
+                index_batch,
+                source=col_name,
+            )
+            for token_set in token_sets:
+                doc_frequencies.update(token_set)
+            doc_count += len(token_sets)
+
+        await _run_sync(
+            self._global_vocab.register_codebase_frequencies,
+            col_name,
+            doc_frequencies,
+            doc_count,
+        )
+        return doc_count
+
+    async def _token_sets_from_indices(
+        self,
+        documents: list[list[int]],
+        *,
+        source: str,
+    ) -> list[set[str]]:
+        """Map persisted sparse indices back to their append-only token names."""
+        unique_indices = sorted({index for document in documents for index in document})
+        try:
+            index_to_token = await _run_sync(
+                self._global_vocab.get_tokens_by_indices, unique_indices
+            )
+        except KeyError as exc:
+            raise RuntimeError(
+                f"{source} contains sparse indices absent from the vocabulary: {exc}"
+            ) from exc
+        return [{index_to_token[index] for index in document} for document in documents]
+
+    async def _reconcile_if_count_mismatch(self, col_name: str) -> bool:
+        """Repair legacy drift when registered and stored document counts differ."""
+        stored = await self._storage.count_index_documents(col_name)
+        registered = await _run_sync(self._global_vocab.get_codebase_doc_count, col_name)
+        if stored == registered:
+            return False
+        async with self._consistency_lock(shared=False):
+            stored = await self._storage.count_index_documents(col_name)
+            registered = await _run_sync(
+                self._global_vocab.get_codebase_doc_count,
+                col_name,
+            )
+            if stored == registered:
+                return False
+            logger.warning(
+                "Repairing vocabulary drift for %s: registered=%d, stored=%d",
+                col_name,
+                registered,
+                stored,
+            )
+            # Publish invalidation before mutation. A crash after this point can
+            # cause an extra cache miss, but can never hide a committed repair.
+            await _run_sync(self._journal.bump_generation)
+            await self._reconcile_collection_vocab(col_name)
+            return True
+
+    async def _recover_pending_intent(self, col_name: str) -> bool:
+        """Finish or reconcile a write interrupted after its intent committed."""
+        intent = await _run_sync(self._journal.get, col_name)
+        if intent is None:
+            return False
+
+        exists = await self._storage.collection_exists(col_name)
+        if intent.operation == "delete":
+            if not await self._safe_unregister_vocab(col_name):
+                raise RuntimeError(
+                    f"Could not resume deletion of {col_name}; vocabulary is unchanged"
+                )
+            if exists:
+                await self._storage.delete_collection(col_name)
+        elif exists:
+            # A process can die after only part of a Qdrant batch lands. Remove
+            # the ambiguous paths so ordinary change detection re-adds each as
+            # one complete file on this same indexing call.
+            if intent.pending_paths:
+                await self._storage.delete_by_paths_batch(col_name, list(intent.pending_paths))
+            await self._reconcile_collection_vocab(col_name)
+        elif not await self._safe_unregister_vocab(col_name):
+            raise RuntimeError(
+                f"Could not recover missing collection {col_name}; vocabulary is unchanged"
+            )
+
+        await self._clear_intent(col_name)
+        logger.info("Recovered interrupted %s operation for %s", intent.operation, col_name)
+        return True
+
+    async def repair_vocabulary(  # noqa: PLR0912, PLR0915
+        self,
+        *,
+        repair: bool = False,
+        full: bool = False,
+    ) -> VocabularyRepairStats:
+        """Audit or reconstruct vocabulary state from authoritative Qdrant points.
+
+        ``repair=False`` is read-only. A normal repair rebuilds collections whose
+        registered document count differs from their stored file/chunk count and
+        removes registrations with no collection. ``full=True`` re-registers
+        every live collection, also repairing a same-count token-frequency drift.
+        Collection locks make this safe alongside ordinary indexing; a busy or
+        unreadable collection is reported and left unchanged.
+        """
+        stats = VocabularyRepairStats()
+        stats.documents_before = await _run_sync(lambda: self._global_vocab.total_docs)
+
+        if repair:
+            stats.intents_recovered = await self.recover_pending_intents()
+
+        collections = set(await self._storage.list_collections())
+        registered = {
+            codebase_id
+            for codebase_id in await _run_sync(self._global_vocab.get_codebase_ids)
+            if codebase_id.startswith("codesearch_")
         }
+        intents = {intent.collection: intent for intent in await _run_sync(self._journal.list)}
+        stats.pending_intents = stats.intents_recovered + len(intents)
+
+        for col_name in sorted(collections):
+            try:
+                async with self._collection_lock(col_name):
+                    async with self._consistency_lock(shared=not repair):
+                        if not await self._storage.collection_exists(col_name):
+                            continue
+
+                        stored = await self._storage.count_index_documents(col_name)
+                        current = await _run_sync(
+                            self._global_vocab.get_codebase_doc_count, col_name
+                        )
+                        stats.collections_checked += 1
+                        mismatch = stored != current
+                        if mismatch:
+                            stats.mismatches_found += 1
+                        if repair and (full or mismatch):
+                            await _run_sync(self._journal.bump_generation)
+                            await self._reconcile_collection_vocab(col_name)
+                            stats.collections_repaired += 1
+            except Exception as exc:
+                logger.warning("Vocabulary repair skipped %s: %s", col_name, exc)
+                stats.failures.append(f"{col_name}: {type(exc).__name__}")
+
+        stale = registered - collections
+        stats.stale_registrations = len(stale)
+        for col_name in sorted(stale | (set(intents) - collections)):
+            if not repair:
+                continue
+            try:
+                async with self._collection_lock(col_name):
+                    if await self._storage.collection_exists(col_name):
+                        continue
+                    async with self._write_intent(col_name, "", "delete"):
+                        if not await self._safe_unregister_vocab(col_name):
+                            raise RuntimeError("vocabulary unregistration failed")
+                    if col_name in stale:
+                        stats.registrations_removed += 1
+            except Exception as exc:
+                logger.warning("Stale vocabulary cleanup skipped %s: %s", col_name, exc)
+                stats.failures.append(f"{col_name}: {type(exc).__name__}")
+
+        if repair:
+            stats.intents_recovered += await self.recover_pending_intents()
+            async with self._consistency_lock(shared=False):
+                await _run_sync(self._journal.bump_generation)
+                await _run_sync(self._global_vocab.rebuild_aggregate_doc_frequencies)
+                stats.aggregate_frequencies_rebuilt = True
+
+        stats.documents_after = await _run_sync(lambda: self._global_vocab.total_docs)
+        return stats
 
     async def _safe_unregister_vocab(self, col_name: str) -> bool:
         """Safely unregister a codebase from the vocabulary.
@@ -353,88 +825,6 @@ class IndexingService:
         except Exception as e:
             logger.warning(f"Failed to unregister vocabulary for {col_name}: {e}")
             return False
-
-    async def _rollback_failed_full_index(self, col_name: str) -> None:
-        """Undo the partial side effects of a full index that failed midway.
-
-        A full (re)index registers this codebase's token contribution with the
-        shared global vocabulary in Phase 1, before any points are embedded and
-        upserted in Phase 2. If Phase 2 raises, the contribution is left behind
-        even though the collection holds few or no points, which skews IDF for
-        every other codebase; and the partial collection, if kept, would steer
-        the next access onto the incremental path, which adds the same tokens a
-        second time. Removing both leaves a clean "not indexed" state so the
-        next access does a fresh full index.
-
-        Best-effort: each step is independent and its failure is logged, not
-        raised, so the original indexing error is the one that propagates.
-        """
-        await self._safe_unregister_vocab(col_name)
-        try:
-            await self._storage.delete_collection(col_name)
-        except Exception as e:
-            logger.warning(
-                f"Failed to drop partial collection {col_name} after a failed full index: {e}"
-            )
-
-    async def _rollback_batch(
-        self,
-        col_name: str,
-        batch: list[PreparedFile],
-        added_tokens: list[set[str]],
-        removed_tokens: list[set[str]],
-        progress: BatchProgress,
-    ) -> None:
-        """Undo one batch's vocabulary delta after it failed to apply.
-
-        The delta is committed before the points because the sparse vectors are
-        computed from it, so a batch that fails has to give it back. Which
-        remedy is correct depends on how far the batch got, which is why
-        progress is tracked rather than assumed.
-
-        Before the stale points were removed, the batch had changed nothing but
-        the vocabulary: the previous points are all still in place, so the whole
-        delta is reversed. The added tokens come back out and the removed ones
-        go back in, because the documents they were counted from are still
-        there. Nothing is deleted -- deleting here is precisely the destruction
-        this ordering exists to avoid.
-
-        Once removal has happened, the affected paths hold neither their old
-        points nor a complete set of new ones, so they are cleared. The
-        removed-token deletions then stand, because they match points that
-        really are gone; only the added tokens are taken back. With no points
-        at all, the next run re-detects those files as added and indexes them
-        cleanly.
-
-        Best-effort: a failure here is logged rather than raised, so the error
-        that caused the rollback is the one that reaches the caller.
-        """
-        restored_tokens: list[set[str]] = removed_tokens
-        if progress.stale_points_removed:
-            restored_tokens = []
-            try:
-                paths = [p.file_info.rel_path for p in batch]
-                await self._storage.delete_by_paths_batch(col_name, paths)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to delete partially-written points for {col_name} "
-                    f"during incremental rollback: {e}"
-                )
-
-        try:
-            await _run_sync(
-                self._global_vocab.update_codebase_incremental,
-                col_name,
-                added_tokens=restored_tokens,
-                removed_tokens=added_tokens,
-                net_doc_change=len(restored_tokens) - len(added_tokens),
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to roll back incremental vocabulary for {col_name} "
-                f"after a batch error; the shared vocabulary may over-count "
-                f"until the next force_reindex: {e}"
-            )
 
     async def delete(self, codebase_path: str) -> bool:
         """
@@ -449,15 +839,25 @@ class IndexingService:
         abs_path = str(Path(codebase_path).resolve())
         col_name = collection_name(abs_path)
 
-        async with async_file_lock(col_name):
-            if not await self._storage.collection_exists(col_name):
+        async with self._collection_lock(col_name):
+            exists = await self._storage.collection_exists(col_name)
+            registered = col_name in await _run_sync(self._global_vocab.get_codebase_ids)
+            if not exists and not registered:
                 return False
 
-            # Unregister vocab FIRST, then delete collection
-            # This prevents orphaned vocabulary data if collection delete succeeds
-            # but vocab unregister fails
-            await self._safe_unregister_vocab(col_name)
-            await self._storage.delete_collection(col_name)
+            async with self._write_intent(
+                col_name,
+                abs_path,
+                "delete",
+                recover_existing=False,
+            ):
+                if not await self._safe_unregister_vocab(col_name):
+                    raise RuntimeError(
+                        f"Could not unregister vocabulary for {col_name}; "
+                        "the collection was left untouched"
+                    )
+                if exists:
+                    await self._storage.delete_collection(col_name)
             return True
 
     async def delete_by_collection_id(self, collection_id: str) -> bool:
@@ -470,15 +870,27 @@ class IndexingService:
         Returns:
             True if deleted, False if not found
         """
-        async with async_file_lock(collection_id):
-            if not await self._storage.collection_exists(collection_id):
+        async with self._collection_lock(collection_id):
+            exists = await self._storage.collection_exists(collection_id)
+            registered = collection_id in await _run_sync(self._global_vocab.get_codebase_ids)
+            if not exists and not registered:
                 return False
 
-            # Unregister vocab FIRST, then delete collection
-            # This prevents orphaned vocabulary data if collection delete succeeds
-            # but vocab unregister fails
-            await self._safe_unregister_vocab(collection_id)
-            await self._storage.delete_collection(collection_id)
+            metadata = await self._storage.get_metadata(collection_id) if exists else None
+            path = metadata.get("codebase_path", "") if metadata else ""
+            async with self._write_intent(
+                collection_id,
+                str(path),
+                "delete",
+                recover_existing=False,
+            ):
+                if not await self._safe_unregister_vocab(collection_id):
+                    raise RuntimeError(
+                        f"Could not unregister vocabulary for {collection_id}; "
+                        "the collection was left untouched"
+                    )
+                if exists:
+                    await self._storage.delete_collection(collection_id)
             return True
 
     # ============= Private Implementation =============
@@ -492,31 +904,53 @@ class IndexingService:
         """
         Perform full indexing of codebase with memory-efficient batching.
 
-        Phase 1: Scan all files and register tokens with global vocabulary
-        Phase 2: Process files in batches for embedding and storage
+        Prepare files once, then embed and commit one recoverable batch at a time.
         """
         start_time = time.time()
         if not files:
+            await self._storage.store_metadata(
+                col_name,
+                codebase_path,
+                indexing_in_progress=False,
+            )
             return 0, 0, IndexingStats(files_indexed=0, chunks_indexed=0, languages={})
 
-        # Phase 1: Prepare files and register tokens with global vocabulary
+        # Preparation is read-only. Vocabulary contribution is committed per
+        # batch only after that batch's dense vectors are ready.
         prepared_files, tokens_per_doc = await _run_sync(self._prepare_files, files)
-        new_tokens = await _run_sync(self._global_vocab.register_codebase, col_name, tokens_per_doc)
-        del tokens_per_doc  # Free memory
 
-        # Phase 2: Process files in batches for embedding and storage
         total_chunks = 0
         languages: dict[str, int] = {}
+        new_tokens = 0
+        doc_offset = 0
 
         for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
             batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
             batch = prepared_files[batch_start:batch_end]
+            doc_count = sum(1 + len(prepared.chunks) for prepared in batch)
+            batch_added = tokens_per_doc[doc_offset : doc_offset + doc_count]
+            doc_offset += doc_count
 
-            chunk_count = await self._process_batch(batch, col_name, languages)
+            chunk_count, batch_new_tokens = await self._process_batch(
+                batch,
+                col_name,
+                codebase_path,
+                languages,
+                added_tokens=batch_added,
+                removed_tokens=[],
+                net_doc_change=len(batch_added),
+            )
             total_chunks += chunk_count
+            new_tokens += batch_new_tokens
+
+        del tokens_per_doc
 
         # Store codebase path metadata
-        await self._storage.store_metadata(col_name, codebase_path)
+        await self._storage.store_metadata(
+            col_name,
+            codebase_path,
+            indexing_in_progress=False,
+        )
 
         elapsed_ms = int((time.time() - start_time) * 1000)
         stats = IndexingStats(
@@ -558,14 +992,18 @@ class IndexingService:
 
         # Handle case where only deletions occurred
         if not files_to_index:
-            await self._storage.delete_by_paths_batch(col_name, list(removed_by_path))
-            await _run_sync(
-                self._global_vocab.update_codebase_incremental,
-                col_name,
-                added_tokens=[],
-                removed_tokens=removed_tokens,
-                net_doc_change=-len(removed_tokens),
-            )
+            paths = list(removed_by_path)
+            async with self._write_intent(col_name, codebase_path, "index"):
+                await self._set_pending_paths(col_name, paths)
+                await self._storage.delete_by_paths_batch(col_name, paths)
+                await _run_sync(
+                    self._global_vocab.update_codebase_incremental,
+                    col_name,
+                    added_tokens=[],
+                    removed_tokens=removed_tokens,
+                    net_doc_change=-len(removed_tokens),
+                )
+                await self._clear_pending_paths(col_name)
             stats = IndexingStats(
                 files_indexed=0,
                 chunks_indexed=0,
@@ -584,29 +1022,26 @@ class IndexingService:
 
         # A file that no longer exists has no replacement to wait for, so its
         # points and its share of the vocabulary go together, now.
-        modified_paths = {f.rel_path for f in changes.modified}
-        gone = [p for p in removed_by_path if p not in modified_paths]
+        replacement_paths = {file_info.rel_path for file_info in changes.added + changes.modified}
+        gone = [path for path in removed_by_path if path not in replacement_paths]
         if gone:
-            await self._storage.delete_by_paths_batch(col_name, gone)
             gone_tokens = [t for p in gone for t in removed_by_path[p]]
-            await _run_sync(
-                self._global_vocab.update_codebase_incremental,
-                col_name,
-                added_tokens=[],
-                removed_tokens=gone_tokens,
-                net_doc_change=-len(gone_tokens),
-            )
+            async with self._write_intent(col_name, codebase_path, "index"):
+                await self._set_pending_paths(col_name, gone)
+                await self._storage.delete_by_paths_batch(col_name, gone)
+                await _run_sync(
+                    self._global_vocab.update_codebase_incremental,
+                    col_name,
+                    added_tokens=[],
+                    removed_tokens=gone_tokens,
+                    net_doc_change=-len(gone_tokens),
+                )
+                await self._clear_pending_paths(col_name)
 
-        # Each batch is applied as a unit: commit its vocabulary delta, build
-        # its points, then swap them in for the ones they replace. A batch that
-        # fails is undone by itself, and the batches after it are never started,
-        # so those files keep the points they already had. The index stays
-        # queryable throughout, and a failure costs at most one batch instead of
-        # every changed file in the run.
-        #
-        # The vocabulary delta has to precede the points, because the sparse
-        # vectors are computed from it. That is what bounds the exposure to a
-        # single batch rather than eliminating it.
+        # Each batch embeds first, then commits its vocabulary delta and Qdrant
+        # replacement under one durable intent and the global writer lock.
+        # Recovery reconstructs from the points that actually landed, so a
+        # failure never unwinds earlier complete batches.
         doc_offset = 0
         for batch_start in range(0, len(prepared_files), INDEXING_BATCH_SIZE):
             batch_end = min(batch_start + INDEXING_BATCH_SIZE, len(prepared_files))
@@ -623,22 +1058,18 @@ class IndexingService:
             ]
             batch_removed = [t for p in batch_stale for t in removed_by_path[p]]
 
-            new_tokens += await _run_sync(
-                self._global_vocab.update_codebase_incremental,
+            chunk_count, batch_new_tokens = await self._process_batch(
+                batch,
                 col_name,
+                codebase_path,
+                languages,
                 added_tokens=batch_added,
                 removed_tokens=batch_removed,
                 net_doc_change=len(batch_added) - len(batch_removed),
+                stale_paths=batch_stale,
             )
-
-            progress = BatchProgress()
-            try:
-                total_chunks += await self._process_batch(
-                    batch, col_name, languages, batch_stale, progress
-                )
-            except Exception:
-                await self._rollback_batch(col_name, batch, batch_added, batch_removed, progress)
-                raise
+            total_chunks += chunk_count
+            new_tokens += batch_new_tokens
 
         # Clear token sets to free memory
         del added_tokens
@@ -716,17 +1147,25 @@ class IndexingService:
         self,
         batch: list[PreparedFile],
         col_name: str,
+        codebase_path: str,
         languages: dict[str, int],
+        *,
+        added_tokens: list[set[str]],
+        removed_tokens: list[set[str]],
+        net_doc_change: int,
         stale_paths: list[str] | None = None,
-        progress: BatchProgress | None = None,
-    ) -> int:
+    ) -> tuple[int, int]:
         """
         Process a batch of prepared files: generate embeddings and upsert to Qdrant.
 
         Args:
             batch: List of PreparedFile objects
             col_name: Collection name
+            codebase_path: Canonical codebase root recorded in the intent
             languages: Dict to track language counts (mutated in place)
+            added_tokens: New sparse token sets contributed by this batch
+            removed_tokens: Sparse token sets superseded by this batch
+            net_doc_change: Added document count minus removed document count
             stale_paths: Paths whose existing points this batch replaces. They
                 are removed only once the new points are built and ready to be
                 written, so that embedding -- by far the slowest and most
@@ -734,7 +1173,7 @@ class IndexingService:
                 old points nor its new ones.
 
         Returns:
-            Number of chunks indexed
+            Tuple of chunks indexed and vocabulary tokens newly introduced
         """
         # Collect texts for this batch (using pre-computed chunk texts)
         batch_texts = []
@@ -745,37 +1184,46 @@ class IndexingService:
         # Generate embeddings for this batch
         dense_embeddings = await self._embedder.embed_all(batch_texts)
 
-        # Sparse vectorization and point construction are CPU-bound, and a
-        # large batch must not prevent the MCP progress heartbeat from running.
-        points, chunk_count = await _run_sync(
-            self._build_batch_points,
-            batch,
-            dense_embeddings,
-            languages,
-        )
+        # Dense inference is the slow and failure-prone step. It deliberately
+        # finishes before the short global consistency window begins, so other
+        # codebases remain searchable while this batch is being embedded.
+        async with self._write_intent(col_name, codebase_path, "index"):
+            new_tokens = await _run_sync(
+                self._global_vocab.update_codebase_incremental,
+                col_name,
+                added_tokens=added_tokens,
+                removed_tokens=removed_tokens,
+                net_doc_change=net_doc_change,
+            )
 
-        # The replacement points exist now, so the ones they supersede can go.
-        # Deleting here rather than before embedding is what keeps a failed run
-        # non-destructive: everything above this line can fail with the existing
-        # index untouched and still answering queries.
-        if progress is not None:
-            # Marked before the request, not after: a delete that raises may
-            # still have been applied before the response was lost, and
-            # recovery has to assume the points are gone. Treating an
-            # ambiguous failure as "not deleted" would restore the vocabulary
-            # for documents Qdrant no longer holds, stranding that count with
-            # no path left for a later run to rediscover and subtract.
-            #
-            # Set even when there is nothing to delete, because the upsert
-            # below can still write points partially.
-            progress.stale_points_removed = True
-        if stale_paths:
-            await self._storage.delete_by_paths_batch(col_name, stale_paths)
+            # Sparse vectorization must follow the vocabulary update so every
+            # newly introduced token already has its append-only index.
+            points, chunk_count = await _run_sync(
+                self._build_batch_points,
+                batch,
+                dense_embeddings,
+                languages,
+            )
 
-        # Upsert this batch to Qdrant
-        await self._storage.upsert_batch(col_name, points)
+            # This marker distinguishes a crash before Qdrant changed from an
+            # ambiguous partial delete/upsert. Recovery clears these paths only
+            # in the latter case, then rebuilds the contribution from Qdrant.
+            paths = [prepared.file_info.rel_path for prepared in batch]
+            await self._set_pending_paths(col_name, paths)
+            if stale_paths:
+                await self._storage.delete_by_paths_batch(col_name, stale_paths)
+            chunk_points = [
+                point for point in points if (point.payload or {}).get("type") == "chunk"
+            ]
+            file_points = [point for point in points if (point.payload or {}).get("type") == "file"]
+            await self._storage.upsert_batch(col_name, chunk_points)
+            # File points are fast-change-detection completion markers. A
+            # separate final write preserves that ordering even when Qdrant
+            # sub-batch concurrency is configured above one.
+            await self._storage.upsert_batch(col_name, file_points)
+            await self._clear_pending_paths(col_name)
 
-        return chunk_count
+        return chunk_count, new_tokens
 
     def _build_batch_points(
         self,
@@ -793,13 +1241,9 @@ class IndexingService:
             languages[file_info.language] = languages.get(file_info.language, 0) + 1
 
             # File point
-            dense_vec = dense_embeddings[embed_idx]
-            sparse_vec = self._global_vocab.vectorize_document(prepared.summary)
+            file_dense_vec = dense_embeddings[embed_idx]
+            file_sparse_vec = self._global_vocab.vectorize_document(prepared.summary)
             embed_idx += 1
-
-            points.append(
-                self._build_file_point(file_info, prepared.summary, dense_vec, sparse_vec)
-            )
 
             # Chunk points (using pre-computed chunk texts)
             for i, chunk in enumerate(prepared.chunks):
@@ -811,6 +1255,18 @@ class IndexingService:
                 chunk_count += 1
 
                 points.append(self._build_chunk_point(file_info, chunk, dense_vec, sparse_vec, i))
+
+            # The file point is the completion marker used by fast change
+            # detection. Write it after all of that file's chunks so a legacy
+            # process crash cannot make a partial file appear complete.
+            points.append(
+                self._build_file_point(
+                    file_info,
+                    prepared.summary,
+                    file_dense_vec,
+                    file_sparse_vec,
+                )
+            )
         return points, chunk_count
 
     async def _collect_removed_tokens(
@@ -819,7 +1275,7 @@ class IndexingService:
         changes: ChangeSet,
     ) -> dict[str, list[set[str]]]:
         """
-        Collect the tokens currently stored for files being deleted or modified.
+        Collect exact sparse token sets for every removed or replacement path.
 
         Reads only. Removing a file's points is deferred to the point where its
         replacement is ready to take their place, so that a failure between here
@@ -832,50 +1288,25 @@ class IndexingService:
             Mapping of path to the token sets of its stored documents
         """
         # Collect all paths to process
-        all_paths = list(changes.deleted) + [f.rel_path for f in changes.modified]
+        # Added paths can still have orphan chunk points from an interrupted
+        # legacy batch whose file point never landed. Treat every replacement
+        # path as potentially outgoing so those chunks and their vocabulary
+        # contribution are removed atomically with the complete replacement.
+        all_paths = (
+            list(changes.deleted)
+            + [file_info.rel_path for file_info in changes.modified]
+            + [file_info.rel_path for file_info in changes.added]
+        )
 
         if not all_paths:
             return {}
 
-        # Phase 1: Collect content from all paths in parallel (for vocabulary update)
-        # Semaphore limits concurrent Qdrant reads
-        semaphore = asyncio.Semaphore(settings.deletion_concurrency)
-
-        async def fetch_content(path: str) -> list[set[str]]:
-            """Fetch stored content and tokenize it."""
-            async with semaphore:
-                stored_texts = await self._storage.get_stored_content_for_path(col_name, path)
-                return await _run_sync(
-                    lambda: [set(self._global_vocab.tokenize(text)) for text in stored_texts]
-                )
-
-        results = await asyncio.gather(
-            *[fetch_content(p) for p in all_paths], return_exceptions=True
-        )
-
-        # A failed fetch means we cannot know that file's old tokens. Removing
-        # its points later while leaving those tokens in the shared vocabulary
-        # would permanently over-count it: the file is then gone (or unchanged)
-        # and never re-detected, so nothing ever subtracts it, inflating IDF for
-        # every codebase that shares the vocabulary. Abort before anything is
-        # deleted or committed, so the next run re-detects the same changes and
-        # retries cleanly.
+        stored = await self._storage.get_stored_sparse_indices_by_paths(col_name, all_paths)
         by_path: dict[str, list[set[str]]] = {}
-        failed: list[str] = []
-        for path, result in zip(all_paths, results, strict=True):
-            if isinstance(result, BaseException):
-                logger.warning(f"Failed to fetch content for {path}: {result}")
-                failed.append(path)
-            else:
-                by_path[path] = result
-
-        if failed:
-            raise RuntimeError(
-                f"Aborting incremental index: could not fetch stored content for "
-                f"{len(failed)} of {len(all_paths)} changed file(s) "
-                f"({', '.join(failed[:5])}); will retry on the next run"
+        for path, documents in stored.items():
+            by_path[path] = await self._token_sets_from_indices(
+                documents, source=f"Stored path {path!r}"
             )
-
         return by_path
 
     @staticmethod

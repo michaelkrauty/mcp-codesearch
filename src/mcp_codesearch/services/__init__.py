@@ -7,6 +7,7 @@ from mcp_codesearch.services.indexing_service import (
     IndexingService,
     IndexingStats,
     PreparedFile,
+    VocabularyRepairStats,
 )
 from mcp_codesearch.services.search_service import (
     SearchQuery,
@@ -18,6 +19,7 @@ __all__ = [
     "IndexingService",
     "IndexingStats",
     "PreparedFile",
+    "VocabularyRepairStats",
     "SearchQuery",
     "SearchResponse",
     "SearchService",

@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.8.0] - 2026-09-04
+
+### Added
+
+- **Dense embeddings can be reused exactly across processes, force rebuilds, clones, and worktrees.** When `VECTOR_EMBEDDING_CACHE_NAMESPACE` identifies the deployed model revision, indexing uses vector-core's persistent content-addressed cache. Keys cover the effective post-truncation text, model, output dimension, cache schema, preprocessing version, and deployment namespace; duplicate inputs are embedded once and scattered back in order. `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` optionally caps active embedding HTTP attempts across local MCP processes sharing the backend.
+- **Indexing now has a durable cross-store write-ahead journal.** Full and incremental indexes commit one file batch at a time, preserve completed batches after interruption, and resume missing work instead of deleting a partial collection and starting over. A shared/exclusive consistency lock keeps searches on one settled Qdrant/vocabulary generation, while dense query inference remains outside the lock.
+- **New `repair_vocabulary` maintenance tool.** Read-only mode audits Qdrant document counts, vocabulary registrations, and interrupted operations. Repair mode reconstructs mismatched contributions directly from persisted sparse-vector indices, removes registrations whose collection is gone, and rebuilds aggregate document frequencies without changing append-only token IDs. `full=True` also repairs same-count frequency drift.
+
+### Fixed
+
+- **Interrupted indexing and deletion can no longer permanently skew sparse ranking.** Every vocabulary/Qdrant mutation is preceded by a durable intent. Recovery either completes a recorded deletion or derives the exact contribution from the points that actually exist; ambiguous file batches are cleared and rediscovered. Contribution-only legacy registrations are included in cleanup, and existing count mismatches self-heal on collection reuse.
+- **A partial full build cannot mix embedding deployments.** Collections record the explicit cache/deployment namespace along with model and dimension. Compatible partial builds resume, while `force_reindex` restarts an incompatible build instead of looping on the same mismatch.
+- **Search-result caches are coherent across MCP processes.** Successful mutations advance a shared generation, and each process refreshes stale vocabulary snapshots before searching. Cache lookup and publication happen under the same shared snapshot.
+- **Equivalent local Qdrant URLs no longer split the consistency domain.** Common loopback aliases, URL casing, and trailing slashes normalize to one journal/lock identity; deployments using other equivalent host aliases can set `CODESEARCH_CONSISTENCY_NAMESPACE` explicitly.
+
+### Changed
+
+- Qdrant path deletes and point upserts request strong ordering and server-confirmed completion. Local cancellation waits for accepted writes to quiesce before recovery begins; file completion markers are written only after their chunks.
+- A short admission lock gives pending writers priority over new readers. Global consistency waits exceed the longest configured Qdrant write budget, and searches release the global lock immediately after generation-aware sparse-vector preparation while retaining collection stability through retrieval.
+
 ## [1.7.2] - 2026-09-01
 
 ### Fixed

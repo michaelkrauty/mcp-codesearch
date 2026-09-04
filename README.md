@@ -16,7 +16,7 @@ Supports stateless MCP `2026-07-28` requests and legacy MCP clients from the sam
 Requires [vector-core](https://github.com/michaelkrauty/vector-core).
 
 ```bash
-pip install git+https://github.com/michaelkrauty/vector-core.git@v1.4.3
+pip install git+https://github.com/michaelkrauty/vector-core.git@v1.5.0
 pip install git+https://github.com/michaelkrauty/mcp-codesearch.git
 ```
 
@@ -58,11 +58,14 @@ claude mcp add codesearch -- mcp-codesearch
 - **18 Languages with AST Support**: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, PHP, Swift, Kotlin, Scala, C#, SQL, JSON, YAML, TOML (line-based fallback for Bash, HTML, CSS, and other file types)
 - **Query Syntax**: `function:name`, `class:name`, `file:pattern`, `path:prefix`, `-path:exclude`
 - **Incremental Indexing**: Change detection via mtime+size before hashing
+- **Resumable Indexing**: Durable batch journal resumes interrupted builds without discarding completed work
+- **Persistent Embedding Reuse**: Exact-input cache avoids recomputation across clones and worktrees
+- **Cross-Process Coordination**: Global embedding capacity and consistent search/index snapshots
 - **Progress-Aware Operations**: Long tool calls emit MCP progress heartbeats so compatible clients can extend request deadlines while indexing continues
 - **Query Preprocessing**: Synonym expansion (`fn` → `function`, `db` → `database`)
 - **Flexible Ignores**: Nested `.gitignore`, `.git/info/exclude`, and `.codesearchignore` (gitignore syntax) honored at every directory level
 
-## Tools (11 total)
+## Tools (12 total)
 
 ### Search (5)
 | Tool | Description |
@@ -73,11 +76,12 @@ claude mcp add codesearch -- mcp-codesearch
 | `find_similar` | Find code similar to a snippet |
 | `find_references` | Find all usages of a symbol |
 
-### Index Management (3)
+### Index Management (4)
 | Tool | Description |
 |------|-------------|
 | `index_status` | Check indexing status, file count, pending changes |
 | `force_reindex` | Force complete re-indexing |
+| `repair_vocabulary` | Audit or repair sparse-vocabulary consistency from Qdrant |
 | `preview_index` | Preview what would be indexed |
 
 ### Collection Management (3)
@@ -201,6 +205,8 @@ search_changed("config", since="3.days.ago")
 | `VECTOR_EMBEDDING_URL` | `http://localhost:8080` | OpenAI-compatible embeddings API |
 | `VECTOR_EMBEDDING_MODEL` | *(required)* | Embedding model name (e.g., `nomic-embed-text`, `text-embedding-3-small`) |
 | `VECTOR_EMBEDDING_DIM` | *(required)* | Vector dimension (must match your model, e.g., `768`, `1536`) |
+| `VECTOR_EMBEDDING_CACHE_NAMESPACE` | *(unset)* | Stable deployed model revision; setting it enables persistent exact-input embedding reuse |
+| `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Active embedding HTTP attempts across local MCP processes; `0` disables the global limit |
 
 > **Changing the embedding model.** A codebase's index is tied to the embedding model it was built with. If you switch `VECTOR_EMBEDDING_MODEL`, the next search or index of that codebase fails fast with a clear error pointing at `force_reindex`, instead of a cryptic Qdrant dimension error (different-dimension swap) or silently meaningless results from incompatible embedding spaces (same-dimension swap — the model name is recorded in each collection's metadata and checked on reuse). Run `force_reindex` on the affected codebase to rebuild it with the new model — each codebase is reindexed independently.
 
@@ -218,6 +224,7 @@ Codesearch-specific settings (configured via environment variables with the `COD
 | `CODESEARCH_UPSERT_BATCH_TIMEOUT` | `300` | Batch operation timeout (seconds) |
 | `CODESEARCH_UPSERT_CONCURRENCY` | `1` | Max concurrent upsert batches |
 | `CODESEARCH_DELETION_CONCURRENCY` | `50` | Concurrent Qdrant operations during incremental indexing |
+| `CODESEARCH_CONSISTENCY_NAMESPACE` | *(derived)* | Optional stable journal/lock identity when equivalent Qdrant URLs are used by different processes |
 
 ## Change Detection
 
@@ -227,6 +234,35 @@ Fast incremental updates:
 3. Re-index only changed chunks
 
 Avoids full re-embedding on every search.
+
+Interrupted full indexes retain complete batches. The next search resumes files
+that are absent or were part of an ambiguous write rather than rebuilding the
+whole collection. Qdrant and the shared sparse vocabulary are coordinated by a
+durable intent journal; searches run against one settled generation.
+
+## Vocabulary Repair
+
+```bash
+# Read-only consistency audit
+repair_vocabulary()
+
+# Repair count mismatches and remove registrations with no collection
+repair_vocabulary(repair=true)
+
+# Reconstruct every live contribution, including same-count frequency drift
+repair_vocabulary(repair=true, full=true)
+```
+
+Qdrant's stored sparse indices are authoritative during reconstruction, so the
+repair preserves existing append-only token IDs and does not require dense
+re-embedding. Pending interrupted operations are recovered first. Collections
+are processed safely one at a time; repeat the audit if indexing changed the
+collection set concurrently.
+
+Point writes and deletes use Qdrant's server-confirmed, strong ordering, and
+local cancellation waits for accepted requests to finish before recovery. Hard
+process-crash recovery assumes the Qdrant transport does not deliver an older
+request to the permanent leader after the later strong-ordered recovery delete.
 
 ## Ignoring files
 
@@ -244,6 +280,8 @@ Ignored directories are pruned during traversal, so excluded subtrees cost nothi
 |------|----------|
 | Index | Qdrant collection `codesearch_{path_hash}` |
 | Metadata | Stored in Qdrant point payloads |
+| Embedding cache | `~/.cache/vector-core/embeddings.db` when a namespace is configured |
+| Recovery journal | `~/.cache/vector-core/codesearch_index_journal_v2.db` |
 
 Each indexed codebase gets a unique collection based on path hash.
 

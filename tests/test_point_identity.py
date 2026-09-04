@@ -36,10 +36,16 @@ def storage() -> QdrantStorage:
 
 @pytest.fixture
 def service(storage: QdrantStorage) -> IndexingService:
+    vocabulary = MagicMock()
+    vocabulary.update_codebase_incremental = MagicMock(return_value=0)
+    journal = MagicMock()
+    journal.get.return_value = None
+    journal.list.return_value = []
     return IndexingService(
         storage=storage,
         embedder=MagicMock(),
-        global_vocab=MagicMock(),
+        global_vocab=vocabulary,
+        journal=journal,
     )
 
 
@@ -101,14 +107,20 @@ async def _upserted_points(service: IndexingService, prepared: PreparedFile) -> 
         upserted.extend(points)
 
     service._storage.upsert_batch = capture
-    service._embedder.embed_all = AsyncMock(
-        side_effect=lambda texts: [[0.1] for _ in texts]
-    )
+    service._embedder.embed_all = AsyncMock(side_effect=lambda texts: [[0.1] for _ in texts])
     service._global_vocab.vectorize_document = MagicMock(
         return_value=SparseVector(indices=[], values=[])
     )
 
-    counted = await service._process_batch([prepared], "test_collection", {})
+    counted, _new_tokens = await service._process_batch(
+        [prepared],
+        "test_collection",
+        "/repo",
+        {},
+        added_tokens=[set()] * (1 + len(prepared.chunks)),
+        removed_tokens=[],
+        net_doc_change=1 + len(prepared.chunks),
+    )
     return upserted, counted
 
 
@@ -141,9 +153,7 @@ class TestChunkPointsFromRealSources:
         assert len({p.id for p in chunk_points}) == len(chunks)
 
     @pytest.mark.asyncio
-    async def test_chunks_on_distinct_lines_are_unaffected(
-        self, service: IndexingService
-    ) -> None:
+    async def test_chunks_on_distinct_lines_are_unaffected(self, service: IndexingService) -> None:
         source = "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n"
         prepared, chunks = _prepared("python", source)
         assert len(chunks) >= 2

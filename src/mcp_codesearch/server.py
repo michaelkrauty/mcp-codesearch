@@ -54,6 +54,7 @@ EXPECTED_TOOLS = [
     "cleanup_orphans",
     "index_status",
     "force_reindex",
+    "repair_vocabulary",
     "preview_index",
     "code_search",
     "search_multiple",
@@ -72,6 +73,7 @@ from mcp_codesearch.tools.indexing import (  # noqa: E402, F401
     force_reindex,
     index_status,
     preview_index,
+    repair_vocabulary,
 )
 from mcp_codesearch.tools.search import (  # noqa: E402, F401
     code_search,

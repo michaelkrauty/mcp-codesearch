@@ -10,6 +10,8 @@ Provides async-safe singleton patterns for:
 
 from __future__ import annotations
 
+import logging
+
 from vector_core import AsyncSingleton, EmbeddingClient, GlobalVocabulary
 
 from mcp_codesearch.services import IndexingService, SearchService
@@ -40,15 +42,19 @@ async def get_global_vocab() -> GlobalVocabulary:
 
     Uses isolated vocabulary database for codesearch (separate from notes/docs).
     """
+
     def _create_vocab() -> GlobalVocabulary:
         codesearch_vocab_db = settings.cache_dir / "codesearch_vocabulary.db"
-        return GlobalVocabulary(db_path=codesearch_vocab_db)
+        # The durable index journal clears only after vocabulary and Qdrant
+        # agree, so a reported SQLite commit must survive the same power loss.
+        return GlobalVocabulary(db_path=codesearch_vocab_db, synchronous="FULL")
 
     return await _global_vocab.get(_create_vocab)
 
 
 async def get_indexing_service() -> IndexingService:
     """Get or create IndexingService instance."""
+
     async def _create_service() -> IndexingService:
         storage = await get_storage()
         embedder = await get_embedder()
@@ -60,11 +66,13 @@ async def get_indexing_service() -> IndexingService:
 
 async def get_search_service() -> SearchService:
     """Get or create SearchService instance."""
+
     async def _create_service() -> SearchService:
         storage = await get_storage()
         embedder = await get_embedder()
         vocab = await get_global_vocab()
-        return SearchService(storage, embedder, vocab)
+        indexing = await get_indexing_service()
+        return SearchService(storage, embedder, vocab, indexing_service=indexing)
 
     return await _search_service.get(_create_service)
 
@@ -77,11 +85,10 @@ async def _safe_embedder_close(embedder: EmbeddingClient) -> None:
     the close will fail with "Event loop is closed". This is harmless - the
     client will be garbage collected anyway.
     """
-    import logging
     _logger = logging.getLogger(__name__)
 
     try:
-        if hasattr(embedder, 'close'):
+        if hasattr(embedder, "close"):
             await embedder.close()
     except (RuntimeError, OSError, ValueError, AttributeError) as e:
         # Suppress expected shutdown errors

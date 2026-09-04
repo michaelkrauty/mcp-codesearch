@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from qdrant_client.models import Distance, VectorParams
-from vector_core import GlobalVocabulary, SparseVector
+from vector_core import GlobalVocabulary
 
 from mcp_codesearch import helpers
 from mcp_codesearch.indexer.chunker import (
@@ -23,6 +23,7 @@ from mcp_codesearch.services.indexing_service import IndexingService
 from mcp_codesearch.settings import settings
 from mcp_codesearch.storage import qdrant as storage_qdrant
 from mcp_codesearch.storage.qdrant import (
+    EmbeddingDeploymentMismatchError,
     EmbeddingDimMismatchError,
     EmbeddingModelMismatchError,
     QdrantStorage,
@@ -51,10 +52,21 @@ def _make_service() -> IndexingService:
     """
     vocab = MagicMock()
     vocab.tokenize = MagicMock(return_value=[])
+    vocab.get_codebase_doc_count = MagicMock(return_value=0)
+    vocab.get_codebase_ids = MagicMock(return_value=[])
+    vocab.get_tokens_by_indices = MagicMock(return_value={})
+    storage = MagicMock()
+    storage.count_index_documents = AsyncMock(return_value=0)
+    storage.get_metadata = AsyncMock(return_value=None)
+    storage.store_metadata = AsyncMock()
+    journal = MagicMock()
+    journal.get.return_value = None
+    journal.list.return_value = []
     return IndexingService(
-        storage=MagicMock(),
+        storage=storage,
         embedder=MagicMock(),
         global_vocab=vocab,
+        journal=journal,
     )
 
 
@@ -84,6 +96,16 @@ async def test_run_sync_waits_for_worker_before_propagating_cancellation() -> No
     with pytest.raises(asyncio.CancelledError):
         await task
     assert finished.is_set()
+
+
+async def test_run_sync_propagates_worker_cancellation_without_spinning() -> None:
+    """A worker raising CancelledError terminates instead of looping forever."""
+
+    def cancelled() -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(idx_svc._run_sync(cancelled), timeout=1.0)
 
 
 class TestPrepareFilesFaultIsolation:
@@ -225,7 +247,7 @@ class TestIndexGuardBranch:
         service._stale_locks_cleaned = True  # skip cleanup_stale_locks()
 
         @asynccontextmanager
-        async def _noop_lock(name):
+        async def _noop_lock(name, **_kwargs):
             yield
 
         monkeypatch.setattr(idx_svc, "async_file_lock", _noop_lock)
@@ -263,6 +285,90 @@ class TestIndexGuardBranch:
 
         service._verify_embedding_dim.assert_awaited_once()
         assert result == (0, 0, None)
+
+    async def test_force_resumes_collection_marked_in_progress(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.get_metadata = AsyncMock(return_value={"indexing_in_progress": True})
+        service._storage.get_indexed_files_metadata = AsyncMock(return_value={})
+        service._storage.delete_collection = AsyncMock()
+        service._storage.create_collection = AsyncMock()
+        service._storage.store_metadata = AsyncMock()
+        service._verify_embedding_dim = AsyncMock()
+        service._verify_embedding_model = AsyncMock()
+        service._verify_embedding_deployment = AsyncMock()
+        monkeypatch.setattr(
+            idx_svc,
+            "detect_changes_fast",
+            lambda path, metadata: SimpleNamespace(has_changes=False),
+        )
+
+        assert await service.index("/proj", force=True) == (0, 0, None)
+
+        service._storage.delete_collection.assert_not_awaited()
+        service._storage.create_collection.assert_not_awaited()
+        service._storage.store_metadata.assert_awaited_once_with(
+            "codesearch_79903f0c2002",
+            "/proj",
+            indexing_in_progress=False,
+        )
+
+    async def test_force_restarts_incompatible_in_progress_collection(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=True)
+        service._storage.get_metadata = AsyncMock(return_value={"indexing_in_progress": True})
+        service._storage.delete_collection = AsyncMock()
+        service._storage.create_collection = AsyncMock()
+        service._storage.store_metadata = AsyncMock()
+        service._verify_embedding_dim = AsyncMock(
+            side_effect=EmbeddingDimMismatchError(
+                "codesearch_79903f0c2002",
+                expected=4096,
+                actual=768,
+            )
+        )
+        service._verify_embedding_model = AsyncMock()
+        service._verify_embedding_deployment = AsyncMock()
+        monkeypatch.setattr(idx_svc, "discover_files", lambda path: [])
+
+        await service.index("/proj", force=True)
+
+        service._storage.delete_collection.assert_awaited_once()
+        service._storage.create_collection.assert_awaited_once()
+
+    async def test_fresh_index_removes_contribution_without_count(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        collection = "codesearch_79903f0c2002"
+        service._storage.collection_exists = AsyncMock(return_value=False)
+        service._storage.create_collection = AsyncMock()
+        service._storage.store_metadata = AsyncMock()
+        service._global_vocab.get_codebase_ids = MagicMock(return_value=[collection])
+        monkeypatch.setattr(idx_svc, "discover_files", lambda path: [])
+
+        await service.index("/proj")
+
+        service._global_vocab.unregister_codebase.assert_called_once_with(collection)
+
+    async def test_new_collection_is_marked_before_discovery(self, monkeypatch):
+        service = self._ready_service(monkeypatch)
+        service._storage.collection_exists = AsyncMock(return_value=False)
+        service._storage.create_collection = AsyncMock()
+        service._storage.store_metadata = AsyncMock()
+        service._global_vocab.get_codebase_doc_count = MagicMock(return_value=0)
+
+        def fail_discovery(_path):
+            raise RuntimeError("discovery failed")
+
+        monkeypatch.setattr(idx_svc, "discover_files", fail_discovery)
+
+        with pytest.raises(RuntimeError, match="discovery failed"):
+            await service.index("/proj")
+
+        service._storage.store_metadata.assert_awaited_once_with(
+            "codesearch_79903f0c2002",
+            "/proj",
+            indexing_in_progress=True,
+        )
 
 
 class TestAutoIndexDimMismatchSurface:
@@ -381,7 +487,7 @@ class TestIndexBranchInvokesModelGuard:
         service._stale_locks_cleaned = True
 
         @asynccontextmanager
-        async def _noop_lock(name):
+        async def _noop_lock(name, **_kwargs):
             yield
 
         monkeypatch.setattr(idx_svc, "async_file_lock", _noop_lock)
@@ -447,15 +553,59 @@ class TestAutoIndexModelMismatchSurface:
         assert "meaningless" in error
 
 
+class TestEmbeddingDeploymentGuard:
+    async def test_rejects_different_explicit_deployment(self, monkeypatch):
+        service = _make_service()
+        monkeypatch.setattr(
+            idx_svc,
+            "settings",
+            SimpleNamespace(
+                embedding_cache_namespace="revision-b",
+                embedding_dim=4096,
+            ),
+        )
+        service._storage.get_metadata = AsyncMock(
+            return_value={"embedding_cache_namespace": "revision-a"}
+        )
+
+        with pytest.raises(EmbeddingDeploymentMismatchError):
+            await service._verify_embedding_deployment("codesearch_abc", "/proj")
+
+    async def test_backfills_legacy_deployment_identity(self, monkeypatch):
+        service = _make_service()
+        monkeypatch.setattr(
+            idx_svc,
+            "settings",
+            SimpleNamespace(
+                embedding_cache_namespace="revision-a",
+                embedding_dim=4096,
+            ),
+        )
+        service._storage.get_metadata = AsyncMock(return_value={})
+        service._storage.store_metadata = AsyncMock()
+
+        await service._verify_embedding_deployment("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_awaited_once_with("codesearch_abc", "/proj")
+
+
 class TestStoreMetadataRecordsModel:
     """The storage wrapper records the configured embedding model."""
 
     @staticmethod
-    def _storage(monkeypatch, model):
+    def _storage(monkeypatch, model, namespace=None):
         storage = QdrantStorage(url="http://localhost:6333")
         storage._core = MagicMock()
+        storage._core.get_metadata = AsyncMock(return_value=None)
         storage._core.store_metadata = AsyncMock()
-        monkeypatch.setattr(storage_qdrant, "settings", SimpleNamespace(embedding_model=model))
+        monkeypatch.setattr(
+            storage_qdrant,
+            "settings",
+            SimpleNamespace(
+                embedding_model=model,
+                embedding_cache_namespace=namespace,
+            ),
+        )
         return storage
 
     async def test_records_model_when_configured(self, monkeypatch):
@@ -465,7 +615,30 @@ class TestStoreMetadataRecordsModel:
 
         storage._core.store_metadata.assert_awaited_once_with(
             "codesearch_abc",
-            {"codebase_path": "/proj", "embedding_model": "Qwen3-Embedding-8B"},
+            {
+                "codebase_path": "/proj",
+                "embedding_model": "Qwen3-Embedding-8B",
+                "indexing_in_progress": False,
+            },
+        )
+
+    async def test_records_cache_namespace_when_configured(self, monkeypatch):
+        storage = self._storage(
+            monkeypatch,
+            "Qwen3-Embedding-8B",
+            namespace="revision-a",
+        )
+
+        await storage.store_metadata("codesearch_abc", "/proj")
+
+        storage._core.store_metadata.assert_awaited_once_with(
+            "codesearch_abc",
+            {
+                "codebase_path": "/proj",
+                "embedding_model": "Qwen3-Embedding-8B",
+                "embedding_cache_namespace": "revision-a",
+                "indexing_in_progress": False,
+            },
         )
 
     async def test_omits_model_when_unconfigured(self, monkeypatch):
@@ -474,18 +647,13 @@ class TestStoreMetadataRecordsModel:
         await storage.store_metadata("codesearch_abc", "/proj")
 
         storage._core.store_metadata.assert_awaited_once_with(
-            "codesearch_abc", {"codebase_path": "/proj"}
+            "codesearch_abc",
+            {"codebase_path": "/proj", "indexing_in_progress": False},
         )
 
 
-class TestForceReindexRollback:
-    """A force re-index destroys the existing collection before rebuilding it.
-    If the rebuild fails partway (a transient embedding/Qdrant error in Phase 2),
-    the service must roll back to a clean "not indexed" state: drop this
-    codebase's contribution from the shared global vocabulary (so a partial
-    rebuild does not skew IDF for every other codebase) and drop the partial
-    collection (so the next access does a fresh full index instead of an
-    incremental one that double-counts the already-registered tokens)."""
+class TestForceReindexResume:
+    """A failed rebuild retains only its complete, resumable batches."""
 
     @staticmethod
     def _ready_service(monkeypatch) -> IndexingService:
@@ -493,36 +661,30 @@ class TestForceReindexRollback:
         service._stale_locks_cleaned = True
 
         @asynccontextmanager
-        async def _noop_lock(name):
+        async def _noop_lock(name, **_kwargs):
             yield
 
         monkeypatch.setattr(idx_svc, "async_file_lock", _noop_lock)
         return service
 
-    async def test_rolls_back_vocab_and_collection_on_phase2_failure(self, monkeypatch):
+    async def test_phase2_failure_keeps_the_new_collection_for_resume(self, monkeypatch):
         service = self._ready_service(monkeypatch)
         service._storage.collection_exists = AsyncMock(return_value=True)
         service._storage.delete_collection = AsyncMock()
         service._storage.create_collection = AsyncMock()
-        # one file so _full_index proceeds past its empty-list early return
         monkeypatch.setattr(idx_svc, "discover_files", lambda path: [object()])
-        # avoid real chunking; Phase 1 registers vocab, Phase 2 then fails
-        service._prepare_files = MagicMock(return_value=([object()], {"doc-0": ["tok"]}))
+        service._prepare_files = MagicMock(return_value=([_prepared("one.py")], [{"tok"}]))
         service._process_batch = AsyncMock(side_effect=RuntimeError("transient embed failure"))
 
         with pytest.raises(RuntimeError, match="transient embed failure"):
             await service.index("/proj", force=True)
 
-        # Pre-delete unregister of the old contribution + rollback unregister == 2.
-        assert service._global_vocab.unregister_codebase.call_count == 2
-        # Pre-rebuild delete of the old collection + rollback delete of the partial == 2.
-        assert service._storage.delete_collection.await_count == 2
+        assert service._global_vocab.unregister_codebase.call_count == 1
+        assert service._storage.delete_collection.await_count == 1
+        service._storage.create_collection.assert_awaited_once()
 
     async def test_rolls_back_when_discovery_fails_after_recreate(self, monkeypatch):
-        """File discovery runs after the old collection is dropped and the new
-        one created. If it raises (e.g. a malformed ignore pattern), the freshly
-        created empty collection must still be rolled back, or the next access
-        takes the incremental path instead of a clean full rebuild."""
+        """An empty recreated collection remains a safe incremental resume point."""
         service = self._ready_service(monkeypatch)
         service._storage.collection_exists = AsyncMock(return_value=True)
         service._storage.delete_collection = AsyncMock()
@@ -536,10 +698,9 @@ class TestForceReindexRollback:
         with pytest.raises(ValueError, match="malformed ignore pattern"):
             await service.index("/proj", force=True)
 
-        # Pre-rebuild delete of the old collection + rollback delete of the
-        # freshly created (empty) collection == 2.
-        assert service._storage.delete_collection.await_count == 2
-        assert service._global_vocab.unregister_codebase.call_count == 2
+        assert service._storage.delete_collection.await_count == 1
+        assert service._global_vocab.unregister_codebase.call_count == 1
+        service._storage.create_collection.assert_awaited_once()
 
     async def test_successful_force_reindex_does_not_roll_back(self, monkeypatch):
         service = self._ready_service(monkeypatch)
@@ -548,12 +709,11 @@ class TestForceReindexRollback:
         service._storage.create_collection = AsyncMock()
         service._storage.store_metadata = AsyncMock()
         monkeypatch.setattr(idx_svc, "discover_files", lambda path: [object()])
-        service._prepare_files = MagicMock(return_value=([object()], {"doc-0": ["tok"]}))
-        service._process_batch = AsyncMock(return_value=1)  # succeeds
+        service._prepare_files = MagicMock(return_value=([_prepared("one.py")], [{"tok"}]))
+        service._process_batch = AsyncMock(return_value=(1, 0))
 
         _files, chunks, _stats = await service.index("/proj", force=True)
 
-        # Only the pre-rebuild delete + pre-delete unregister run; no rollback.
         assert service._storage.delete_collection.await_count == 1
         assert service._global_vocab.unregister_codebase.call_count == 1
         assert chunks == 1
@@ -564,21 +724,15 @@ def _prepared(rel_path: str):
     return SimpleNamespace(file_info=SimpleNamespace(rel_path=rel_path), chunks=[])
 
 
-class TestIncrementalIndexRollback:
-    """An incremental index applies one batch at a time: it commits that batch's
-    vocabulary delta, builds its points, then swaps them in for the ones they
-    replace. The delta has to precede the points because the sparse vectors are
-    computed from it, so a batch that fails must give the delta back -- and what
-    "giving it back" means depends on whether the outgoing points had already
-    been removed by then."""
+class TestIncrementalIndexTransactions:
+    """Incremental work embeds first and commits complete batches one at a time."""
 
     async def test_embedding_failure_leaves_the_existing_points_alone(self):
         """Failing before the swap must not delete anything.
 
         Embedding is the slow, network-dependent step. When it fails the
-        previous points are all still in place and still answering queries, so
-        the whole delta is reversed and nothing is removed. Deleting here is
-        precisely the destruction this ordering exists to prevent.
+        previous points are all still in place and no vocabulary delta has been
+        attempted. The journaled transaction lives inside _process_batch.
         """
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={"mod.py": [{"old"}]})
@@ -595,48 +749,7 @@ class TestIncrementalIndexRollback:
         # Nothing was deleted: the file still has the points it started with.
         service._storage.delete_by_paths_batch.assert_not_awaited()
 
-        calls = service._global_vocab.update_codebase_incremental.call_args_list
-        assert len(calls) == 2
-        orig, undo = calls[0].kwargs, calls[1].kwargs
-        assert orig["added_tokens"] == [{"new"}] and orig["removed_tokens"] == [{"old"}]
-        # The delta is reversed in full: the old tokens go back, because the
-        # documents they were counted from were never removed.
-        assert undo["added_tokens"] == [{"old"}]
-        assert undo["removed_tokens"] == [{"new"}]
-        assert undo["net_doc_change"] == 0
-
-    async def test_failure_after_the_swap_clears_that_batch(self):
-        """Failing once the outgoing points are gone leaves the paths empty.
-
-        The affected paths now hold neither their old points nor a complete set
-        of new ones, so they are cleared and the next run re-detects them as
-        added. The removed-token deletions stand, because they match points
-        that really are gone.
-        """
-        service = _make_service()
-        service._collect_removed_tokens = AsyncMock(return_value={"mod.py": [{"old"}]})
-        service._prepare_files = MagicMock(return_value=([_prepared("mod.py")], [{"new"}]))
-
-        async def fail_after_swap(batch, col_name, languages, stale_paths, progress):
-            progress.stale_points_removed = True
-            raise RuntimeError("upsert failure")
-
-        service._process_batch = AsyncMock(side_effect=fail_after_swap)
-        service._storage.delete_by_paths_batch = AsyncMock()
-        changes = SimpleNamespace(
-            added=[], modified=[SimpleNamespace(rel_path="mod.py")], deleted=[]
-        )
-
-        with pytest.raises(RuntimeError, match="upsert failure"):
-            await service._incremental_index("codesearch_x", changes, "/proj")
-
-        service._storage.delete_by_paths_batch.assert_awaited_once()
-        assert service._storage.delete_by_paths_batch.await_args.args[1] == ["mod.py"]
-
-        undo = service._global_vocab.update_codebase_incremental.call_args_list[1].kwargs
-        assert undo["added_tokens"] == []
-        assert undo["removed_tokens"] == [{"new"}]
-        assert undo["net_doc_change"] == -1
+        service._global_vocab.update_codebase_incremental.assert_not_called()
 
     async def test_a_failed_batch_does_not_start_the_next_one(self, monkeypatch):
         """Files in later batches keep their points, so the index stays whole."""
@@ -662,17 +775,14 @@ class TestIncrementalIndexRollback:
         # Only the first batch ran; b.py was never touched at all.
         assert service._process_batch.await_count == 1
         assert service._process_batch.await_args.args[0][0].file_info.rel_path == "a.py"
-        # And only the first batch's delta was committed, then reversed.
-        calls = service._global_vocab.update_codebase_incremental.call_args_list
-        assert len(calls) == 2
-        assert calls[0].kwargs["added_tokens"] == [{"new_a"}]
+        service._global_vocab.update_codebase_incremental.assert_not_called()
 
     async def test_deleted_files_are_removed_without_waiting_for_a_batch(self):
         """A file gone from disk has no replacement to wait for."""
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={"gone.py": [{"old"}]})
         service._prepare_files = MagicMock(return_value=([_prepared("new.py")], [{"new"}]))
-        service._process_batch = AsyncMock(return_value=1)
+        service._process_batch = AsyncMock(return_value=(1, 0))
         service._storage.store_metadata = AsyncMock()
         service._storage.delete_by_paths_batch = AsyncMock()
         changes = SimpleNamespace(
@@ -688,33 +798,33 @@ class TestIncrementalIndexRollback:
         service = _make_service()
         service._collect_removed_tokens = AsyncMock(return_value={})
         service._prepare_files = MagicMock(return_value=([_prepared("new.py")], [{"tok"}]))
-        service._process_batch = AsyncMock(return_value=1)
+        service._process_batch = AsyncMock(return_value=(1, 0))
         service._storage.store_metadata = AsyncMock()
         service._storage.delete_by_paths_batch = AsyncMock()
-        changes = SimpleNamespace(added=[object()], modified=[], deleted=[])
+        changes = SimpleNamespace(
+            added=[SimpleNamespace(rel_path="new.py")], modified=[], deleted=[]
+        )
 
         await service._incremental_index("codesearch_x", changes, "/proj")
 
-        # Only the original delta; no rollback, no cleanup deletion.
-        assert service._global_vocab.update_codebase_incremental.call_count == 1
+        # The mocked batch owns the entire transaction, so no outer rollback or
+        # vocabulary mutation occurs.
+        service._global_vocab.update_codebase_incremental.assert_not_called()
         service._storage.delete_by_paths_batch.assert_not_awaited()
 
 
 class TestCollectRemovedTokensFetchFailure:
-    """If fetching a changed file's OLD content fails, deleting its points while
-    dropping its tokens permanently over-counts the shared vocabulary (points
-    gone from Qdrant, tokens left in the vocab). The run must abort BEFORE
-    deleting anything, so the next run re-detects the change and retries."""
+    """Outgoing sparse vectors must be readable before any mutation begins."""
 
     async def test_aborts_and_does_not_delete_on_fetch_failure(self):
         service = _make_service()
-        service._storage.get_stored_content_for_path = AsyncMock(
+        service._storage.get_stored_sparse_indices_by_paths = AsyncMock(
             side_effect=RuntimeError("scroll timeout")
         )
         service._storage.delete_by_paths_batch = AsyncMock()
         changes = SimpleNamespace(deleted=["foo.py"], modified=[], added=[])
 
-        with pytest.raises(RuntimeError, match="[Aa]bort"):
+        with pytest.raises(RuntimeError, match="scroll timeout"):
             await service._collect_removed_tokens("col", changes)
 
         # Nothing was deleted: a clean abort leaves Qdrant and the vocab in sync.
@@ -727,8 +837,10 @@ class TestCollectRemovedTokensFetchFailure:
         a batch may only account for the files it actually replaced.
         """
         service = _make_service()
-        service._storage.get_stored_content_for_path = AsyncMock(return_value=["some code"])
-        service._global_vocab.tokenize = MagicMock(return_value=["some", "code"])
+        service._storage.get_stored_sparse_indices_by_paths = AsyncMock(
+            return_value={"foo.py": [[1, 2]]}
+        )
+        service._global_vocab.get_tokens_by_indices = MagicMock(return_value={1: "some", 2: "code"})
         service._storage.delete_by_paths_batch = AsyncMock()
         changes = SimpleNamespace(deleted=["foo.py"], modified=[], added=[])
 
@@ -744,13 +856,14 @@ class TestVocabularyAccountingInvariant:
     async def test_register_then_remove_with_imports_restores_counters(self, tmp_path):
         vocab = GlobalVocabulary(db_path=tmp_path / "vocabulary.db")
         storage = QdrantStorage()
-        client = MagicMock()
-        client.delete = AsyncMock()
-        storage._get_client = AsyncMock(return_value=client)
+        journal = MagicMock()
+        journal.get.return_value = None
+        journal.list.return_value = []
         service = IndexingService(
             storage=storage,
             embedder=MagicMock(),
             global_vocab=vocab,
+            journal=journal,
         )
         file_info = _make_file(
             "imported.py",
@@ -758,22 +871,7 @@ class TestVocabularyAccountingInvariant:
         )
 
         try:
-            prepared_files, added_tokens = service._prepare_files([file_info])
-            prepared = prepared_files[0]
-            empty_sparse = SparseVector(indices=[], values=[])
-            points = [
-                service._build_file_point(file_info, prepared.summary, [], empty_sparse),
-                *[
-                    service._build_chunk_point(file_info, chunk, [], empty_sparse, i)
-                    for i, chunk in enumerate(prepared.chunks)
-                ],
-            ]
-            client.scroll = AsyncMock(
-                return_value=(
-                    [SimpleNamespace(id=point.id, payload=point.payload) for point in points],
-                    None,
-                )
-            )
+            _prepared_files, added_tokens = service._prepare_files([file_info])
 
             baseline_tokens = set().union(*added_tokens)
             vocab.register_codebase("baseline", [baseline_tokens])
@@ -781,6 +879,15 @@ class TestVocabularyAccountingInvariant:
             starting_doc_count = vocab.total_docs
 
             vocab.register_codebase("subject", added_tokens)
+            token_to_index = vocab._get_vocab()
+            storage.get_stored_sparse_indices_by_paths = AsyncMock(
+                return_value={
+                    file_info.rel_path: [
+                        sorted(token_to_index[token] for token in token_set)
+                        for token_set in added_tokens
+                    ]
+                }
+            )
             changes = SimpleNamespace(deleted=[file_info.rel_path], modified=[], added=[])
             removed_by_path = await service._collect_removed_tokens("collection", changes)
             removed_tokens = [t for toks in removed_by_path.values() for t in toks]

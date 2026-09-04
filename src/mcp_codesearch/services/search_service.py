@@ -15,14 +15,21 @@ from typing import TYPE_CHECKING, Literal
 from vector_core import CacheConfig, TTLCache
 
 from mcp_codesearch.search.preprocess import preprocess_query
-from mcp_codesearch.search.query import format_results, search_codebase
+from mcp_codesearch.search.query import (
+    DenseQueryPreparation,
+    format_results,
+    prepare_dense_query,
+    prepare_sparse_query,
+    search_codebase,
+)
 from mcp_codesearch.settings import settings
 from mcp_codesearch.storage.qdrant import collection_name
 
 if TYPE_CHECKING:
-    from vector_core import EmbeddingClient, GlobalVocabulary
+    from vector_core import EmbeddingClient, GlobalVocabulary, SparseVector
 
     from mcp_codesearch.search.query import SearchResult
+    from mcp_codesearch.services.indexing_service import IndexingService
     from mcp_codesearch.storage.qdrant import QdrantStorage
 
 logger = logging.getLogger(__name__)
@@ -86,6 +93,7 @@ class SearchService:
         embedder: EmbeddingClient,
         global_vocab: GlobalVocabulary,
         cache_config: CacheConfig | None = None,
+        indexing_service: IndexingService | None = None,
     ):
         """Initialize the search service.
 
@@ -98,6 +106,7 @@ class SearchService:
         self._storage = storage
         self._embedder = embedder
         self._global_vocab = global_vocab
+        self._indexing_service = indexing_service
 
         # Initialize cache with provided or default config
         if cache_config is None:
@@ -128,34 +137,96 @@ class SearchService:
             SearchResponse with formatted results and metadata
         """
         abs_path = str(Path(query.path).resolve())
-        collection_name(abs_path)  # Validate/normalize path
+        col_name = collection_name(abs_path)
+
+        if self._indexing_service is None:
+            return await self._search_consistent(
+                query,
+                abs_path,
+                0,
+                skip_cache,
+                dense_preparation=None,
+            )
+
+        if not skip_cache:
+            async with self._indexing_service.consistent_read([col_name]) as snapshot:
+                cached = self._cached_response(
+                    query,
+                    abs_path,
+                    snapshot.generation,
+                )
+                if cached is not None:
+                    return cached
+
+        # Dense inference is independent of the mutable sparse vocabulary and
+        # Qdrant collection. Do it outside the shared snapshot so a slow backend
+        # cannot starve index commits or deletion recovery.
+        dense_preparation = await prepare_dense_query(query.query, self._embedder)
+
+        async with self._indexing_service.consistent_read(
+            [col_name],
+            prepare=lambda: prepare_sparse_query(query.query, self._global_vocab),
+        ) as snapshot:
+            return await self._search_consistent(
+                query,
+                abs_path,
+                snapshot.generation,
+                skip_cache,
+                dense_preparation=dense_preparation,
+                sparse_preparation=snapshot.prepared,
+            )
+
+    def _cached_response(
+        self,
+        query: SearchQuery,
+        abs_path: str,
+        generation: int,
+    ) -> SearchResponse | None:
+        cached_result = self._cache.get(self._cache_key(query, abs_path, generation))
+        if cached_result is None:
+            return None
+        return SearchResponse(
+            formatted_output=cached_result,
+            was_cached=True,
+            language_hint=self._get_language_hint(query.query, query.language),
+        )
+
+    async def _search_consistent(
+        self,
+        query: SearchQuery,
+        abs_path: str,
+        generation: int,
+        skip_cache: bool,
+        dense_preparation: DenseQueryPreparation | None,
+        sparse_preparation: SparseVector | None = None,
+    ) -> SearchResponse:
+        """Search and publish a cache entry under one shared index generation."""
 
         # Check cache first (unless skip_cache is True)
-        cache_key = self._cache_key(query, abs_path)
+        cache_key = self._cache_key(query, abs_path, generation)
         if not skip_cache:
-            cached_result = self._cache.get(cache_key)
-            if cached_result is not None:
-                # Add language hint even for cached results
-                lang_hint = self._get_language_hint(query.query, query.language)
-                return SearchResponse(
-                    formatted_output=cached_result,
-                    was_cached=True,
-                    language_hint=lang_hint,
-                )
+            cached = self._cached_response(query, abs_path, generation)
+            if cached is not None:
+                return cached
 
         # Execute search
-        results = await search_codebase(
-            query=query.query,
-            codebase_path=abs_path,
-            storage=self._storage,
-            embedder=self._embedder,
-            global_vocab=self._global_vocab,
-            mode=query.mode,
-            language=query.language,
-            limit=query.limit,
-            path_prefix=query.path_prefix,
-            exclude_paths=query.exclude_paths,
-        )
+        async def execute_search() -> list[SearchResult]:
+            return await search_codebase(
+                query=query.query,
+                codebase_path=abs_path,
+                storage=self._storage,
+                embedder=self._embedder,
+                global_vocab=self._global_vocab,
+                mode=query.mode,
+                language=query.language,
+                limit=query.limit,
+                path_prefix=query.path_prefix,
+                exclude_paths=query.exclude_paths,
+                dense_preparation=dense_preparation,
+                sparse_preparation=sparse_preparation,
+            )
+
+        results = await execute_search()
 
         # Format results
         formatted = format_results(results, output_format=query.output_format)
@@ -195,7 +266,12 @@ class SearchService:
         """Clear all cache entries."""
         self._cache.clear()
 
-    def _cache_key(self, query: SearchQuery, abs_path: str) -> str:
+    def _cache_key(
+        self,
+        query: SearchQuery,
+        abs_path: str,
+        generation: int = 0,
+    ) -> str:
         """Generate deterministic cache key from search parameters.
 
         The key includes the path as a prefix (before hash) to enable
@@ -206,7 +282,7 @@ class SearchService:
         key_parts = (
             f"{query.query}|{abs_path}|{query.mode}|"
             f"{query.language or ''}|{query.limit}|{query.output_format}|"
-            f"{query.path_prefix or ''}|{exclude_str}"
+            f"{query.path_prefix or ''}|{exclude_str}|generation={generation}"
         )
         key_hash = hashlib.sha256(key_parts.encode()).hexdigest()[:16]
         # Include path prefix for targeted invalidation

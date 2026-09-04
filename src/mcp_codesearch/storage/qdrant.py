@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal
@@ -28,6 +28,7 @@ from qdrant_client.models import (
     TextIndexParams,
     TextIndexType,
     TokenizerType,
+    WriteOrdering,
 )
 from qdrant_client.models import (
     SparseVector as QdrantSparseVector,
@@ -49,6 +50,37 @@ logger = logging.getLogger(__name__)
 
 # Prefix for all codesearch collections
 COLLECTION_PREFIX = "codesearch"
+
+
+async def _finish_qdrant_write(awaitable: Any) -> Any:
+    """Do not let local cancellation abandon a remotely accepted write."""
+    worker = asyncio.create_task(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+            break
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            if worker.done():
+                result = worker.result()
+                break
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def _quiesce_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+    """Wait through repeated caller cancellation until every write task stops."""
+    waiter = asyncio.gather(*tasks, return_exceptions=True)
+    while True:
+        try:
+            await asyncio.shield(waiter)
+            return
+        except asyncio.CancelledError:
+            if waiter.done():
+                waiter.result()
+                return
 
 
 class EmbeddingDimMismatchError(Exception):
@@ -92,6 +124,19 @@ class EmbeddingModelMismatchError(Exception):
         super().__init__(
             f"collection {collection!r} was indexed with embedding model "
             f"{actual!r}, but the configured embedding model is now {expected!r}"
+        )
+
+
+class EmbeddingDeploymentMismatchError(Exception):
+    """Raised when a collection belongs to another embedding deployment."""
+
+    def __init__(self, collection: str, expected: str, actual: str) -> None:
+        self.collection = collection
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"collection {collection!r} was indexed with embedding deployment "
+            f"{actual!r}, but the configured deployment is {expected!r}"
         )
 
 
@@ -219,12 +264,12 @@ class QdrantStorage:
 
     async def delete_collection(self, name: str) -> None:
         """Delete collection."""
-        await self._core.delete_collection(name)
         # Qdrant drops payload indexes with the collection; forget the
         # cached state so a same-process recreate (e.g. force_reindex)
         # re-creates the text indexes instead of skipping them.
         self._text_indexed_collections.discard(name)
         self._text_index_failed_collections.discard(name)
+        await _finish_qdrant_write(self._core.delete_collection(name))
 
     async def list_collections(self) -> list[str]:
         """List all codesearch collections."""
@@ -329,7 +374,14 @@ class QdrantStorage:
             },
         )
 
-        await client.upsert(collection, [point])
+        await _finish_qdrant_write(
+            client.upsert(
+                collection,
+                [point],
+                wait=True,
+                ordering=WriteOrdering.STRONG,
+            )
+        )
 
     async def upsert_chunk(
         self,
@@ -368,13 +420,20 @@ class QdrantStorage:
                 "name": chunk.name,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
-                "content": chunk.content[:settings.max_payload_content_chars],
+                "content": chunk.content[: settings.max_payload_content_chars],
                 "context": chunk.context,
                 "indexed_at": datetime.now(UTC).isoformat(),
             },
         )
 
-        await client.upsert(collection, [point])
+        await _finish_qdrant_write(
+            client.upsert(
+                collection,
+                [point],
+                wait=True,
+                ordering=WriteOrdering.STRONG,
+            )
+        )
 
     async def upsert_batch(
         self,
@@ -401,10 +460,7 @@ class QdrantStorage:
         concurrency = concurrency or settings.upsert_concurrency
 
         # Split into batches
-        batches = [
-            points[i : i + batch_size]
-            for i in range(0, len(points), batch_size)
-        ]
+        batches = [points[i : i + batch_size] for i in range(0, len(points), batch_size)]
 
         # Use semaphore to limit concurrent upserts
         semaphore = asyncio.Semaphore(concurrency)
@@ -415,22 +471,26 @@ class QdrantStorage:
                 last_error = None
                 for attempt in range(max_retries):
                     try:
-                        await client.upsert(collection, batch)
+                        await _finish_qdrant_write(
+                            client.upsert(
+                                collection,
+                                batch,
+                                wait=True,
+                                ordering=WriteOrdering.STRONG,
+                            )
+                        )
                         return
                     except Exception as e:
                         last_error = e
                         if attempt < max_retries - 1:
                             # Exponential backoff: 1s, 2s, 4s
-                            await asyncio.sleep(2 ** attempt)
+                            await asyncio.sleep(2**attempt)
                 if last_error:
                     raise last_error
 
         # Run all batches concurrently (limited by semaphore) with timeout
         # Create explicit tasks for proper cancellation handling on timeout
-        tasks = [
-            asyncio.create_task(upsert_with_retry(batch))
-            for batch in batches
-        ]
+        tasks = [asyncio.create_task(upsert_with_retry(batch)) for batch in batches]
         try:
             async with asyncio.timeout(settings.upsert_batch_timeout):
                 await asyncio.gather(*tasks)
@@ -439,8 +499,7 @@ class QdrantStorage:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            # Wait for cancellations to complete (suppress CancelledError)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _quiesce_tasks(tasks)
             msg = (
                 f"Batch upsert timed out after {settings.upsert_batch_timeout}s "
                 f"({len(batches)} batches, {len(points)} points)"
@@ -459,7 +518,7 @@ class QdrantStorage:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _quiesce_tasks(tasks)
             raise
 
     async def delete_by_path(self, collection: str, path: str) -> None:
@@ -498,24 +557,25 @@ class QdrantStorage:
 
             # Build OR filter for all paths in this batch
             filter_conditions = [
-                FieldCondition(key="path", match=MatchValue(value=p))
-                for p in batch_paths
+                FieldCondition(key="path", match=MatchValue(value=p)) for p in batch_paths
             ]
 
             delete_filter = Filter(should=filter_conditions)  # type: ignore[arg-type]
 
-            await client.delete(
-                collection_name=collection,
-                points_selector=delete_filter,
+            await _finish_qdrant_write(
+                client.delete(
+                    collection_name=collection,
+                    points_selector=delete_filter,
+                    wait=True,
+                    ordering=WriteOrdering.STRONG,
+                )
             )
 
             processed += len(batch_paths)
 
         return processed
 
-    async def get_stored_content_for_path(
-        self, collection: str, path: str
-    ) -> list[str]:
+    async def get_stored_content_for_path(self, collection: str, path: str) -> list[str]:
         """
         Get vocabulary text for a file path (summary + all reconstructed chunks).
 
@@ -546,26 +606,9 @@ class QdrantStorage:
                 with_payload=["type", "summary", "content", "imports"],
             )
 
-            for point in points:
-                if not point.payload:
-                    continue
-                if point.payload.get("type") == "file":
-                    summary = point.payload.get("summary", "")
-                    texts.append(summary if isinstance(summary, str) else "")
-                elif point.payload.get("type") == "chunk":
-                    content = point.payload.get("content", "")
-                    content = content if isinstance(content, str) else ""
-                    if "imports" not in point.payload:
-                        legacy_chunks += 1
-                        texts.append(content)
-                        continue
-                    stored_imports = point.payload.get("imports")
-                    imports = (
-                        [item for item in stored_imports if isinstance(item, str)]
-                        if isinstance(stored_imports, list)
-                        else []
-                    )
-                    texts.append(build_chunk_vocabulary_text(content, imports))
+            batch_texts, batch_legacy = self._vocabulary_texts(points)
+            texts.extend(batch_texts)
+            legacy_chunks += batch_legacy
 
             if offset is None:
                 break
@@ -580,6 +623,141 @@ class QdrantStorage:
 
         return texts
 
+    @staticmethod
+    def _vocabulary_texts(points: list[Any]) -> tuple[list[str], int]:
+        """Reconstruct the exact sparse-vocabulary text from Qdrant payloads."""
+        texts: list[str] = []
+        legacy_chunks = 0
+        for point in points:
+            payload = point.payload
+            if not payload:
+                continue
+            if payload.get("type") == "file":
+                summary = payload.get("summary", "")
+                texts.append(summary if isinstance(summary, str) else "")
+            elif payload.get("type") == "chunk":
+                content = payload.get("content", "")
+                content = content if isinstance(content, str) else ""
+                if "imports" not in payload:
+                    legacy_chunks += 1
+                    texts.append(content)
+                    continue
+                stored_imports = payload.get("imports")
+                imports = (
+                    [item for item in stored_imports if isinstance(item, str)]
+                    if isinstance(stored_imports, list)
+                    else []
+                )
+                texts.append(build_chunk_vocabulary_text(content, imports))
+        return texts, legacy_chunks
+
+    @staticmethod
+    def _index_document_filter() -> Filter:
+        """Filter to file and chunk points, excluding collection metadata."""
+        return Filter(
+            should=[
+                FieldCondition(key="type", match=MatchValue(value="file")),
+                FieldCondition(key="type", match=MatchValue(value="chunk")),
+            ]
+        )
+
+    async def count_index_documents(self, collection: str) -> int:
+        """Count file and chunk points that contribute vocabulary documents."""
+        client = await self._get_client()
+        result = await client.count(
+            collection_name=collection,
+            count_filter=self._index_document_filter(),
+            exact=True,
+        )
+        return result.count
+
+    @staticmethod
+    def _sparse_indices(point: Any, collection: str) -> list[int]:
+        """Read one named sparse vector, failing closed on malformed state."""
+        vectors = point.vector
+        sparse = vectors.get("sparse") if isinstance(vectors, dict) else None
+        sparse_value: Any = sparse
+        if sparse is None:
+            raise RuntimeError(f"Point {point.id!r} in {collection} has no named sparse vector")
+        if hasattr(sparse_value, "indices"):
+            indices = list(sparse_value.indices)
+        elif isinstance(sparse_value, dict) and isinstance(sparse_value.get("indices"), list):
+            indices = list(sparse_value["indices"])
+        else:
+            raise RuntimeError(f"Malformed sparse vector on point {point.id!r} in {collection}")
+        if not all(
+            isinstance(index, int) and not isinstance(index, bool) and index >= 0
+            for index in indices
+        ):
+            raise RuntimeError(f"Invalid sparse indices on point {point.id!r} in {collection}")
+        return indices
+
+    async def get_stored_sparse_indices_by_paths(
+        self,
+        collection: str,
+        paths: list[str],
+        path_batch_size: int = 100,
+    ) -> dict[str, list[list[int]]]:
+        """Return exact sparse token indices for many paths in bounded scans."""
+        if not paths:
+            return {}
+        client = await self._get_client()
+        result: dict[str, list[list[int]]] = {path: [] for path in paths}
+        unique_paths = sorted(set(paths))
+
+        for start in range(0, len(unique_paths), path_batch_size):
+            path_batch = unique_paths[start : start + path_batch_size]
+            offset = None
+            while True:
+                points, offset = await client.scroll(
+                    collection,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="path",
+                                match=MatchAny(any=path_batch),
+                            )
+                        ]
+                    ),
+                    limit=1000,
+                    offset=offset,
+                    with_payload=["path"],
+                    with_vectors=["sparse"],
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    path = payload.get("path")
+                    if isinstance(path, str) and path in result:
+                        result[path].append(self._sparse_indices(point, collection))
+                if offset is None:
+                    break
+        return result
+
+    async def iter_stored_sparse_indices(
+        self,
+        collection: str,
+        batch_size: int = 1000,
+    ) -> AsyncIterator[list[list[int]]]:
+        """Stream each indexed document's exact sparse vocabulary indices."""
+        client = await self._get_client()
+        offset = None
+        while True:
+            points, offset = await client.scroll(
+                collection,
+                scroll_filter=self._index_document_filter(),
+                limit=batch_size,
+                offset=offset,
+                with_payload=False,
+                with_vectors=["sparse"],
+            )
+            batch: list[list[int]] = []
+            for point in points:
+                batch.append(self._sparse_indices(point, collection))
+            if batch:
+                yield batch
+            if offset is None:
+                break
+
     # =========================================================================
     # Indexed Files Queries - Code-search-specific
     # =========================================================================
@@ -589,9 +767,7 @@ class QdrantStorage:
         metadata = await self.get_indexed_files_metadata(collection)
         return {path: meta["file_hash"] for path, meta in metadata.items()}
 
-    async def get_indexed_files_metadata(
-        self, collection: str
-    ) -> dict[str, dict[str, Any]]:
+    async def get_indexed_files_metadata(self, collection: str) -> dict[str, dict[str, Any]]:
         """
         Get full metadata for all indexed files.
 
@@ -655,9 +831,7 @@ class QdrantStorage:
         """
         conditions: list[FieldCondition] = []
         if restrict_paths:
-            conditions.append(
-                FieldCondition(key="path", match=MatchAny(any=restrict_paths))
-            )
+            conditions.append(FieldCondition(key="path", match=MatchAny(any=restrict_paths)))
         if path_text_tokens:
             conditions.append(
                 FieldCondition(key="path", match=MatchText(text=" ".join(path_text_tokens)))
@@ -697,20 +871,14 @@ class QdrantStorage:
         # Build code-search-specific filters
         filter_conditions: list[FieldCondition] = []
         if mode == "file":
-            filter_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value="file"))
-            )
+            filter_conditions.append(FieldCondition(key="type", match=MatchValue(value="file")))
         elif mode == "chunk":
-            filter_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value="chunk"))
-            )
+            filter_conditions.append(FieldCondition(key="type", match=MatchValue(value="chunk")))
         if language:
             filter_conditions.append(
                 FieldCondition(key="language", match=MatchValue(value=language))
             )
-        filter_conditions.extend(
-            self._path_pushdown_conditions(restrict_paths, path_text_tokens)
-        )
+        filter_conditions.extend(self._path_pushdown_conditions(restrict_paths, path_text_tokens))
 
         # Use vector-core's HybridSearcher for RRF fusion
         searcher = HybridSearcher(
@@ -740,7 +908,9 @@ class QdrantStorage:
             # Skip results with missing path (malformed data)
             path = p.get("path")
             if not path:
-                logger.warning(f"Skipping hybrid search result with missing path: score={generic.score}")
+                logger.warning(
+                    f"Skipping hybrid search result with missing path: score={generic.score}"
+                )
                 continue
 
             result = SearchResult(
@@ -803,20 +973,14 @@ class QdrantStorage:
         # Build filters
         filter_conditions: list[FieldCondition] = []
         if mode == "file":
-            filter_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value="file"))
-            )
+            filter_conditions.append(FieldCondition(key="type", match=MatchValue(value="file")))
         elif mode == "chunk":
-            filter_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value="chunk"))
-            )
+            filter_conditions.append(FieldCondition(key="type", match=MatchValue(value="chunk")))
         if language:
             filter_conditions.append(
                 FieldCondition(key="language", match=MatchValue(value=language))
             )
-        filter_conditions.extend(
-            self._path_pushdown_conditions(restrict_paths, path_text_tokens)
-        )
+        filter_conditions.extend(self._path_pushdown_conditions(restrict_paths, path_text_tokens))
 
         query_filter = Filter(must=filter_conditions) if filter_conditions else None  # type: ignore[arg-type]
 
@@ -841,7 +1005,9 @@ class QdrantStorage:
             # Skip results with missing path (malformed data)
             path = p.get("path")
             if not path:
-                logger.warning(f"Skipping sparse search result with missing path: point_id={point.id}")
+                logger.warning(
+                    f"Skipping sparse search result with missing path: point_id={point.id}"
+                )
                 continue
 
             result = SearchResult(
@@ -888,8 +1054,16 @@ class QdrantStorage:
     # Payload fields needed for exact match search (avoiding full content load)
     # This reduces payload size significantly (2-10x faster for large codebases)
     _EXACT_MATCH_PAYLOAD_FIELDS = [
-        "type", "path", "name", "summary", "content", "language",
-        "chunk_type", "start_line", "end_line", "line_count",
+        "type",
+        "path",
+        "name",
+        "summary",
+        "content",
+        "language",
+        "chunk_type",
+        "start_line",
+        "end_line",
+        "line_count",
     ]
 
     # Fields covered by the full-text payload indexes that pre-filter
@@ -965,9 +1139,7 @@ class QdrantStorage:
         """
         if not any(c.isalnum() for c in query):
             return False
-        return all(
-            len(word) <= self._TEXT_INDEX_MAX_TOKEN_LEN for word in query.split()
-        )
+        return all(len(word) <= self._TEXT_INDEX_MAX_TOKEN_LEN for word in query.split())
 
     async def exact_match_search(
         self,
@@ -1041,20 +1213,14 @@ class QdrantStorage:
         # Build filter
         filter_conditions = []
         if mode == "file":
-            filter_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value="file"))
-            )
+            filter_conditions.append(FieldCondition(key="type", match=MatchValue(value="file")))
         elif mode == "chunk":
-            filter_conditions.append(
-                FieldCondition(key="type", match=MatchValue(value="chunk"))
-            )
+            filter_conditions.append(FieldCondition(key="type", match=MatchValue(value="chunk")))
         if language:
             filter_conditions.append(
                 FieldCondition(key="language", match=MatchValue(value=language))
             )
-        filter_conditions.extend(
-            self._path_pushdown_conditions(restrict_paths, path_text_tokens)
-        )
+        filter_conditions.extend(self._path_pushdown_conditions(restrict_paths, path_text_tokens))
 
         query_filter = Filter(must=filter_conditions) if filter_conditions else None  # type: ignore[arg-type]
 
@@ -1073,16 +1239,12 @@ class QdrantStorage:
             # Edge-conditional assertions handle both.
             left = r"(?<!\w)" if re.match(r"\w", query) else ""
             right = r"(?!\w)" if re.search(r"\w\Z", query) else ""
-            compiled_pattern = re.compile(
-                left + re.escape(query) + right, re.IGNORECASE
-            )
+            compiled_pattern = re.compile(left + re.escape(query) + right, re.IGNORECASE)
         except re.error as e:
             logger.warning(f"Regex compilation failed for query '{query[:50]}': {e}")
             compiled_pattern = None  # Fall back to substring search
 
-        if self._text_prefilter_applicable(query) and await self._ensure_text_indexes(
-            collection
-        ):
+        if self._text_prefilter_applicable(query) and await self._ensure_text_indexes(collection):
             text_conditions = [
                 FieldCondition(key=field, match=MatchText(text=query))
                 for field in self._TEXT_INDEX_FIELDS
@@ -1090,9 +1252,15 @@ class QdrantStorage:
             fast_filter = Filter(must=filter_conditions, should=text_conditions)  # type: ignore[arg-type]
             try:
                 results = await self._exact_match_scan(
-                    client, collection, fast_filter,
-                    compiled_pattern, query_lower, query, limit,
-                    path_predicate=path_predicate, rank=rank,
+                    client,
+                    collection,
+                    fast_filter,
+                    compiled_pattern,
+                    query_lower,
+                    query,
+                    limit,
+                    path_predicate=path_predicate,
+                    rank=rank,
                 )
             except Exception as e:
                 logger.warning(
@@ -1104,9 +1272,15 @@ class QdrantStorage:
                 return results
 
         return await self._exact_match_scan(
-            client, collection, query_filter,
-            compiled_pattern, query_lower, query, limit,
-            path_predicate=path_predicate, rank=rank,
+            client,
+            collection,
+            query_filter,
+            compiled_pattern,
+            query_lower,
+            query,
+            limit,
+            path_predicate=path_predicate,
+            rank=rank,
         )
 
     async def _exact_match_scan(  # noqa: PLR0912, PLR0915
@@ -1204,9 +1378,7 @@ class QdrantStorage:
                 # Precise path constraint: skip before any match counting
                 # so path false positives cannot consume the result limit
                 # or trip early termination.
-                if path_predicate is not None and not path_predicate(
-                    str(p.get("path") or "")
-                ):
+                if path_predicate is not None and not path_predicate(str(p.get("path") or "")):
                     continue
 
                 # Check for word boundary match in searchable fields
@@ -1225,7 +1397,9 @@ class QdrantStorage:
                     # Skip results with missing path (malformed data)
                     path = p.get("path")
                     if not path:
-                        logger.warning(f"Skipping exact match result with missing path: point_id={point.id}")
+                        logger.warning(
+                            f"Skipping exact match result with missing path: point_id={point.id}"
+                        )
                         continue
 
                     # Field-based scoring: name > summary > content
@@ -1286,6 +1460,8 @@ class QdrantStorage:
         self,
         collection: str,
         codebase_path: str,
+        *,
+        indexing_in_progress: bool | None = None,
     ) -> None:
         """Store collection metadata.
 
@@ -1294,10 +1470,18 @@ class QdrantStorage:
         detected when the collection is reused. The model key is omitted when
         no model is configured (auto-detect setups that leave it empty).
         """
-        metadata: dict[str, Any] = {"codebase_path": codebase_path}
+        existing = await self._core.get_metadata(collection)
+        metadata: dict[str, Any] = dict(existing or {})
+        metadata["codebase_path"] = codebase_path
         if settings.embedding_model:
             metadata["embedding_model"] = settings.embedding_model
-        await self._core.store_metadata(collection, metadata)
+        if settings.embedding_cache_namespace:
+            metadata["embedding_cache_namespace"] = settings.embedding_cache_namespace
+        if indexing_in_progress is not None:
+            metadata["indexing_in_progress"] = indexing_in_progress
+        else:
+            metadata.setdefault("indexing_in_progress", False)
+        await _finish_qdrant_write(self._core.store_metadata(collection, metadata))
 
     async def get_metadata(self, collection: str) -> dict[str, Any] | None:
         """Get collection metadata."""
@@ -1333,7 +1517,7 @@ class QdrantStorage:
                     # e.g., abs_path="/home/user/project/src/main.py", rel_path="src/main.py"
                     # -> codebase = "/home/user/project"
                     if abs_path.endswith(rel_path):
-                        codebase: str = abs_path[:-len(rel_path)].rstrip("/")
+                        codebase: str = abs_path[: -len(rel_path)].rstrip("/")
                         return codebase
 
             return None

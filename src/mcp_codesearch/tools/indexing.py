@@ -4,6 +4,7 @@ Tools:
 - index_status: Check indexing status for a codebase
 - force_reindex: Force complete re-indexing of a codebase
 - preview_index: Preview what would be indexed without actually indexing
+- repair_vocabulary: Audit or repair sparse-vocabulary consistency
 """
 
 from __future__ import annotations
@@ -109,6 +110,55 @@ embedding server is running."""
             f"  Languages:\n{lang_lines}"
         )
     return f"Re-indexed {abs_path}:\n  Files: {files_indexed}\n  Chunks: {chunks_indexed}"
+
+
+@mcp.tool()
+@tool_error_handler
+async def repair_vocabulary(repair: bool = False, full: bool = False) -> str:
+    """Audit or repair codesearch's global sparse vocabulary.
+
+    Qdrant file and chunk points are authoritative. The audit compares their
+    counts with each collection's registered vocabulary contribution and finds
+    registrations whose Qdrant collection no longer exists. With ``repair``
+    enabled, mismatched contributions are reconstructed from stored sparse
+    vectors and stale registrations are removed. Vocabulary reconstruction does
+    not rewrite Qdrant; recovery of a pending interrupted operation may finish
+    its recorded deletion or clear an ambiguously partial path before rebuilding
+    the contribution.
+    ``full`` re-registers every live collection and also requires ``repair``;
+    use it to correct token-frequency drift that happens to preserve the count.
+    Collections are processed safely one at a time; if indexing changes the
+    collection set concurrently, run the audit again for a point-in-time report.
+    """
+    if full and not repair:
+        return "Error: full=True requires repair=True."
+
+    indexing_svc = await get_indexing_service()
+    stats = await indexing_svc.repair_vocabulary(repair=repair, full=full)
+    action = "Repair" if repair else "Audit"
+    lines = [
+        f"Vocabulary {action.lower()} complete:",
+        f"  Collections checked: {stats.collections_checked}",
+        f"  Count mismatches found: {stats.mismatches_found}",
+        f"  Stale registrations found: {stats.stale_registrations}",
+        f"  Pending intents found: {stats.pending_intents}",
+        f"  Registered documents before: {stats.documents_before}",
+        f"  Registered documents after: {stats.documents_after}",
+    ]
+    if repair:
+        lines.extend(
+            [
+                f"  Collections reconstructed: {stats.collections_repaired}",
+                f"  Stale registrations removed: {stats.registrations_removed}",
+                f"  Interrupted operations recovered: {stats.intents_recovered}",
+                "  Aggregate frequencies rebuilt: "
+                f"{'yes' if stats.aggregate_frequencies_rebuilt else 'no'}",
+            ]
+        )
+    if stats.failures:
+        lines.append(f"  Failures: {len(stats.failures)}")
+        lines.extend(f"    {failure}" for failure in stats.failures)
+    return "\n".join(lines)
 
 
 @mcp.tool()
