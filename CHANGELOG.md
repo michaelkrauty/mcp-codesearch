@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.9.0] - 2026-10-01
+
+### Fixed
+
+- Embedding configuration changes automatically select a separate physical index and sparse vocabulary. The next search rebuilds from source files using the existing crash-resumable indexing pipeline, while previous collections and vocabularies remain intact. Returning to a previous configuration reconciles source edits and deletions before searching. Legacy indexes with unknown model provenance are preserved rather than stamped with the current model. Addresses #82.
+- Collection routing and search-result caches use a frozen embedding identity covering the model, deployment, endpoint, resolved dimension, and preprocessing configuration. Queries use the query embedding role; indexed content uses the document role.
+- Vocabulary repair, deletion, and orphan cleanup operate only on the selected embedding generation. Collection inventory also lists retained generations without enrolling them in maintenance.
+- Integration fixtures honor the configured Qdrant endpoint instead of silently connecting to a hardcoded server.
+
 ## [1.8.0] - 2026-09-04
 
 ### Added

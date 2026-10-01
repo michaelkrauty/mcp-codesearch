@@ -1,12 +1,22 @@
 """Tests for server module helper functions and logic."""
 
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_codesearch.helpers import validate_git_since
 from mcp_codesearch.services import IndexingStats
+from mcp_codesearch.storage.qdrant import configured_identity
+
+
+@pytest.fixture(autouse=True)
+def resolved_embedding_identity(monkeypatch):
+    """Singleton lifecycle tests do not require an external embedding server."""
+    monkeypatch.setattr(
+        "vector_core.EmbeddingClient.resolve_identity",
+        AsyncMock(return_value=configured_identity()),
+    )
 
 
 def is_error_result(result) -> bool:
@@ -262,7 +272,7 @@ class TestSyncCleanup:
 
             mock_loop.create_task = capture_create_task
 
-            with patch.object(asyncio, 'get_running_loop', return_value=mock_loop):
+            with patch.object(asyncio, "get_running_loop", return_value=mock_loop):
                 _sync_cleanup()
 
             # Verify create_task was called with a coroutine
@@ -295,8 +305,10 @@ class TestSyncCleanup:
             def capture_run(coro):
                 captured_coros.append(coro)
 
-            with patch.object(asyncio, 'get_running_loop', side_effect=RuntimeError("No running loop")):
-                with patch.object(asyncio, 'run', side_effect=capture_run):
+            with patch.object(
+                asyncio, "get_running_loop", side_effect=RuntimeError("No running loop")
+            ):
+                with patch.object(asyncio, "run", side_effect=capture_run):
                     _sync_cleanup()
 
             # Verify asyncio.run was called with cleanup coroutine
@@ -325,9 +337,13 @@ class TestSyncCleanup:
             def capture_run(coro):
                 captured_coros.append(coro)
 
-            with patch.object(asyncio, 'get_running_loop', side_effect=RuntimeError("No running loop")):
-                with patch.object(asyncio, 'get_event_loop', side_effect=RuntimeError("No event loop")):
-                    with patch.object(asyncio, 'run', side_effect=capture_run):
+            with patch.object(
+                asyncio, "get_running_loop", side_effect=RuntimeError("No running loop")
+            ):
+                with patch.object(
+                    asyncio, "get_event_loop", side_effect=RuntimeError("No event loop")
+                ):
+                    with patch.object(asyncio, "run", side_effect=capture_run):
                         _sync_cleanup()
 
             # Verify asyncio.run was called
@@ -352,7 +368,7 @@ class TestSyncCleanup:
         server_module._indexing_service.reset()
         server_module._search_service.reset()
 
-        with patch.object(asyncio, 'get_running_loop') as mock_get_loop:
+        with patch.object(asyncio, "get_running_loop") as mock_get_loop:
             _sync_cleanup()
 
             # Should not have tried to get a loop since nothing is initialized
@@ -449,10 +465,7 @@ class TestInputValidation:
         """Invalid paths in list returns error."""
         from mcp_codesearch.server import search_multiple
 
-        result = await search_multiple(
-            query="test",
-            paths=[str(tmp_path / "nonexistent")]
-        )
+        result = await search_multiple(query="test", paths=[str(tmp_path / "nonexistent")])
         assert is_error_result(result)
         assert error_contains(result, "invalid") or error_contains(result, "does not exist")
 
@@ -492,23 +505,26 @@ class TestValidateGitSince:
     """Tests for git 'since' parameter validation."""
 
     # Valid inputs that don't need transformation (return empty string)
-    @pytest.mark.parametrize("since", [
-        "HEAD",
-        "HEAD~1",
-        "HEAD~10",
-        "HEAD~999",
-        "HEAD@{1}",
-        "main",
-        "master",
-        "develop",
-        "feature/my-branch",
-        "v1.0",
-        "v1.0.0",
-        "release-2.0",
-        "abc123",
-        "abc123def456",
-        "1234567890abcdef1234567890abcdef12345678",  # Full SHA
-    ])
+    @pytest.mark.parametrize(
+        "since",
+        [
+            "HEAD",
+            "HEAD~1",
+            "HEAD~10",
+            "HEAD~999",
+            "HEAD@{1}",
+            "main",
+            "master",
+            "develop",
+            "feature/my-branch",
+            "v1.0",
+            "v1.0.0",
+            "release-2.0",
+            "abc123",
+            "abc123def456",
+            "1234567890abcdef1234567890abcdef12345678",  # Full SHA
+        ],
+    )
     def test_valid_since_values(self, since: str):
         """Valid since values should pass validation with empty result."""
         is_valid, result = validate_git_since(since)
@@ -516,18 +532,21 @@ class TestValidateGitSince:
         assert result == "", f"Expected empty string for non-.ago pattern, got: {result}"
 
     # Valid .ago inputs that get transformed (return transformed value)
-    @pytest.mark.parametrize("since,expected", [
-        ("1.day.ago", "1 day ago"),
-        ("3.days.ago", "3 days ago"),
-        ("1.week.ago", "1 week ago"),
-        ("2.weeks.ago", "2 weeks ago"),
-        ("1.month.ago", "1 month ago"),
-        ("6.months.ago", "6 months ago"),
-        ("1.year.ago", "1 year ago"),
-        ("30.seconds.ago", "30 seconds ago"),
-        ("5.minutes.ago", "5 minutes ago"),
-        ("2.hours.ago", "2 hours ago"),
-    ])
+    @pytest.mark.parametrize(
+        "since,expected",
+        [
+            ("1.day.ago", "1 day ago"),
+            ("3.days.ago", "3 days ago"),
+            ("1.week.ago", "1 week ago"),
+            ("2.weeks.ago", "2 weeks ago"),
+            ("1.month.ago", "1 month ago"),
+            ("6.months.ago", "6 months ago"),
+            ("1.year.ago", "1 year ago"),
+            ("30.seconds.ago", "30 seconds ago"),
+            ("5.minutes.ago", "5 minutes ago"),
+            ("2.hours.ago", "2 hours ago"),
+        ],
+    )
     def test_valid_ago_values_transformed(self, since: str, expected: str):
         """Valid .ago values should pass validation and return transformed value."""
         is_valid, result = validate_git_since(since)
@@ -535,15 +554,18 @@ class TestValidateGitSince:
         assert result == expected, f"Expected '{expected}', got '{result}'"
 
     # Invalid inputs - dangerous patterns
-    @pytest.mark.parametrize("since,expected_error", [
-        ("", "'since' parameter cannot be empty"),
-        ("   ", "'since' parameter cannot be empty"),
-        ("-help", "cannot start with '-'"),
-        ("--version", "cannot start with '-'"),
-        ("-o /etc/passwd", "cannot start with '-'"),
-        ("main..HEAD", "Revision ranges"),
-        ("HEAD..main", "Revision ranges"),
-    ])
+    @pytest.mark.parametrize(
+        "since,expected_error",
+        [
+            ("", "'since' parameter cannot be empty"),
+            ("   ", "'since' parameter cannot be empty"),
+            ("-help", "cannot start with '-'"),
+            ("--version", "cannot start with '-'"),
+            ("-o /etc/passwd", "cannot start with '-'"),
+            ("main..HEAD", "Revision ranges"),
+            ("HEAD..main", "Revision ranges"),
+        ],
+    )
     def test_invalid_dangerous_patterns(self, since: str, expected_error: str):
         """Dangerous patterns should be rejected."""
         is_valid, error_msg = validate_git_since(since)
@@ -551,17 +573,20 @@ class TestValidateGitSince:
         assert expected_error in error_msg
 
     # Invalid inputs - malformed values
-    @pytest.mark.parametrize("since", [
-        "_underscore",  # Starts with underscore
-        "spaces in name",
-        "semi;colon",
-        "back`tick",
-        "$(whoami)",
-        "${HOME}",
-        "foo\nbar",
-        "foo\rbar",
-        "123_not_hex",  # Numbers with invalid hex chars
-    ])
+    @pytest.mark.parametrize(
+        "since",
+        [
+            "_underscore",  # Starts with underscore
+            "spaces in name",
+            "semi;colon",
+            "back`tick",
+            "$(whoami)",
+            "${HOME}",
+            "foo\nbar",
+            "foo\rbar",
+            "123_not_hex",  # Numbers with invalid hex chars
+        ],
+    )
     def test_invalid_malformed_values(self, since: str):
         """Malformed values should be rejected."""
         is_valid, error_msg = validate_git_since(since)
@@ -569,11 +594,14 @@ class TestValidateGitSince:
         assert "Invalid 'since' format" in error_msg or "cannot" in error_msg
 
     # Edge cases - valid branch names (should pass even if unusual)
-    @pytest.mark.parametrize("since", [
-        "notavalidformat",  # Valid branch name (starts with letter)
-        "abc123",  # Could be short commit hash (4+ hex chars)
-        "abc",  # Too short for commit hash but valid branch
-    ])
+    @pytest.mark.parametrize(
+        "since",
+        [
+            "notavalidformat",  # Valid branch name (starts with letter)
+            "abc123",  # Could be short commit hash (4+ hex chars)
+            "abc",  # Too short for commit hash but valid branch
+        ],
+    )
     def test_edge_case_valid_values(self, since: str):
         """Edge cases that look weird but are actually valid git refs."""
         is_valid, error_msg = validate_git_since(since)
@@ -586,14 +614,17 @@ class TestMainFunction:
     def test_main_exists_and_callable(self):
         """main() function exists and is callable."""
         from mcp_codesearch.server import main
+
         assert callable(main)
 
     def test_main_with_mock_mcp_run(self):
         """main() calls mcp.run()."""
         from mcp_codesearch import server
 
-        with patch.object(server, "mcp") as mock_mcp, \
-             patch("mcp_codesearch.server.verify_tools_registered"):
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("mcp_codesearch.server.verify_tools_registered"),
+        ):
             mock_mcp.run = MagicMock()
             server.main()
             mock_mcp.run.assert_called_once_with(transport="stdio")
@@ -695,8 +726,7 @@ class TestCacheInvalidationOnDeletion:
 
         # With the fix, index_changed should be True
         assert index_changed is True, (
-            "Cache should be invalidated when files_deleted > 0 "
-            "even if files_indexed == 0"
+            "Cache should be invalidated when files_deleted > 0 even if files_indexed == 0"
         )
 
     def test_cache_invalidation_logic_no_changes(self):

@@ -98,7 +98,7 @@ def helper_function():
 @pytest.fixture
 def sample_typescript_code():
     """Sample TypeScript code for testing."""
-    return '''/**
+    return """/**
  * Module for handling user operations.
  */
 
@@ -123,13 +123,13 @@ class UserServiceImpl implements UserService {
 export function createUserService(): UserService {
     return new UserServiceImpl();
 }
-'''
+"""
 
 
 @pytest.fixture
 def sample_rust_code():
     """Sample Rust code for testing."""
-    return '''//! Crate-level documentation.
+    return """//! Crate-level documentation.
 //! This module handles data processing.
 
 use std::io;
@@ -155,7 +155,7 @@ impl Processor {
 fn helper() {
     // Internal helper
 }
-'''
+"""
 
 
 @pytest.fixture
@@ -177,7 +177,7 @@ if __name__ == "__main__":
 ''')
 
     # TypeScript file
-    (src_dir / "utils.ts").write_text('''/**
+    (src_dir / "utils.ts").write_text("""/**
  * Utility functions.
  */
 
@@ -188,7 +188,7 @@ export function formatDate(date: Date): string {
 export function parseNumber(s: string): number {
     return parseInt(s, 10);
 }
-''')
+""")
 
     # Tests directory
     test_dir = tmp_path / "tests"
@@ -202,14 +202,17 @@ def test_main():
 
     # Track collection name for cleanup
     from mcp_codesearch.storage.qdrant import collection_name
+
     col_name = collection_name(str(tmp_path.resolve()))
 
     yield tmp_path
 
     # Cleanup: Delete Qdrant collection
     import asyncio
+
     try:
         from mcp_codesearch.storage.qdrant import QdrantStorage
+
         storage = QdrantStorage()
 
         async def cleanup():
@@ -233,12 +236,14 @@ def empty_file_content():
 @pytest.fixture
 def large_class_code():
     """Python class with many methods for testing class overview generation."""
-    methods = "\n\n".join([
-        f'''    def method_{i}(self, arg):
+    methods = "\n\n".join(
+        [
+            f'''    def method_{i}(self, arg):
         """Method {i} docstring."""
         return arg * {i}'''
-        for i in range(30)
-    ])
+            for i in range(30)
+        ]
+    )
 
     return f'''"""Large class module."""
 
@@ -247,32 +252,3 @@ class LargeClass:
 
 {methods}
 '''
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Clean up orphaned collections at end of test session."""
-    import asyncio
-
-    from mcp_codesearch.storage.qdrant import QdrantStorage
-
-    async def cleanup():
-        storage = QdrantStorage()
-        try:
-            collections = await storage.list_collections()
-            for col in collections:
-                # Only clean up test collections (paths that don't exist)
-                path = await storage.infer_codebase_path(col)
-                if path and "pytest" in path:
-                    try:
-                        await storage.delete_collection(col)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        finally:
-            await storage.close()
-
-    try:
-        asyncio.run(cleanup())
-    except Exception:
-        pass

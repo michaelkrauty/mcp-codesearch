@@ -3,6 +3,7 @@
 import asyncio
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -56,6 +57,10 @@ def _make_service() -> IndexingService:
     vocab.get_codebase_ids = MagicMock(return_value=[])
     vocab.get_tokens_by_indices = MagicMock(return_value={})
     storage = MagicMock()
+    storage.identity = storage_qdrant.configured_identity()
+    storage.collection_name.side_effect = lambda path: storage_qdrant.collection_name(
+        path, storage.identity
+    )
     storage.count_index_documents = AsyncMock(return_value=0)
     storage.get_metadata = AsyncMock(return_value=None)
     storage.store_metadata = AsyncMock()
@@ -156,12 +161,11 @@ class TestPrepareFilesFaultIsolation:
 
 
 class TestVerifyEmbeddingDim:
-    """Reusing a collection whose dense vectors no longer match the configured
-    embedding dimension is refused, but an unknown/unreadable dim never blocks."""
+    """The frozen dimension gates reuse; absent stored dimensions remain unknown."""
 
     async def test_raises_on_dimension_mismatch(self, monkeypatch):
         service = _make_service()
-        monkeypatch.setattr(idx_svc, "settings", SimpleNamespace(embedding_dim=4096))
+        service._storage.identity = replace(service._storage.identity, dimension=4096)
         service._storage.get_dense_dim = AsyncMock(return_value=768)
 
         with pytest.raises(EmbeddingDimMismatchError) as excinfo:
@@ -176,26 +180,28 @@ class TestVerifyEmbeddingDim:
 
     async def test_passes_when_dimension_matches(self, monkeypatch):
         service = _make_service()
-        monkeypatch.setattr(idx_svc, "settings", SimpleNamespace(embedding_dim=4096))
+        service._storage.identity = replace(service._storage.identity, dimension=4096)
         service._storage.get_dense_dim = AsyncMock(return_value=4096)
 
         # Must not raise.
         await service._verify_embedding_dim("codesearch_abc")
 
-    async def test_skips_storage_when_expected_dim_unknown(self, monkeypatch):
-        """embedding_dim==0 means auto-detect has not resolved; do not even query."""
+    async def test_uses_frozen_dimension_when_settings_become_unresolved(self, monkeypatch):
+        """Later settings mutations cannot disable a resolved identity's guard."""
         service = _make_service()
+        service._storage.identity = replace(service._storage.identity, dimension=4096)
         monkeypatch.setattr(idx_svc, "settings", SimpleNamespace(embedding_dim=0))
         service._storage.get_dense_dim = AsyncMock(return_value=768)
 
-        await service._verify_embedding_dim("codesearch_abc")
+        with pytest.raises(EmbeddingDimMismatchError):
+            await service._verify_embedding_dim("codesearch_abc")
 
-        service._storage.get_dense_dim.assert_not_called()
+        service._storage.get_dense_dim.assert_awaited_once_with("codesearch_abc")
 
     async def test_skips_when_stored_dim_unreadable(self, monkeypatch):
         """A stored dim of None ('cannot verify') is not treated as a mismatch."""
         service = _make_service()
-        monkeypatch.setattr(idx_svc, "settings", SimpleNamespace(embedding_dim=4096))
+        service._storage.identity = replace(service._storage.identity, dimension=4096)
         service._storage.get_dense_dim = AsyncMock(return_value=None)
 
         await service._verify_embedding_dim("codesearch_abc")
@@ -244,6 +250,7 @@ class TestIndexGuardBranch:
         """A service with the cross-process lock and stale-lock cleanup neutralized
         so index() can be driven without filesystem side effects."""
         service = _make_service()
+        service._verify_embedding_identity = AsyncMock()
         service._stale_locks_cleaned = True  # skip cleanup_stale_locks()
 
         @asynccontextmanager
@@ -308,7 +315,7 @@ class TestIndexGuardBranch:
         service._storage.delete_collection.assert_not_awaited()
         service._storage.create_collection.assert_not_awaited()
         service._storage.store_metadata.assert_awaited_once_with(
-            "codesearch_79903f0c2002",
+            service._storage.collection_name("/proj"),
             "/proj",
             indexing_in_progress=False,
         )
@@ -322,7 +329,7 @@ class TestIndexGuardBranch:
         service._storage.store_metadata = AsyncMock()
         service._verify_embedding_dim = AsyncMock(
             side_effect=EmbeddingDimMismatchError(
-                "codesearch_79903f0c2002",
+                service._storage.collection_name("/proj"),
                 expected=4096,
                 actual=768,
             )
@@ -338,7 +345,7 @@ class TestIndexGuardBranch:
 
     async def test_fresh_index_removes_contribution_without_count(self, monkeypatch):
         service = self._ready_service(monkeypatch)
-        collection = "codesearch_79903f0c2002"
+        collection = service._storage.collection_name("/proj")
         service._storage.collection_exists = AsyncMock(return_value=False)
         service._storage.create_collection = AsyncMock()
         service._storage.store_metadata = AsyncMock()
@@ -365,7 +372,7 @@ class TestIndexGuardBranch:
             await service.index("/proj")
 
         service._storage.store_metadata.assert_awaited_once_with(
-            "codesearch_79903f0c2002",
+            service._storage.collection_name("/proj"),
             "/proj",
             indexing_in_progress=True,
         )
@@ -394,16 +401,12 @@ class TestAutoIndexDimMismatchSurface:
 
 class TestVerifyEmbeddingModel:
     """Reusing a collection recorded under a different embedding model is
-    refused even when dimensions match; unknown/legacy metadata never blocks."""
+    refused even when dimensions match; unknown provenance also blocks."""
 
     @staticmethod
     def _service_with_metadata(monkeypatch, metadata, model="Qwen3-Embedding-8B", dim=4096):
         service = _make_service()
-        monkeypatch.setattr(
-            idx_svc,
-            "settings",
-            SimpleNamespace(embedding_model=model, embedding_dim=dim),
-        )
+        service._storage.identity = replace(service._storage.identity, model=model, dimension=dim)
         service._storage.get_metadata = AsyncMock(return_value=metadata)
         service._storage.store_metadata = AsyncMock()
         return service
@@ -434,47 +437,51 @@ class TestVerifyEmbeddingModel:
 
         service._storage.store_metadata.assert_not_called()
 
-    async def test_skips_storage_when_no_model_configured(self, monkeypatch):
-        """An empty configured model (auto-detect setups) disables the guard."""
+    async def test_missing_provenance_rejected_even_when_model_empty(self, monkeypatch):
         service = self._service_with_metadata(monkeypatch, None, model="")
 
-        await service._verify_embedding_model("codesearch_abc", "/proj")
+        with pytest.raises(EmbeddingModelMismatchError):
+            await service._verify_embedding_model("codesearch_abc", "/proj")
 
-        service._storage.get_metadata.assert_not_called()
+        service._storage.get_metadata.assert_awaited_once_with("codesearch_abc")
         service._storage.store_metadata.assert_not_called()
 
-    async def test_backfills_when_metadata_missing(self, monkeypatch):
-        """A collection with no metadata point gets stamped with the current model."""
+    async def test_rejects_missing_metadata_without_backfill(self, monkeypatch):
         service = self._service_with_metadata(monkeypatch, None)
 
-        await service._verify_embedding_model("codesearch_abc", "/proj")
+        with pytest.raises(EmbeddingModelMismatchError):
+            await service._verify_embedding_model("codesearch_abc", "/proj")
 
-        service._storage.store_metadata.assert_awaited_once_with("codesearch_abc", "/proj")
+        service._storage.store_metadata.assert_not_called()
 
-    async def test_backfills_when_model_key_absent(self, monkeypatch):
-        """Metadata written before this guard exists lacks the model key."""
+    async def test_rejects_absent_model_key_without_backfill(self, monkeypatch):
         service = self._service_with_metadata(monkeypatch, {"codebase_path": "/proj"})
 
-        await service._verify_embedding_model("codesearch_abc", "/proj")
+        with pytest.raises(EmbeddingModelMismatchError):
+            await service._verify_embedding_model("codesearch_abc", "/proj")
 
-        service._storage.store_metadata.assert_awaited_once_with("codesearch_abc", "/proj")
+        service._storage.store_metadata.assert_not_called()
 
-    async def test_backfill_skipped_while_dim_unresolved(self, monkeypatch):
-        """Metadata writes need a placeholder dense vector; don't stamp at dim 0."""
-        service = self._service_with_metadata(monkeypatch, None, dim=0)
+    async def test_model_guard_uses_frozen_identity(self, monkeypatch):
+        service = self._service_with_metadata(
+            monkeypatch, {"embedding_model": "Qwen3-Embedding-8B"}
+        )
+        monkeypatch.setattr(idx_svc, "settings", SimpleNamespace(embedding_model="changed"))
 
         await service._verify_embedding_model("codesearch_abc", "/proj")
 
         service._storage.store_metadata.assert_not_called()
 
-    async def test_non_string_stored_model_fails_open(self, monkeypatch):
-        """A JSON-coerced or foreign stored value is 'cannot verify', not a mismatch."""
+    @pytest.mark.parametrize("stored_model", [123, None, [], {}])
+    async def test_malformed_stored_model_fails_closed(self, monkeypatch, stored_model):
         service = self._service_with_metadata(
-            monkeypatch, {"codebase_path": "/proj", "embedding_model": 123}
+            monkeypatch, {"codebase_path": "/proj", "embedding_model": stored_model}
         )
 
-        await service._verify_embedding_model("codesearch_abc", "/proj")
+        with pytest.raises(EmbeddingModelMismatchError) as excinfo:
+            await service._verify_embedding_model("codesearch_abc", "/proj")
 
+        assert excinfo.value.actual == stored_model
         service._storage.store_metadata.assert_not_called()
 
 
@@ -484,6 +491,7 @@ class TestIndexBranchInvokesModelGuard:
     @staticmethod
     def _ready_service(monkeypatch) -> IndexingService:
         service = _make_service()
+        service._verify_embedding_identity = AsyncMock()
         service._stale_locks_cleaned = True
 
         @asynccontextmanager
@@ -521,7 +529,7 @@ class TestIndexBranchInvokesModelGuard:
         result = await service.index("/proj")
 
         service._verify_embedding_model.assert_awaited_once()
-        # The guard receives the resolved absolute path for backfill stamping.
+        # The guard receives the resolved absolute path.
         args = service._verify_embedding_model.await_args.args
         assert args[1] == str(Path("/proj").resolve())
         assert result == (0, 0, None)
@@ -554,16 +562,23 @@ class TestAutoIndexModelMismatchSurface:
 
 
 class TestEmbeddingDeploymentGuard:
+    async def test_uses_frozen_namespace_after_settings_change(self, monkeypatch):
+        service = _make_service()
+        service._storage.identity = replace(service._storage.identity, namespace="revision-a")
+        service._storage.get_metadata = AsyncMock(
+            return_value={"embedding_cache_namespace": "revision-a"}
+        )
+        monkeypatch.setattr(
+            idx_svc, "settings", SimpleNamespace(embedding_cache_namespace="revision-b")
+        )
+
+        await service._verify_embedding_deployment("codesearch_abc", "/proj")
+
+        service._storage.store_metadata.assert_not_called()
+
     async def test_rejects_different_explicit_deployment(self, monkeypatch):
         service = _make_service()
-        monkeypatch.setattr(
-            idx_svc,
-            "settings",
-            SimpleNamespace(
-                embedding_cache_namespace="revision-b",
-                embedding_dim=4096,
-            ),
-        )
+        service._storage.identity = replace(service._storage.identity, namespace="revision-b")
         service._storage.get_metadata = AsyncMock(
             return_value={"embedding_cache_namespace": "revision-a"}
         )
@@ -571,45 +586,37 @@ class TestEmbeddingDeploymentGuard:
         with pytest.raises(EmbeddingDeploymentMismatchError):
             await service._verify_embedding_deployment("codesearch_abc", "/proj")
 
-    async def test_backfills_legacy_deployment_identity(self, monkeypatch):
+    async def test_rejects_legacy_deployment_identity_without_backfill(self, monkeypatch):
         service = _make_service()
-        monkeypatch.setattr(
-            idx_svc,
-            "settings",
-            SimpleNamespace(
-                embedding_cache_namespace="revision-a",
-                embedding_dim=4096,
-            ),
-        )
+        service._storage.identity = replace(service._storage.identity, namespace="revision-a")
         service._storage.get_metadata = AsyncMock(return_value={})
         service._storage.store_metadata = AsyncMock()
 
-        await service._verify_embedding_deployment("codesearch_abc", "/proj")
+        with pytest.raises(EmbeddingDeploymentMismatchError):
+            await service._verify_embedding_deployment("codesearch_abc", "/proj")
 
-        service._storage.store_metadata.assert_awaited_once_with("codesearch_abc", "/proj")
+        service._storage.store_metadata.assert_not_called()
 
 
 class TestStoreMetadataRecordsModel:
-    """The storage wrapper records the configured embedding model."""
+    """The storage wrapper records its frozen embedding identity."""
 
     @staticmethod
     def _storage(monkeypatch, model, namespace=None):
-        storage = QdrantStorage(url="http://localhost:6333")
+        identity = replace(storage_qdrant.configured_identity(), model=model, namespace=namespace)
+        storage = QdrantStorage(url="http://localhost:6333", identity=identity)
         storage._core = MagicMock()
         storage._core.get_metadata = AsyncMock(return_value=None)
         storage._core.store_metadata = AsyncMock()
-        monkeypatch.setattr(
-            storage_qdrant,
-            "settings",
-            SimpleNamespace(
-                embedding_model=model,
-                embedding_cache_namespace=namespace,
-            ),
-        )
         return storage
 
     async def test_records_model_when_configured(self, monkeypatch):
         storage = self._storage(monkeypatch, "Qwen3-Embedding-8B")
+        monkeypatch.setattr(
+            storage_qdrant,
+            "settings",
+            SimpleNamespace(embedding_model="changed", embedding_cache_namespace="changed"),
+        )
 
         await storage.store_metadata("codesearch_abc", "/proj")
 
@@ -618,6 +625,8 @@ class TestStoreMetadataRecordsModel:
             {
                 "codebase_path": "/proj",
                 "embedding_model": "Qwen3-Embedding-8B",
+                "embedding_identity": storage.identity.to_dict(),
+                "embedding_cache_namespace": None,
                 "indexing_in_progress": False,
             },
         )
@@ -636,19 +645,26 @@ class TestStoreMetadataRecordsModel:
             {
                 "codebase_path": "/proj",
                 "embedding_model": "Qwen3-Embedding-8B",
+                "embedding_identity": storage.identity.to_dict(),
                 "embedding_cache_namespace": "revision-a",
                 "indexing_in_progress": False,
             },
         )
 
-    async def test_omits_model_when_unconfigured(self, monkeypatch):
+    async def test_records_explicit_identity_when_model_empty(self, monkeypatch):
         storage = self._storage(monkeypatch, "")
 
         await storage.store_metadata("codesearch_abc", "/proj")
 
         storage._core.store_metadata.assert_awaited_once_with(
             "codesearch_abc",
-            {"codebase_path": "/proj", "indexing_in_progress": False},
+            {
+                "codebase_path": "/proj",
+                "embedding_model": "",
+                "embedding_identity": storage.identity.to_dict(),
+                "embedding_cache_namespace": None,
+                "indexing_in_progress": False,
+            },
         )
 
 

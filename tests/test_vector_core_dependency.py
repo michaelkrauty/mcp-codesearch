@@ -29,10 +29,10 @@ def test_readme_install_example_uses_current_vector_core_pin() -> None:
     assert "mcp-codesearch.git@v1.0.0" not in readme
 
 
-def test_project_version_is_v1_8_0() -> None:
+def test_project_version_is_v1_9_0() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert pyproject["project"]["version"] == "1.8.0"
+    assert pyproject["project"]["version"] == "1.9.0"
 
 
 def test_runtime_version_matches_project_metadata() -> None:

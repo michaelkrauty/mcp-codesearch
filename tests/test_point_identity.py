@@ -107,7 +107,9 @@ async def _upserted_points(service: IndexingService, prepared: PreparedFile) -> 
         upserted.extend(points)
 
     service._storage.upsert_batch = capture
-    service._embedder.embed_all = AsyncMock(side_effect=lambda texts: [[0.1] for _ in texts])
+    service._embedder.embed_all = AsyncMock(
+        side_effect=lambda texts, *, role: [[0.1] for _ in texts]
+    )
     service._global_vocab.vectorize_document = MagicMock(
         return_value=SparseVector(indices=[], values=[])
     )

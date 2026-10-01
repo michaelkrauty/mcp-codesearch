@@ -1,6 +1,6 @@
 [project]
 name = "mcp-codesearch"
-version = "1.8.0"
+version = "1.9.0"
 description = "Semantic code search MCP server using Qdrant and OpenAI-compatible embeddings"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,6 +21,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/michaelkrauty/mcp-codesearch"
 Repository = "https://github.com/michaelkrauty/mcp-codesearch"
+
+[project.optional-dependencies]
+tokenizer = ["vector-core[tokenizer]"]
 
 # A dependency group rather than an extra: `uv sync` installs it by default,
 # so `uv run pytest` finds pytest in the project environment. As an extra it

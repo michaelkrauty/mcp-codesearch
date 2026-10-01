@@ -208,7 +208,7 @@ search_changed("config", since="3.days.ago")
 | `VECTOR_EMBEDDING_CACHE_NAMESPACE` | *(unset)* | Stable deployed model revision; setting it enables persistent exact-input embedding reuse |
 | `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Active embedding HTTP attempts across local MCP processes; `0` disables the global limit |
 
-> **Changing the embedding model.** A codebase's index is tied to the embedding model it was built with. If you switch `VECTOR_EMBEDDING_MODEL`, the next search or index of that codebase fails fast with a clear error pointing at `force_reindex`, instead of a cryptic Qdrant dimension error (different-dimension swap) or silently meaningless results from incompatible embedding spaces (same-dimension swap — the model name is recorded in each collection's metadata and checked on reuse). Run `force_reindex` on the affected codebase to rebuild it with the new model — each codebase is reindexed independently.
+> **Changing the embedding model.** Restart the MCP server after changing embedding configuration. The next search builds a separate index from source files, with its own sparse vocabulary; no `force_reindex` is required. The embedding identity includes the model, deployment namespace, endpoint, verified vector dimension, and input preprocessing. Previous collections and vocabulary databases are retained, including legacy indexes whose provenance is unknown. `list_collections` shows retained generations, while status, repair, deletion, and orphan cleanup operate only on the configured identity. Returning to a previous configuration reuses that generation after reconciling source edits and deletions. Change `VECTOR_EMBEDDING_CACHE_NAMESPACE` whenever the same model name serves different weights or behavior.
 
 Codesearch-specific settings (configured via environment variables with the `CODESEARCH_` prefix):
 
@@ -278,12 +278,13 @@ Ignored directories are pruned during traversal, so excluded subtrees cost nothi
 
 | Data | Location |
 |------|----------|
-| Index | Qdrant collection `codesearch_{path_hash}` |
+| Index | Qdrant collection `csg_{embedding_identity}_{path_hash}` |
 | Metadata | Stored in Qdrant point payloads |
+| Sparse vocabulary | `~/.cache/vector-core/codesearch_vocabulary_{embedding_identity}.db` |
 | Embedding cache | `~/.cache/vector-core/embeddings.db` when a namespace is configured |
 | Recovery journal | `~/.cache/vector-core/codesearch_index_journal_v2.db` |
 
-Each indexed codebase gets a unique collection based on path hash.
+Each indexed codebase gets a unique collection for its path and embedding identity. Retained generations are never automatically deleted.
 
 ## Supported Languages
 
