@@ -28,6 +28,7 @@ from vector_core import (
     cleanup_stale_locks,
     sparse_to_qdrant,
 )
+from vector_core.embeddings.identity import EmbeddingIdentity
 
 from mcp_codesearch.indexer.change_detect import ChangeSet, detect_changes_fast
 from mcp_codesearch.indexer.chunker import (
@@ -51,7 +52,6 @@ from mcp_codesearch.storage.qdrant import (
     EmbeddingDimMismatchError,
     EmbeddingModelMismatchError,
     QdrantStorage,
-    collection_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -197,10 +197,11 @@ class IndexingService:
         self._storage = storage
         self._embedder = embedder
         self._global_vocab = global_vocab
-        storage_identity = settings.consistency_namespace or "\0".join(
+        storage_identity = "\0".join(
             (
-                _canonical_qdrant_identity(str(storage.url)),
+                settings.consistency_namespace or _canonical_qdrant_identity(str(storage.url)),
                 str(Path(global_vocab.db_path).resolve()),
+                str(storage.identity.fingerprint),
             )
         )
         self._consistency_scope = hashlib.sha256(storage_identity.encode()).hexdigest()[:16]
@@ -285,7 +286,7 @@ class IndexingService:
         await self._ensure_stale_locks_cleaned()
 
         abs_path = str(Path(codebase_path).resolve())
-        col_name = collection_name(abs_path)
+        col_name = self._storage.collection_name(abs_path)
         await self.recover_pending_intents(skip={col_name} if force else None)
 
         # Acquire cross-process lock for this collection
@@ -309,6 +310,7 @@ class IndexingService:
                     await self._verify_embedding_dim(col_name)
                     await self._verify_embedding_model(col_name, abs_path)
                     await self._verify_embedding_deployment(col_name, abs_path)
+                    await self._verify_embedding_identity(col_name)
                     compatibility_verified = True
                 except (
                     EmbeddingDeploymentMismatchError,
@@ -364,6 +366,7 @@ class IndexingService:
                     await self._verify_embedding_dim(col_name)
                     await self._verify_embedding_model(col_name, abs_path)
                     await self._verify_embedding_deployment(col_name, abs_path)
+                    await self._verify_embedding_identity(col_name)
                 await self._reconcile_if_count_mismatch(col_name)
 
                 # Incremental index with fast change detection
@@ -410,7 +413,7 @@ class IndexingService:
         collection config (``get_dense_dim`` returns ``None``); a genuine Qdrant
         read failure propagates to the caller's existing error handling.
         """
-        expected = settings.embedding_dim
+        expected = self._storage.identity.dimension
         if not expected:
             return
         stored = await self._storage.get_dense_dim(col_name)
@@ -418,42 +421,15 @@ class IndexingService:
             raise EmbeddingDimMismatchError(col_name, expected=expected, actual=stored)
 
     async def _verify_embedding_model(self, col_name: str, codebase_path: str) -> None:
-        """Refuse to reuse a collection whose vectors were embedded with a
-        different model, even when the output dimension matches.
+        """Reject unknown provenance; retained legacy indexes are never stamped.
 
-        The dimension guard above catches model swaps that change the vector
-        size. This guard catches the silent case — same dimension, different
-        model — where every Qdrant operation succeeds but query vectors and
-        stored vectors come from incompatible embedding spaces, so searches
-        quietly return meaningless results. The model name is recorded in
-        collection metadata at index time and compared on every reuse.
-
-        Fail-open by design, mirroring ``_verify_embedding_dim``: a missing
-        configured model, missing collection metadata, or a stored value that
-        is not a string (metadata predating this guard, or foreign collections)
-        never blocks. Only a definite name mismatch raises.
-
-        Collections indexed before the model was recorded are stamped with the
-        current model on first reuse (backfill). Their true model is
-        unknowable after the fact, and any subsequent incremental indexing
-        embeds new chunks with the current model anyway, so recording the
-        current model starts protection from now on without changing search
-        behavior. The stamp is skipped while ``embedding_dim`` is unresolved
-        because metadata writes need the dimension for their placeholder
-        vector. Note the stamp refreshes the metadata ``updated_at`` (reported
-        as ``last_updated`` by index_status) — a one-time cosmetic effect per
-        legacy collection.
+        Normal configuration changes select a different physical collection.
+        This guard detects damaged or foreign metadata within the selected one.
         """
-        expected = settings.embedding_model
-        if not expected:
-            return
+        expected = self._storage.identity.model
         metadata = await self._storage.get_metadata(col_name)
         stored = metadata.get("embedding_model") if metadata else None
-        if stored is None:
-            if settings.embedding_dim:
-                await self._storage.store_metadata(col_name, codebase_path)
-            return
-        if isinstance(stored, str) and stored != expected:
+        if not isinstance(stored, str) or stored != expected:
             raise EmbeddingModelMismatchError(col_name, expected=expected, actual=stored)
 
     async def _verify_embedding_deployment(
@@ -462,20 +438,32 @@ class IndexingService:
         codebase_path: str,
     ) -> None:
         """Guard same-name model revisions through the explicit cache namespace."""
-        expected = settings.embedding_cache_namespace
-        if not expected:
-            return
+        expected = self._storage.identity.namespace
         metadata = await self._storage.get_metadata(col_name)
         stored = metadata.get("embedding_cache_namespace") if metadata else None
-        if stored is None:
-            if settings.embedding_dim:
-                await self._storage.store_metadata(col_name, codebase_path)
-            return
-        if isinstance(stored, str) and stored != expected:
+        if stored != expected:
             raise EmbeddingDeploymentMismatchError(
                 col_name,
                 expected=expected,
                 actual=stored,
+            )
+
+    async def _verify_embedding_identity(self, col_name: str) -> None:
+        """Require complete provenance even when a collection has a scoped name."""
+        metadata = await self._storage.get_metadata(col_name)
+        payload = metadata.get("embedding_identity") if metadata else None
+        expected = self._storage.identity
+        try:
+            if not isinstance(payload, dict) or set(payload) != set(expected.to_dict()):
+                raise ValueError("Incomplete embedding identity")
+            stored = EmbeddingIdentity.from_dict(payload)
+        except (ValueError, TypeError):
+            stored = None
+        if stored != expected:
+            raise EmbeddingDeploymentMismatchError(
+                col_name,
+                expected=expected.fingerprint,
+                actual=stored.fingerprint if stored else "unknown",
             )
 
     async def get_status(self, codebase_path: str) -> dict[str, Any]:
@@ -489,7 +477,7 @@ class IndexingService:
             Status dict with file counts, pending changes, vocab stats
         """
         abs_path = str(Path(codebase_path).resolve())
-        col_name = collection_name(abs_path)
+        col_name = self._storage.collection_name(abs_path)
         await self.recover_pending_intents()
 
         async with self.consistent_read([col_name]):
@@ -497,7 +485,11 @@ class IndexingService:
                 return {
                     "indexed": False,
                     "path": abs_path,
-                    "message": "Not indexed. Run code_search to auto-index.",
+                    "embedding_identity": self._storage.identity.to_dict(),
+                    "message": (
+                        "Not indexed for this embedding identity. Run code_search to auto-index. "
+                        "Retained generations are unchanged."
+                    ),
                 }
 
             indexed_metadata = await self._storage.get_indexed_files_metadata(col_name)
@@ -509,6 +501,7 @@ class IndexingService:
                 "indexed": True,
                 "path": abs_path,
                 "collection": col_name,
+                "embedding_identity": self._storage.identity.to_dict(),
                 "files_indexed": len(indexed_metadata),
                 "last_updated": updated,
                 "pending_changes": {
@@ -758,7 +751,7 @@ class IndexingService:
         registered = {
             codebase_id
             for codebase_id in await _run_sync(self._global_vocab.get_codebase_ids)
-            if codebase_id.startswith("codesearch_")
+            if self._storage.owns_collection(codebase_id)
         }
         intents = {intent.collection: intent for intent in await _run_sync(self._journal.list)}
         stats.pending_intents = stats.intents_recovered + len(intents)
@@ -837,7 +830,7 @@ class IndexingService:
             True if deleted, False if not found
         """
         abs_path = str(Path(codebase_path).resolve())
-        col_name = collection_name(abs_path)
+        col_name = self._storage.collection_name(abs_path)
 
         async with self._collection_lock(col_name):
             exists = await self._storage.collection_exists(col_name)
@@ -870,6 +863,10 @@ class IndexingService:
         Returns:
             True if deleted, False if not found
         """
+        if not self._storage.owns_collection(collection_id):
+            raise ValueError(
+                "Retained embedding generations are read-only; select their identity first"
+            )
         async with self._collection_lock(collection_id):
             exists = await self._storage.collection_exists(collection_id)
             registered = collection_id in await _run_sync(self._global_vocab.get_codebase_ids)
@@ -1182,7 +1179,7 @@ class IndexingService:
             batch_texts.extend(prepared.chunk_embedding_texts)
 
         # Generate embeddings for this batch
-        dense_embeddings = await self._embedder.embed_all(batch_texts)
+        dense_embeddings = await self._embedder.embed_all(batch_texts, role="document")
 
         # Dense inference is the slow and failure-prone step. It deliberately
         # finishes before the short global consistency window begins, so other

@@ -23,7 +23,6 @@ from mcp_codesearch.search.query import (
     search_codebase,
 )
 from mcp_codesearch.settings import settings
-from mcp_codesearch.storage.qdrant import collection_name
 
 if TYPE_CHECKING:
     from vector_core import EmbeddingClient, GlobalVocabulary, SparseVector
@@ -137,7 +136,7 @@ class SearchService:
             SearchResponse with formatted results and metadata
         """
         abs_path = str(Path(query.path).resolve())
-        col_name = collection_name(abs_path)
+        col_name = self._storage.collection_name(abs_path)
 
         if self._indexing_service is None:
             return await self._search_consistent(
@@ -282,7 +281,8 @@ class SearchService:
         key_parts = (
             f"{query.query}|{abs_path}|{query.mode}|"
             f"{query.language or ''}|{query.limit}|{query.output_format}|"
-            f"{query.path_prefix or ''}|{exclude_str}|generation={generation}"
+            f"{query.path_prefix or ''}|{exclude_str}|generation={generation}|"
+            f"embedding={self._storage.identity.fingerprint}"
         )
         key_hash = hashlib.sha256(key_parts.encode()).hexdigest()[:16]
         # Include path prefix for targeted invalidation

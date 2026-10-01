@@ -27,7 +27,6 @@ from mcp_codesearch.singletons import (
     get_indexing_service,
     get_storage,
 )
-from mcp_codesearch.storage.qdrant import collection_name
 from mcp_codesearch.tools._errors import tool_error_handler
 
 logger = logging.getLogger(__name__)
@@ -66,7 +65,6 @@ async def find_similar(
     if isinstance(result, dict):
         return format_error(result)
     abs_path = str(result)
-    col_name = collection_name(abs_path)
 
     # Auto-index if needed
     files_indexed, chunks_indexed, stats, error = await auto_index(abs_path)
@@ -79,6 +77,7 @@ async def find_similar(
 
     # Embed the input code snippet
     storage = await get_storage()
+    col_name = storage.collection_name(abs_path)
     embedder = await get_embedder()
     global_vocab = await get_global_vocab()
 
@@ -88,7 +87,7 @@ async def find_similar(
     dense_query: list[float] | None = None
     embedding_error: EmbeddingServiceError | CircuitBreakerOpenError | None = None
     try:
-        dense_query = await embedder.embed_single_cached(code)
+        dense_query = await embedder.embed_single_cached(code, role="query")
     except (EmbeddingServiceError, CircuitBreakerOpenError) as exc:
         embedding_error = exc
 
@@ -165,7 +164,6 @@ async def find_references(
     if isinstance(result, dict):
         return format_error(result)
     abs_path = str(result)
-    col_name = collection_name(abs_path)
 
     # Auto-index if needed
     files_indexed, chunks_indexed, stats, error = await auto_index(abs_path)
@@ -177,6 +175,7 @@ async def find_references(
         index_msg = f"[Indexed {files_indexed} files, {chunks_indexed} chunks]\n\n"
 
     storage = await get_storage()
+    col_name = storage.collection_name(abs_path)
     indexing_svc = await get_indexing_service()
 
     # Use exact match search. rank=False keeps matches in scroll order rather

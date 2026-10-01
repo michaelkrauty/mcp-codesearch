@@ -8,6 +8,7 @@ functionality (hybrid search with RRF, file/chunk indexing, exact match search).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from collections.abc import AsyncIterator, Callable
@@ -33,13 +34,14 @@ from qdrant_client.models import (
 from qdrant_client.models import (
     SparseVector as QdrantSparseVector,
 )
+from vector_core import EmbeddingClient
+from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.embeddings.sparse import SparseVector
 from vector_core.storage.hybrid import HybridSearcher
 from vector_core.storage.qdrant import (
     QdrantStorage as VectorCoreStorage,
 )
 from vector_core.storage.qdrant import (
-    generate_collection_name,
     generate_point_id,
 )
 
@@ -117,7 +119,7 @@ class EmbeddingModelMismatchError(Exception):
     indexing refuse the reuse and point the user at ``force_reindex`` instead.
     """
 
-    def __init__(self, collection: str, expected: str, actual: str) -> None:
+    def __init__(self, collection: str, expected: str, actual: Any) -> None:
         self.collection = collection
         self.expected = expected
         self.actual = actual
@@ -130,7 +132,7 @@ class EmbeddingModelMismatchError(Exception):
 class EmbeddingDeploymentMismatchError(Exception):
     """Raised when a collection belongs to another embedding deployment."""
 
-    def __init__(self, collection: str, expected: str, actual: str) -> None:
+    def __init__(self, collection: str, expected: str | None, actual: Any) -> None:
         self.collection = collection
         self.expected = expected
         self.actual = actual
@@ -140,19 +142,22 @@ class EmbeddingDeploymentMismatchError(Exception):
         )
 
 
-def collection_name(codebase_path: str) -> str:
+def configured_identity() -> EmbeddingIdentity:
+    """Describe a resolved configuration; unresolved dimensions must be probed first."""
+    if not settings.embedding_dim:
+        raise RuntimeError("Resolve the embedding identity before accessing an index")
+    return EmbeddingClient().configured_identity()
+
+
+def collection_name(codebase_path: str, identity: EmbeddingIdentity | None = None) -> str:
+    """Name one codebase inside an immutable embedding space.
+
+    The separate prefix keeps legacy binaries from repairing or deleting these
+    collections with their incompatible vocabulary database.
     """
-    Generate deterministic collection name from absolute path.
-
-    Uses vector-core's generate_collection_name with "codesearch" prefix.
-
-    Args:
-        codebase_path: Absolute path to codebase root
-
-    Returns:
-        Collection name in format "codesearch_{hash[:12]}"
-    """
-    return generate_collection_name(codebase_path, prefix=COLLECTION_PREFIX)
+    identity = identity or configured_identity()
+    path_hash = hashlib.sha256(codebase_path.rstrip("/").encode()).hexdigest()[:12]
+    return f"csg_{identity.fingerprint}_{path_hash}"
 
 
 # Point ID cache size - eliminates ~11,000+ redundant SHA256 operations per index
@@ -228,12 +233,13 @@ class QdrantStorage:
     - Exact substring search fallback
     """
 
-    def __init__(self, url: str | None = None):
+    def __init__(self, url: str | None = None, *, identity: EmbeddingIdentity | None = None):
         self.url = url or settings.qdrant_url
+        self.identity = identity or configured_identity()
         # Use vector-core for shared infrastructure
         self._core = VectorCoreStorage(
             url=self.url,
-            embedding_dim=settings.embedding_dim,
+            embedding_dim=self.identity.dimension,
         )
         # Collections whose full-text payload indexes were successfully
         # ensured by this process, and those whose creation failed (one
@@ -257,9 +263,17 @@ class QdrantStorage:
         """Check if collection exists."""
         return await self._core.collection_exists(name)
 
+    def collection_name(self, codebase_path: str) -> str:
+        """Route using this client's frozen identity, never mutable settings."""
+        return collection_name(codebase_path, self.identity)
+
+    def owns_collection(self, name: str) -> bool:
+        """Whether this collection belongs to this vocabulary and embedding space."""
+        return name.startswith(f"csg_{self.identity.fingerprint}_")
+
     async def create_collection(self, name: str) -> None:
         """Create collection with hybrid vector config and text indexes."""
-        await self._core.create_collection(name, dense_dim=settings.embedding_dim)
+        await self._core.create_collection(name, dense_dim=self.identity.dimension)
         await self._ensure_text_indexes(name)
 
     async def delete_collection(self, name: str) -> None:
@@ -272,8 +286,17 @@ class QdrantStorage:
         await _finish_qdrant_write(self._core.delete_collection(name))
 
     async def list_collections(self) -> list[str]:
-        """List all codesearch collections."""
-        return await self._core.list_collections(prefix="codesearch_")
+        """List current-identity collections; retained generations are read-only."""
+        return await self._core.list_collections(prefix=f"csg_{self.identity.fingerprint}_")
+
+    async def list_preserved_collections(self) -> list[str]:
+        """Discover retained generations without enrolling them in maintenance."""
+        names = await self._core.list_collections()
+        return [
+            name
+            for name in names
+            if name.startswith(("codesearch_", "csg_")) and not self.owns_collection(name)
+        ]
 
     async def get_dense_dim(self, name: str) -> int | None:
         """Return the dense-vector dimension recorded for an existing collection.
@@ -1473,10 +1496,9 @@ class QdrantStorage:
         existing = await self._core.get_metadata(collection)
         metadata: dict[str, Any] = dict(existing or {})
         metadata["codebase_path"] = codebase_path
-        if settings.embedding_model:
-            metadata["embedding_model"] = settings.embedding_model
-        if settings.embedding_cache_namespace:
-            metadata["embedding_cache_namespace"] = settings.embedding_cache_namespace
+        metadata["embedding_model"] = self.identity.model
+        metadata["embedding_cache_namespace"] = self.identity.namespace
+        metadata["embedding_identity"] = self.identity.to_dict()
         if indexing_in_progress is not None:
             metadata["indexing_in_progress"] = indexing_in_progress
         else:

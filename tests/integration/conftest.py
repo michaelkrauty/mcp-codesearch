@@ -5,6 +5,8 @@ from uuid import uuid4
 import pytest
 from vector_core.embeddings.sparse import SparseVector
 
+from mcp_codesearch.settings import settings
+
 from mcp_codesearch.storage.qdrant import (
     ChunkPoint,
     FilePoint,
@@ -15,16 +17,16 @@ from mcp_codesearch.storage.qdrant import (
 def qdrant_available() -> bool:
     """Check if Qdrant is running."""
     import httpx
+
     try:
-        response = httpx.get("http://localhost:6333/collections", timeout=2.0)
+        response = httpx.get(f"{settings.qdrant_url.rstrip('/')}/collections", timeout=2.0)
         return response.status_code == 200
     except Exception:
         return False
 
 
 requires_qdrant = pytest.mark.skipif(
-    not qdrant_available(),
-    reason="Qdrant not available at localhost:6333"
+    not qdrant_available(), reason="Qdrant not available at the configured endpoint"
 )
 
 
@@ -42,10 +44,7 @@ def qdrant_and_embeddings_available() -> bool:
     from mcp_codesearch.settings import settings
 
     try:
-        if (
-            httpx.get(f"{settings.qdrant_url}/collections", timeout=2.0).status_code
-            != 200
-        ):
+        if httpx.get(f"{settings.qdrant_url}/collections", timeout=2.0).status_code != 200:
             return False
 
         response = httpx.post(
@@ -55,9 +54,7 @@ def qdrant_and_embeddings_available() -> bool:
         )
         if response.status_code != 200:
             return False
-        return (
-            len(response.json()["data"][0]["embedding"]) == settings.embedding_dim
-        )
+        return len(response.json()["data"][0]["embedding"]) == settings.embedding_dim
     except Exception:
         return False
 
@@ -66,8 +63,7 @@ def qdrant_and_embeddings_available() -> bool:
 # work fails at the first embedding call, which says nothing about the code
 # under test, so they are skipped rather than failed.
 requires_full_stack = pytest.mark.skipif(
-    not qdrant_and_embeddings_available(),
-    reason="Qdrant and/or embedding service not available"
+    not qdrant_and_embeddings_available(), reason="Qdrant and/or embedding service not available"
 )
 
 
@@ -80,7 +76,7 @@ def test_collection_name():
 @pytest.fixture
 async def qdrant_storage():
     """Create QdrantStorage instance for testing."""
-    storage = QdrantStorage(url="http://localhost:6333")
+    storage = QdrantStorage()
     yield storage
     await storage.close()
 
@@ -100,6 +96,7 @@ async def test_collection(qdrant_storage, test_collection_name):
 def sample_dense_vector():
     """Sample dense vector for testing (dimension from settings)."""
     from mcp_codesearch.settings import settings
+
     return [0.1] * settings.embedding_dim
 
 

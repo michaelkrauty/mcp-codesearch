@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Strict regex for collection ID validation (prevents injection attacks)
-_COLLECTION_ID_PATTERN = re.compile(r"^codesearch_[a-f0-9]{12}$")
+_COLLECTION_ID_PATTERN = re.compile(r"^csg_[a-f0-9]{64}_[a-f0-9]{12}$")
 
 
 @mcp.tool()
@@ -42,15 +42,16 @@ async def list_collections() -> str:
     """
     storage = await get_storage()
     collections = await storage.list_collections()
+    preserved = await storage.list_preserved_collections()
 
-    if not collections:
+    if not collections and not preserved:
         return "No codebases indexed yet."
 
     valid_count = 0
     orphan_count = 0
     missing_count = 0
 
-    lines = ["Indexed codebases:"]
+    lines = ["Indexed codebases (current embedding identity):"]
     for col_name in collections:
         metadata = await storage.get_metadata(col_name)
         path = metadata.get("codebase_path") if metadata else None
@@ -75,6 +76,13 @@ async def list_collections() -> str:
             f"Summary: {valid_count} valid, {missing_count} missing, {orphan_count} orphaned"
         )
         lines.append("Tip: Run cleanup_orphans() to remove stale collections.")
+
+    if preserved:
+        lines.append("\nRetained embedding generations (excluded from repair and cleanup):")
+        for col_name in preserved:
+            metadata = await storage.get_metadata(col_name)
+            path = metadata.get("codebase_path", "unknown") if metadata else "unknown"
+            lines.append(f"  {col_name}: {path}")
 
     return "\n".join(lines)
 
@@ -108,7 +116,7 @@ async def delete_collection(path: str = "", collection_id: str = "") -> str:
         if not _COLLECTION_ID_PATTERN.match(collection_id):
             return (
                 f"Error: Invalid collection ID format. "
-                f"Expected 'codesearch_<12 hex chars>' but got '{collection_id}'"
+                f"Expected 'csg_<64 hex identity>_<12 hex path>' but got '{collection_id}'"
             )
 
         deleted = await indexing_svc.delete_by_collection_id(collection_id)
@@ -142,7 +150,8 @@ async def _classify_for_cleanup(storage: QdrantStorage, col_name: str) -> str:
     except Exception as e:
         logger.warning(
             "cleanup_orphans: skipping %s, could not read its codebase path: %s",
-            col_name, e,
+            col_name,
+            e,
         )
         return "skip"
 
@@ -158,7 +167,9 @@ async def _classify_for_cleanup(storage: QdrantStorage, col_name: str) -> str:
         # permission error). We cannot confirm absence, so keep it.
         logger.warning(
             "cleanup_orphans: skipping %s, path %s is inaccessible: %s",
-            col_name, path, e,
+            col_name,
+            path,
+            e,
         )
         return "skip"
 

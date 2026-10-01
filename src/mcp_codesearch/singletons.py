@@ -29,7 +29,20 @@ _search_service: AsyncSingleton[SearchService] = AsyncSingleton("search_service"
 
 async def get_storage() -> QdrantStorage:
     """Get or create QdrantStorage instance (async-safe via AsyncSingleton)."""
-    return await _storage.get(QdrantStorage)
+
+    async def create() -> QdrantStorage:
+        embedder = await get_embedder()
+        # Explicit dimensions identify an existing generation without inference.
+        # Dense requests still validate their returned width in EmbeddingClient;
+        # inventory and sparse/exact fallback must work during backend outages.
+        identity = (
+            embedder.configured_identity()
+            if embedder.dim > 0
+            else await embedder.resolve_identity()
+        )
+        return QdrantStorage(identity=identity)
+
+    return await _storage.get(create)
 
 
 async def get_embedder() -> EmbeddingClient:
@@ -43,8 +56,11 @@ async def get_global_vocab() -> GlobalVocabulary:
     Uses isolated vocabulary database for codesearch (separate from notes/docs).
     """
 
-    def _create_vocab() -> GlobalVocabulary:
-        codesearch_vocab_db = settings.cache_dir / "codesearch_vocabulary.db"
+    async def _create_vocab() -> GlobalVocabulary:
+        storage = await get_storage()
+        codesearch_vocab_db = (
+            settings.cache_dir / f"codesearch_vocabulary_{storage.identity.fingerprint}.db"
+        )
         # The durable index journal clears only after vocabulary and Qdrant
         # agree, so a reported SQLite commit must survive the same power loss.
         return GlobalVocabulary(db_path=codesearch_vocab_db, synchronous="FULL")

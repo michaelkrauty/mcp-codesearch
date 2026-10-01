@@ -35,7 +35,6 @@ from mcp_codesearch.settings import PATH_BOOST_MAX, PATH_BOOST_PATTERNS
 from mcp_codesearch.storage.qdrant import (
     QdrantStorage,
     SearchResult,
-    collection_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,7 +144,9 @@ async def prepare_dense_query(
     if plan.skip_embedding:
         return DenseQueryPreparation()
     try:
-        vector = await embedder.embed_single_cached(processed_query or plan.search_text)
+        vector = await embedder.embed_single_cached(
+            processed_query or plan.search_text, role="query"
+        )
         return DenseQueryPreparation(vector=vector)
     except CircuitBreakerOpenError as exc:
         return DenseQueryPreparation(degraded_reason=str(exc))
@@ -443,7 +444,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
         List of SearchResult
     """
     abs_path = str(Path(codebase_path).resolve())
-    col_name = collection_name(abs_path)
+    col_name = storage.collection_name(abs_path)
 
     # Preprocess query (synonyms + structured syntax parsing)
     processed_query, parsed = preprocess_query(query)

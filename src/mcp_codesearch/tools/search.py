@@ -48,7 +48,6 @@ from mcp_codesearch.singletons import (
     get_search_service,
     get_storage,
 )
-from mcp_codesearch.storage.qdrant import collection_name
 from mcp_codesearch.tools._errors import tool_error_handler
 
 if TYPE_CHECKING:
@@ -420,7 +419,7 @@ async def _search_multiple_global(
             (path, reason or "embedding service unavailable") for path, _abs_path, reason in indexed
         ]
         return _format_global([], output_format, embedding_errors)
-    collections = [collection_name(abs_path) for _i, _path, abs_path in searchable]
+    collections = [storage.collection_name(abs_path) for _i, _path, abs_path in searchable]
     async with indexing_svc.consistent_read(
         collections,
         prepare=lambda: prepare_sparse_query(query, global_vocab),
@@ -757,7 +756,7 @@ async def search_changed(  # noqa: PLR0911
         indexing_svc = await get_indexing_service()
         dense_preparation = await prepare_dense_query(query, embedder)
         async with indexing_svc.consistent_read(
-            [collection_name(abs_path)],
+            [storage.collection_name(abs_path)],
             prepare=lambda: prepare_sparse_query(query, global_vocab),
         ) as snapshot:
             results = await search_codebase(

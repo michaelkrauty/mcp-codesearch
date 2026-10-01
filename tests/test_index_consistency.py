@@ -20,11 +20,13 @@ from mcp_codesearch.services.indexing_service import (
 )
 from mcp_codesearch.services.search_service import SearchQuery, SearchService
 from mcp_codesearch.storage import qdrant as qdrant_module
-from mcp_codesearch.storage.qdrant import QdrantStorage
+from mcp_codesearch.storage.qdrant import QdrantStorage, collection_name, configured_identity
 
 
 def _service(tmp_path: Path) -> tuple[IndexingService, IndexIntentStore]:
     storage = MagicMock()
+    storage.identity = configured_identity()
+    storage.collection_name.side_effect = collection_name
     embedder = MagicMock()
     vocab = MagicMock()
     vocab.get_tokens_by_indices.side_effect = lambda indices: {
@@ -322,7 +324,8 @@ async def test_search_cache_is_scoped_to_shared_index_generation(tmp_path) -> No
     coordinator = Coordinator()
     embedder = MagicMock()
 
-    async def embed_outside_snapshot(_query):
+    async def embed_outside_snapshot(_query, *, role):
+        assert role == "query"
         assert coordinator.inside is False
         return [0.1]
 
@@ -353,7 +356,7 @@ async def test_explicit_delete_can_remove_an_unrecoverable_target_intent(
 ) -> None:
     service, journal = _service(tmp_path)
     _install_noop_lock(monkeypatch)
-    collection = indexing_module.collection_name(str(Path("/repo").resolve()))
+    collection = collection_name(str(Path("/repo").resolve()))
     journal.mark(collection, "/repo", "index")
     journal.set_pending_paths(collection, ["broken.py"])
     service._storage.collection_exists = AsyncMock(return_value=True)
@@ -373,7 +376,7 @@ async def test_force_reindex_replaces_stale_delete_intent_for_absent_collection(
 ) -> None:
     service, journal = _service(tmp_path)
     _install_noop_lock(monkeypatch)
-    collection = indexing_module.collection_name(str(Path("/repo").resolve()))
+    collection = collection_name(str(Path("/repo").resolve()))
     journal.mark(collection, "/repo", "delete")
     service._storage.collection_exists = AsyncMock(return_value=False)
     service._storage.create_collection = AsyncMock()
