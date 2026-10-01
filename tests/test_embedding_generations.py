@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from qdrant_client import AsyncQdrantClient
-from vector_core import AsyncSingleton, GlobalVocabulary
+from vector_core import AsyncSingleton, EmbeddingClient, EmbeddingServiceError, GlobalVocabulary
 from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.settings import settings as core_settings
 
@@ -363,6 +363,7 @@ async def test_singletons_resolve_identity_before_storage_and_isolate_vocabulary
             monkeypatch.setattr(singletons, "_storage", AsyncSingleton("test-storage"))
             monkeypatch.setattr(singletons, "_global_vocab", AsyncSingleton("test-vocab"))
             embedder = FakeEmbedder(current)
+            embedder.dim = 0
             embedder.resolve_identity = AsyncMock(return_value=current)
             monkeypatch.setattr(singletons, "get_embedder", AsyncMock(return_value=embedder))
             storage = await singletons.get_storage()
@@ -380,3 +381,22 @@ async def test_singletons_resolve_identity_before_storage_and_isolate_vocabulary
     finally:
         for vocab in vocabularies:
             vocab.close()
+
+
+async def test_explicit_dimension_inventory_survives_embedding_outage(monkeypatch):
+    embedder = EmbeddingClient(model="offline-model", dim=8)
+    probe = AsyncMock(side_effect=EmbeddingServiceError("backend unavailable"))
+    monkeypatch.setattr(embedder, "resolve_identity", probe)
+    monkeypatch.setattr(singletons, "get_embedder", AsyncMock(return_value=embedder))
+    monkeypatch.setattr(singletons, "_storage", AsyncSingleton("offline-storage"))
+    client = AsyncQdrantClient(":memory:")
+    try:
+        storage = await singletons.get_storage()
+        storage._core.get_client = AsyncMock(return_value=client)
+        storage._core._get_client = AsyncMock(return_value=client)
+        assert storage.identity == embedder.configured_identity()
+        assert await storage.list_collections() == []
+        probe.assert_not_awaited()
+    finally:
+        await embedder.close()
+        await client.close()

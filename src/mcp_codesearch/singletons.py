@@ -32,7 +32,15 @@ async def get_storage() -> QdrantStorage:
 
     async def create() -> QdrantStorage:
         embedder = await get_embedder()
-        return QdrantStorage(identity=await embedder.resolve_identity())
+        # Explicit dimensions identify an existing generation without inference.
+        # Dense requests still validate their returned width in EmbeddingClient;
+        # inventory and sparse/exact fallback must work during backend outages.
+        identity = (
+            embedder.configured_identity()
+            if embedder.dim > 0
+            else await embedder.resolve_identity()
+        )
+        return QdrantStorage(identity=identity)
 
     return await _storage.get(create)
 
