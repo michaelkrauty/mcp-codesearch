@@ -395,22 +395,23 @@ class TestInputValidation:
         assert "Error: Query cannot be empty" in result
 
     @pytest.mark.asyncio
-    async def test_code_search_negative_limit(self):
-        """Negative limit is clamped to default (10), not rejected."""
+    @pytest.mark.parametrize("limit", [-1, 0])
+    async def test_code_search_nonpositive_limit(self, monkeypatch, limit):
+        """Nonpositive limits reach the search service as the default (10)."""
         from mcp_codesearch.server import code_search
 
-        result = await code_search(query="test", path=".", limit=-1)
-        # Should not error - clamped to default
-        assert "Error: limit must be a positive integer" not in result
-
-    @pytest.mark.asyncio
-    async def test_code_search_zero_limit(self):
-        """Zero limit is clamped to default (10), not rejected."""
-        from mcp_codesearch.server import code_search
-
-        result = await code_search(query="test", path=".", limit=0)
-        # Should not error - clamped to default
-        assert "Error: limit must be a positive integer" not in result
+        monkeypatch.setattr(
+            "mcp_codesearch.tools.search.auto_index", AsyncMock(return_value=(0, 0, None, None))
+        )
+        response = MagicMock()
+        response.to_output.return_value = "No results found."
+        service = MagicMock()
+        service.search = AsyncMock(return_value=response)
+        monkeypatch.setattr(
+            "mcp_codesearch.tools.search.get_search_service", AsyncMock(return_value=service)
+        )
+        assert await code_search(query="test", path=".", limit=limit) == "No results found."
+        assert service.search.await_args.args[0].limit == 10
 
     @pytest.mark.asyncio
     async def test_code_search_nonexistent_path(self, tmp_path):

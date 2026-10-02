@@ -30,6 +30,10 @@ class Chunk(BaseModel):
     end_line: int
     context: str | None  # Parent class/module name
     imports: list[str] | None = None  # File-level imports (attached to all chunks)
+    start_byte: int | None = None
+    end_byte: int | None = None
+    source_coverage: bool = True  # Synthetic overviews do not represent their source range
+    source_chunk_type: str | None = None  # Original container kind for synthetic overviews
 
 
 # Map our language names to tree-sitter language names
@@ -455,6 +459,10 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
                     start_line=node.start_point[0] + 1,
                     end_line=node.end_point[0] + 1,
                     context=full_context,
+                    start_byte=node.start_byte,
+                    end_byte=node.end_byte,
+                    source_coverage=False,
+                    source_chunk_type=chunk_type,
                 )
             )
         else:
@@ -466,6 +474,8 @@ def chunk_with_treesitter(content: str, language: str) -> list[Chunk]:
                     start_line=node.start_point[0] + 1,
                     end_line=node.end_point[0] + 1,
                     context=full_context,
+                    start_byte=node.start_byte,
+                    end_byte=node.end_byte,
                 )
             )
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.10.0] - 2026-10-02
+
+### Fixed
+
+- Index all discovered source text, including statements outside AST definitions and attributes in large classes. Oversized definitions and single lines are split into independently searchable, lossless source spans using the complete formatted embedding budget. Source offsets, language and symbol metadata remain available on each segment.
+- Store and sparsely index complete segment content instead of dropping payload tails. Preparation failures now fail indexing explicitly rather than silently skipping files.
+- Preserve original newline sequences for byte-accurate source offsets, and retain those offsets during exact-match retrieval so same-line segments remain distinct.
+- File searches include matching source chunks and roll them up to file results, so source-only matches do not depend on auxiliary summaries.
+- File retrieval expands its candidate budget until enough distinct files are found or retrieval is exhausted, preventing repeated segments from starving later files. Invalid UTF-8 source is explicitly reported and skipped rather than indexed with fabricated replacement characters.
+
+### Changed
+
+- Update the shared vector-core dependency to v1.7.0 for complete-or-error embedding validation, lossless source-span splitting and explicit backend input rejection.
+- Full-source indexes use a separate retained generation and are rebuilt from source. Existing collections remain intact; their truncated payloads are not used as migration sources.
+
 ## [1.9.1] - 2026-10-01
 
 ### Changed

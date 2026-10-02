@@ -10,12 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from qdrant_client.models import Distance, VectorParams
-from vector_core import GlobalVocabulary
+from vector_core import EmbeddingClient, GlobalVocabulary
 
 from mcp_codesearch import helpers
 from mcp_codesearch.indexer.chunker import (
     build_chunk_vocabulary_text,
-    truncate_chunk_content,
 )
 from mcp_codesearch.indexer.discovery import FileInfo
 from mcp_codesearch.indexer.treesitter import Chunk
@@ -67,9 +66,11 @@ def _make_service() -> IndexingService:
     journal = MagicMock()
     journal.get.return_value = None
     journal.list.return_value = []
+    embedder = MagicMock()
+    embedder.split_text = EmbeddingClient(model="offline-model", dim=8, profile="raw").split_text
     return IndexingService(
         storage=storage,
-        embedder=MagicMock(),
+        embedder=embedder,
         global_vocab=vocab,
         journal=journal,
     )
@@ -114,10 +115,10 @@ async def test_run_sync_propagates_worker_cancellation_without_spinning() -> Non
 
 
 class TestPrepareFilesFaultIsolation:
-    """One unparseable file must not abort the whole indexing run."""
+    """Preparation failures must never masquerade as complete indexing."""
 
-    def test_skips_file_when_chunker_raises(self, monkeypatch, caplog):
-        """A chunker crash on one file logs a warning and lets the loop continue."""
+    def test_reports_file_when_chunker_raises(self, monkeypatch):
+        """A chunker crash names the failed source and aborts preparation."""
         service = _make_service()
 
         good1 = _make_file("good1.py", "def a():\n    pass\n")
@@ -133,17 +134,9 @@ class TestPrepareFilesFaultIsolation:
 
         monkeypatch.setattr(idx_svc, "chunk_file", failing_chunk_file)
 
-        with caplog.at_level("WARNING", logger="mcp_codesearch.services.indexing_service"):
-            prepared, tokens_per_doc = service._prepare_files([good1, bad, good2])
-
-        rel_paths = [p.file_info.rel_path for p in prepared]
-        assert rel_paths == ["good1.py", "good2.py"]
-        # The bad file should be absent from token rows too (one summary + N chunks per good file).
-        assert len(tokens_per_doc) >= 2
-
-        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
-        assert any("bad.py" in m for m in warnings), warnings
-        assert any("RecursionError" in m for m in warnings), warnings
+        with pytest.raises(ValueError, match="Failed to prepare bad.py") as error:
+            service._prepare_files([good1, bad, good2])
+        assert isinstance(error.value.__cause__, RecursionError)
 
     def test_all_files_prepared_when_chunker_is_healthy(self):
         """Sanity check: the happy path still works after adding the try/except."""
@@ -626,6 +619,7 @@ class TestStoreMetadataRecordsModel:
                 "codebase_path": "/proj",
                 "embedding_model": "Qwen3-Embedding-8B",
                 "embedding_identity": storage.identity.to_dict(),
+                "source_policy_version": "v1",
                 "embedding_cache_namespace": None,
                 "indexing_in_progress": False,
             },
@@ -646,6 +640,7 @@ class TestStoreMetadataRecordsModel:
                 "codebase_path": "/proj",
                 "embedding_model": "Qwen3-Embedding-8B",
                 "embedding_identity": storage.identity.to_dict(),
+                "source_policy_version": "v1",
                 "embedding_cache_namespace": "revision-a",
                 "indexing_in_progress": False,
             },
@@ -662,6 +657,7 @@ class TestStoreMetadataRecordsModel:
                 "codebase_path": "/proj",
                 "embedding_model": "",
                 "embedding_identity": storage.identity.to_dict(),
+                "source_policy_version": "v1",
                 "embedding_cache_namespace": None,
                 "indexing_in_progress": False,
             },
@@ -877,7 +873,7 @@ class TestVocabularyAccountingInvariant:
         journal.list.return_value = []
         service = IndexingService(
             storage=storage,
-            embedder=MagicMock(),
+            embedder=EmbeddingClient(model="offline-model", dim=8, profile="raw"),
             global_vocab=vocab,
             journal=journal,
         )
@@ -924,7 +920,7 @@ class TestVocabularyAccountingInvariant:
 class TestStoredVocabularyText:
     """Stored chunk payloads preserve the text needed for exact removal."""
 
-    def test_vocabulary_text_uses_stored_content_limit_but_dense_text_does_not(self):
+    def test_vocabulary_and_dense_text_preserve_payload_tail(self):
         content = "x" * settings.max_payload_content_chars + " tail_only_token"
         chunk = Chunk(
             content=content,
@@ -936,13 +932,10 @@ class TestStoredVocabularyText:
             imports=["example.module"],
         )
 
-        stored_content = truncate_chunk_content(chunk.content)
-        vocabulary_text = build_chunk_vocabulary_text(stored_content, chunk.imports)
+        vocabulary_text = build_chunk_vocabulary_text(chunk.content, chunk.imports)
 
-        assert vocabulary_text == "Uses: example.module\n\n" + (
-            "x" * settings.max_payload_content_chars
-        )
-        assert "tail_only_token" not in vocabulary_text
+        assert vocabulary_text == "Uses: example.module\n\n" + content
+        assert "tail_only_token" in vocabulary_text
         assert build_chunk_vocabulary_text(chunk.content, chunk.imports).endswith("tail_only_token")
         assert IndexingService._chunk_embedding_text(chunk).endswith("tail_only_token")
 

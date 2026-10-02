@@ -35,7 +35,6 @@ from mcp_codesearch.indexer.chunker import (
     build_chunk_vocabulary_text,
     chunk_file,
     generate_file_summary,
-    truncate_chunk_content,
 )
 from mcp_codesearch.indexer.discovery import (
     FileInfo,
@@ -1107,20 +1106,28 @@ class IndexingService:
             try:
                 chunks = chunk_file(f.content, f.language)
                 summary = generate_file_summary(f.content, chunks, f.language)
+                summary_spans = self._embedder.split_text(summary, role="document")
+                summary = summary_spans[0].text if summary_spans else ""
+                chunks.extend(
+                    Chunk(
+                        content=span.text,
+                        chunk_type="file_overview",
+                        name=None,
+                        start_line=1,
+                        end_line=f.line_count,
+                        context=None,
+                        source_coverage=False,
+                    )
+                    for span in summary_spans[1:]
+                )
+                chunks = self._split_chunks(chunks)
                 # Pre-compute chunk embedding texts (avoids recomputation in _process_batch)
                 chunk_texts = [self._chunk_embedding_text(chunk) for chunk in chunks]
                 chunk_vocabulary_texts = [
-                    build_chunk_vocabulary_text(
-                        truncate_chunk_content(chunk.content), chunk.imports
-                    )
-                    for chunk in chunks
+                    build_chunk_vocabulary_text(chunk.content, chunk.imports) for chunk in chunks
                 ]
             except Exception as e:
-                # Chunking operates on arbitrary untrusted source; one pathological
-                # file (malformed encoding, parser crash, etc.) must not abort the
-                # whole indexing run. Log and skip.
-                logger.warning(f"Failed to chunk {f.rel_path}: {type(e).__name__}: {e}")
-                continue
+                raise ValueError(f"Failed to prepare {f.rel_path}: {e}") from e
 
             prepared_files.append(
                 PreparedFile(
@@ -1139,6 +1146,39 @@ class IndexingService:
                 tokens_per_doc.append(set(self._global_vocab.tokenize(chunk_text)))
 
         return prepared_files, tokens_per_doc
+
+    def _split_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        """Partition source and auxiliary chunks within the complete document budget."""
+        result = []
+        for chunk in chunks:
+            prefix = build_chunk_vocabulary_text("", chunk.imports)
+            spans = self._embedder.split_text(chunk.content, role="document", context_prefix=prefix)
+            byte_offset = chunk.start_byte
+            line = chunk.start_line
+            for span in spans:
+                end_byte = (
+                    byte_offset + len(span.text.encode("utf-8"))
+                    if byte_offset is not None and chunk.source_coverage
+                    else None
+                )
+                result.append(
+                    chunk.model_copy(
+                        update={
+                            "content": span.text,
+                            "start_line": line if chunk.source_coverage else chunk.start_line,
+                            "end_line": (
+                                line + span.text.count("\n")
+                                if chunk.source_coverage
+                                else chunk.end_line
+                            ),
+                            "start_byte": byte_offset if chunk.source_coverage else None,
+                            "end_byte": end_byte,
+                        }
+                    )
+                )
+                byte_offset = end_byte
+                line += span.text.count("\n")
+        return result
 
     async def _process_batch(
         self,
@@ -1368,8 +1408,11 @@ class IndexingService:
                 "name": chunk.name,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
-                "content": truncate_chunk_content(chunk.content),
+                "content": chunk.content,
                 "context": chunk.context,
                 "imports": chunk.imports or [],
+                "start_byte": chunk.start_byte,
+                "end_byte": chunk.end_byte,
+                "source_coverage": chunk.source_coverage,
             },
         )

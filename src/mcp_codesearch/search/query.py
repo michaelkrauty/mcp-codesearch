@@ -382,18 +382,18 @@ def _merge_results(
     primary: list[SearchResult],
     secondary: list[SearchResult],
 ) -> list[SearchResult]:
-    """Merge two result lists, deduplicating by path+line."""
-    seen: set[tuple[str, int | None]] = set()
+    """Merge results without collapsing independently searchable same-line spans."""
+    seen: set[tuple[str, int | None, int | None]] = set()
     merged: list[SearchResult] = []
 
     for r in primary:
-        key = (r.path, r.start_line)  # Tuples are hashable, no string ops
+        key = (r.path, r.start_line, r.start_byte)
         if key not in seen:
             seen.add(key)
             merged.append(r)
 
     for r in secondary:
-        key = (r.path, r.start_line)
+        key = (r.path, r.start_line, r.start_byte)
         if key not in seen:
             seen.add(key)
             merged.append(r)
@@ -445,6 +445,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
     """
     abs_path = str(Path(codebase_path).resolve())
     col_name = storage.collection_name(abs_path)
+    retrieval_mode = "both" if mode == "file" else mode
 
     # Preprocess query (synonyms + structured syntax parsing)
     processed_query, parsed = preprocess_query(query)
@@ -516,10 +517,13 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
     # away the lower-scored matches it wants (see exact_match_search's rank=).
     # file: is pushed into the scan via file_predicate, so it does not disable
     # ranking — its candidates are already constrained before truncation.
-    rank_exact = not (parsed.path_prefix or parsed.exclude_paths or parsed.scope)
+    rank_exact = not (parsed.path_prefix or parsed.exclude_paths or parsed.scope or mode == "file")
+    candidate_count = 0
 
     async def _retrieve(path_tokens: list[str] | None) -> list[SearchResult]:
         """Run the planned retrieval with the given path-token pushdown."""
+        nonlocal candidate_count
+        candidate_count = 0
         results: list[SearchResult] = []
 
         if plan.query_type == QueryType.NAME_ONLY:
@@ -527,7 +531,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
             results = await storage.exact_match_search(
                 collection=col_name,
                 query=plan.name_filter or "",
-                mode=mode,
+                mode=retrieval_mode,
                 language=language,
                 limit=fetch_limit,
                 restrict_paths=restrict_paths,
@@ -541,7 +545,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
             results = await storage.exact_match_search(
                 collection=col_name,
                 query=plan.search_text,
-                mode=mode,
+                mode=retrieval_mode,
                 language=language,
                 limit=fetch_limit,
                 restrict_paths=restrict_paths,
@@ -556,9 +560,9 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
             name_results = await storage.exact_match_search(
                 collection=col_name,
                 query=plan.name_filter or "",
-                mode=mode,
+                mode=retrieval_mode,
                 language=language,
-                limit=limit * 2,
+                limit=fetch_limit if mode == "file" else limit * 2,
                 restrict_paths=restrict_paths,
                 path_text_tokens=path_tokens,
                 path_predicate=file_predicate,
@@ -573,7 +577,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                     collection=col_name,
                     dense_query=dense_preparation.vector,
                     sparse_query=sparse_preparation,
-                    mode=mode,
+                    mode=retrieval_mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
@@ -589,7 +593,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 semantic_results = await storage.sparse_only_search(
                     collection=col_name,
                     sparse_query=sparse_preparation,
-                    mode=mode,
+                    mode=retrieval_mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
@@ -597,6 +601,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 )
 
             # Merge: name results first (higher priority)
+            candidate_count = max(len(name_results), len(semantic_results))
             results = _merge_results(name_results, semantic_results)
 
         else:  # QueryType.SEMANTIC
@@ -608,7 +613,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                     collection=col_name,
                     dense_query=dense_preparation.vector,
                     sparse_query=sparse_preparation,
-                    mode=mode,
+                    mode=retrieval_mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
@@ -624,7 +629,7 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 results = await storage.sparse_only_search(
                     collection=col_name,
                     sparse_query=sparse_preparation,
-                    mode=mode,
+                    mode=retrieval_mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
@@ -632,12 +637,13 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                 )
 
             # Fallback to exact match if semantic scores are low
+            candidate_count = len(results)
             EXACT_MATCH_THRESHOLD = 0.3
             if not results or (results and results[0].score < EXACT_MATCH_THRESHOLD):
                 exact_results = await storage.exact_match_search(
                     collection=col_name,
                     query=parsed.text or query,
-                    mode=mode,
+                    mode=retrieval_mode,
                     language=language,
                     limit=fetch_limit,
                     restrict_paths=restrict_paths,
@@ -649,26 +655,25 @@ async def search_codebase(  # noqa: PLR0913, PLR0915
                     # Merge: exact matches first
                     results = _merge_results(exact_results, results)
 
+        candidate_count = max(candidate_count, len(results))
         return results
 
-    results = await _retrieve(path_text_tokens)
-
-    # Apply path-based boosting
-    results = _apply_path_boost(results)
-
-    # Apply parsed query filters
-    results = _filter_by_parsed_query(results, parsed)
-
-    # Zero-result fallback for the file-token pushdown: if the constrained
-    # retrieval plus post-filters produced nothing, rerun once WITHOUT the
-    # path tokens (restrict_paths stays — it is an exact set, not a token
-    # heuristic) and re-apply the post-filters. This mirrors the exact-match
-    # fast-path-empty → exhaustive discipline and covers unforeseen tokenizer
-    # edge cases (e.g. unicode filenames) at the cost of one extra query.
-    if not results and path_text_tokens:
-        results = await _retrieve(None)
+    active_path_tokens = path_text_tokens
+    while True:
+        results = await _retrieve(active_path_tokens)
         results = _apply_path_boost(results)
         results = _filter_by_parsed_query(results, parsed)
+        # Retry token pushdown without the heuristic if post-filtering finds no match.
+        if not results and active_path_tokens:
+            active_path_tokens = None
+            continue
+        if mode != "file":
+            break
+        results = await storage.rollup_files(col_name, results)
+        if len(results) >= limit or candidate_count < fetch_limit:
+            break
+        # A segmented file must not consume the entire distinct-file result budget.
+        fetch_limit *= 2
 
     # Normalize scores to 0-1 range for consistent interpretation
     results = _normalize_scores(results[:limit])
@@ -708,6 +713,8 @@ def format_results(  # noqa: PLR0912
                     "name": r.name,
                     "start_line": r.start_line,
                     "end_line": r.end_line,
+                    "start_byte": r.start_byte,
+                    "end_byte": r.end_byte,
                     "content": r.content,
                     "degraded": r.degraded,
                 }

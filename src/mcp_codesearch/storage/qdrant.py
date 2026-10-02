@@ -12,6 +12,7 @@ import hashlib
 import logging
 import re
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any, Literal
@@ -49,6 +50,19 @@ from mcp_codesearch.indexer.chunker import build_chunk_vocabulary_text
 from mcp_codesearch.settings import settings
 
 logger = logging.getLogger(__name__)
+
+SOURCE_POLICY_VERSION = "v1"
+
+
+def index_identity(identity: EmbeddingIdentity) -> EmbeddingIdentity:
+    """Scope source representations without changing embedding or cache identity."""
+    if re.search(r":codesearch-source-v\d+$", identity.preprocessing):
+        return identity
+    return replace(
+        identity,
+        preprocessing=f"{identity.preprocessing}:codesearch-source-{SOURCE_POLICY_VERSION}",
+    )
+
 
 # Prefix for all codesearch collections
 COLLECTION_PREFIX = "codesearch"
@@ -156,6 +170,7 @@ def collection_name(codebase_path: str, identity: EmbeddingIdentity | None = Non
     collections with their incompatible vocabulary database.
     """
     identity = identity or configured_identity()
+    identity = index_identity(identity)
     path_hash = hashlib.sha256(codebase_path.rstrip("/").encode()).hexdigest()[:12]
     return f"csg_{identity.fingerprint}_{path_hash}"
 
@@ -214,6 +229,8 @@ class SearchResult(BaseModel):
     start_line: int | None = None
     end_line: int | None = None
     content: str | None = None
+    start_byte: int | None = None
+    end_byte: int | None = None
     # Degraded mode indicator (sparse-only fallback)
     degraded: bool = False
 
@@ -235,7 +252,7 @@ class QdrantStorage:
 
     def __init__(self, url: str | None = None, *, identity: EmbeddingIdentity | None = None):
         self.url = url or settings.qdrant_url
-        self.identity = identity or configured_identity()
+        self.identity = index_identity(identity or configured_identity())
         # Use vector-core for shared infrastructure
         self._core = VectorCoreStorage(
             url=self.url,
@@ -443,7 +460,7 @@ class QdrantStorage:
                 "name": chunk.name,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
-                "content": chunk.content[: settings.max_payload_content_chars],
+                "content": chunk.content,
                 "context": chunk.context,
                 "indexed_at": datetime.now(UTC).isoformat(),
             },
@@ -916,7 +933,7 @@ class QdrantStorage:
             dense_query=dense_query,
             sparse_query=sparse_query,
             limit=limit,
-            prefetch_limit=prefetch_limit or settings.rrf_prefetch_limit,
+            prefetch_limit=max(prefetch_limit or settings.rrf_prefetch_limit, limit),
             filter_conditions=filter_conditions if filter_conditions else None,
             dense_weight=dense_weight,
             sparse_weight=sparse_weight,
@@ -952,6 +969,8 @@ class QdrantStorage:
                 result.start_line = p.get("start_line")
                 result.end_line = p.get("end_line")
                 result.content = p.get("content")
+                result.start_byte = p.get("start_byte")
+                result.end_byte = p.get("end_byte")
 
             results.append(result)
 
@@ -1050,6 +1069,8 @@ class QdrantStorage:
                 result.start_line = p.get("start_line")
                 result.end_line = p.get("end_line")
                 result.content = p.get("content")
+                result.start_byte = p.get("start_byte")
+                result.end_byte = p.get("end_byte")
 
             results.append(result)
 
@@ -1058,6 +1079,40 @@ class QdrantStorage:
     # =========================================================================
     # Exact Match Search - Code-search-specific (fallback for semantic failures)
     # =========================================================================
+
+    async def rollup_files(
+        self, collection: str, results: list[SearchResult]
+    ) -> list[SearchResult]:
+        """Return the strongest summary or source match for each canonical file."""
+        best: dict[str, SearchResult] = {}
+        for result in results:
+            if result.path not in best or result.score > best[result.path].score:
+                best[result.path] = result
+        if not best:
+            return []
+        client = await self._get_client()
+        files = await client.retrieve(
+            collection,
+            ids=[self._point_id("file", path) for path in best],
+            with_payload=True,
+            with_vectors=False,
+        )
+        payloads = {point.payload["path"]: point.payload for point in files if point.payload}
+        return sorted(
+            [
+                result.model_copy(
+                    update={
+                        "point_type": "file",
+                        "summary": payloads[path].get("summary"),
+                        "line_count": payloads[path].get("line_count"),
+                    }
+                )
+                for path, result in best.items()
+                if path in payloads
+            ],
+            key=lambda result: result.score,
+            reverse=True,
+        )
 
     # Safety limit for scroll loops to prevent runaway resource consumption
     _MAX_SCROLL_ITERATIONS = 1000  # 1000 * 1000 = 1M points max
@@ -1086,6 +1141,8 @@ class QdrantStorage:
         "chunk_type",
         "start_line",
         "end_line",
+        "start_byte",
+        "end_byte",
         "line_count",
     ]
 
@@ -1453,6 +1510,8 @@ class QdrantStorage:
                         result.start_line = p.get("start_line")
                         result.end_line = p.get("end_line")
                         result.content = p.get("content")
+                        result.start_byte = p.get("start_byte")
+                        result.end_byte = p.get("end_byte")
 
                     results.append(result)
 
@@ -1499,6 +1558,9 @@ class QdrantStorage:
         metadata["embedding_model"] = self.identity.model
         metadata["embedding_cache_namespace"] = self.identity.namespace
         metadata["embedding_identity"] = self.identity.to_dict()
+        metadata["source_policy_version"] = self.identity.preprocessing.rsplit(
+            ":codesearch-source-", 1
+        )[1]
         if indexing_in_progress is not None:
             metadata["indexing_in_progress"] = indexing_in_progress
         else:
