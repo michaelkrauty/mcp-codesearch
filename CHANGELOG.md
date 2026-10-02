@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.9.1] - 2026-10-01
+
+### Changed
+
+- Update the shared vector-core dependency to v1.6.1 for embedding migration storage and batch-sizing fixes. Code search continues rebuilding identity-scoped indexes from source files through its existing crash-resumable indexing pipeline.
+
 ## [1.9.0] - 2026-10-01
 
 ### Fixed
