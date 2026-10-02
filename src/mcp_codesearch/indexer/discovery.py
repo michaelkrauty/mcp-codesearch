@@ -32,26 +32,24 @@ def _safe_read_file(file_path: Path) -> str | None:
         File contents as string, or None if file is a symlink, doesn't exist,
         or cannot be read.
     """
-    # On Windows, O_NOFOLLOW is not available, so fall back to is_symlink() check
-    # with a comment noting the limitation
-    if sys.platform == "win32":
-        # Windows limitation: No O_NOFOLLOW support, small TOCTOU window exists
-        if file_path.is_symlink():
-            return None
-        try:
-            return file_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-
-    # Unix: Use O_NOFOLLOW for atomic symlink rejection
     fd = -1
     try:
+        if sys.platform == "win32":
+            # No O_NOFOLLOW on Windows; the symlink check has a small TOCTOU window.
+            if file_path.is_symlink():
+                return None
+            with file_path.open("r", encoding="utf-8", newline="") as f:
+                return f.read()
+        # Unix: Use O_NOFOLLOW for atomic symlink rejection.
         fd = os.open(str(file_path), os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+        with os.fdopen(fd, "r", encoding="utf-8", newline="") as f:
             fd = -1  # fdopen took ownership
             return f.read()
     except OSError:
         # Symlink, doesn't exist, or permission denied
+        return None
+    except UnicodeDecodeError as e:
+        logger.warning("Skipping invalid UTF-8 source %s: %s", file_path, e)
         return None
     except Exception as e:
         # Log for debugging, but continue (one bad file shouldn't stop indexing)
@@ -122,9 +120,22 @@ EXTENSION_TO_LANGUAGE = {
 # build artifacts, caches). These are pruned regardless of ignore files.
 _ALWAYS_EXCLUDE_DIRS: frozenset[str] = frozenset(
     {
-        ".git", ".svn", ".hg", "node_modules", "__pycache__",
-        ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache",
-        "dist", "build", ".next", ".nuxt", "target", "coverage",
+        ".git",
+        ".svn",
+        ".hg",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".pytest_cache",
+        ".mypy_cache",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        "target",
+        "coverage",
     }
 )
 
@@ -336,9 +347,7 @@ def discover_files(
     codebase_path = Path(codebase_path).resolve()
     extensions = include_extensions or settings.code_extensions
     max_size = (max_file_size_kb or settings.max_file_size_kb) * 1024
-    exclude_spec = (
-        pathspec.GitIgnoreSpec.from_lines(exclude_patterns) if exclude_patterns else None
-    )
+    exclude_spec = pathspec.GitIgnoreSpec.from_lines(exclude_patterns) if exclude_patterns else None
 
     for file_path, rel_path, stat in _walk_codebase(
         codebase_path, extensions, max_size, exclude_spec
@@ -348,12 +357,6 @@ def discover_files(
         if content is None:
             logger.debug(f"Skipping file {rel_path}: could not read (symlink or permission issue)")
             continue
-        # Check if content had encoding issues (replacement chars present)
-        if "\ufffd" in content:
-            logger.debug(
-                f"File {rel_path} has encoding issues (non-UTF-8 characters replaced)"
-            )
-
         # Detect language
         language = _detect_language(file_path)
         if not language:
@@ -373,12 +376,8 @@ def discover_files(
 
 def get_file_hash(file_path: Path) -> str | None:
     """Get hash of file content without loading full content."""
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-        return hash_content(content)
-    except OSError as e:
-        logger.debug(f"Cannot hash file {file_path}: {e}")
-        return None
+    content = _safe_read_file(file_path)
+    return hash_content(content) if content is not None else None
 
 
 def get_file_stat(file_path: Path) -> tuple[float, int] | None:

@@ -16,7 +16,7 @@ Supports stateless MCP `2026-07-28` requests and legacy MCP clients from the sam
 Requires [vector-core](https://github.com/michaelkrauty/vector-core).
 
 ```bash
-pip install git+https://github.com/michaelkrauty/vector-core.git@v1.6.1
+pip install git+https://github.com/michaelkrauty/vector-core.git@v1.7.0
 pip install git+https://github.com/michaelkrauty/mcp-codesearch.git
 ```
 
@@ -55,6 +55,7 @@ claude mcp add codesearch -- mcp-codesearch
 
 - **Hybrid Search**: Dense embeddings + sparse TF-IDF with RRF fusion
 - **AST-Aware Chunking**: Tree-sitter extracts functions, classes, methods with context
+- **Complete Source Coverage**: Source gaps and oversized symbols are indexed as lossless spans, including single-line and Unicode source
 - **18 Languages with AST Support**: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, PHP, Swift, Kotlin, Scala, C#, SQL, JSON, YAML, TOML (line-based fallback for Bash, HTML, CSS, and other file types)
 - **Query Syntax**: `function:name`, `class:name`, `file:pattern`, `path:prefix`, `-path:exclude`
 - **Incremental Indexing**: Change detection via mtime+size before hashing
@@ -158,7 +159,7 @@ code_search("handler scope:impl")      # Non-test code only
 
 | Mode | Description |
 |------|-------------|
-| `file` | File-level results (overview) |
+| `file` | Best summary or source match per file, returned with its overview |
 | `chunk` | Function/class-level results (detailed) |
 | `both` | Combined ranking (default) |
 
@@ -171,6 +172,10 @@ Tree-sitter extracts semantic units:
 - Modules (imports, top-level statements)
 
 Fallback to line-based chunking for non-code files (JSON, YAML, TOML, Markdown).
+
+AST definitions are supplemented with source spans for every uncovered region, including module-level statements and attributes in large classes. Auxiliary summaries do not replace source coverage. All source chunks are partitioned without dropping text to fit the complete formatted embedding budget, including role and import prefixes. Each segment has its own dense and sparse vectors, complete stored content, language and symbol metadata, and UTF-8 byte offsets. File searches rank matching summaries and source chunks, then return the strongest match per file.
+
+Embedding inputs are complete or rejected explicitly. Configure the deployment's supported token budget and tokenizer through vector-core; oversized queries produce an input error rather than silently searching a prefix. Text and Markdown results show previews, while JSON exposes full stored segments and their byte offsets. Indexing preparation failures are reported and do not mark failed files complete.
 
 ## Path Boosting
 
@@ -209,6 +214,8 @@ search_changed("config", since="3.days.ago")
 | `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Active embedding HTTP attempts across local MCP processes; `0` disables the global limit |
 
 > **Changing the embedding model.** Restart the MCP server after changing embedding configuration. The next search builds a separate index from source files, with its own sparse vocabulary; no `force_reindex` is required. The embedding identity includes the model, deployment namespace, endpoint, verified vector dimension, and input preprocessing. Previous collections and vocabulary databases are retained, including legacy indexes whose provenance is unknown. `list_collections` shows retained generations, while status, repair, deletion, and orphan cleanup operate only on the configured identity. Returning to a previous configuration reuses that generation after reconciling source edits and deletions. Change `VECTOR_EMBEDDING_CACHE_NAMESPACE` whenever the same model name serves different weights or behavior.
+
+The storage identity also includes the indexing-representation suffix `:codesearch-source-v1` in its preprocessing field. This suffix is applied once and remains frozen for a storage instance; it does not alter the embedding client's identity or cache keys. Changing the source policy selects a separate collection and vocabulary even when the embedding model and source files are unchanged. Collection metadata records `source_policy_version`. Full-source generations are rebuilt from source files, never from earlier truncated payloads; unavailable source roots and their retained generations remain untouched.
 
 Codesearch-specific settings (configured via environment variables with the `CODESEARCH_` prefix):
 
@@ -273,6 +280,8 @@ File discovery honors gitignore-syntax exclude rules at **every** directory leve
 - **`.codesearchignore`** — exclude paths from indexing *without* changing git's behavior. Same syntax as `.gitignore`; useful for vendored code, generated files, or large data you want tracked by git but kept out of the index.
 
 Ignored directories are pruned during traversal, so excluded subtrees cost nothing. The global `core.excludesFile` is intentionally not consulted, so indexing stays reproducible regardless of per-machine git configuration.
+
+Complete coverage applies to discovered UTF-8 source: hidden paths, symlinks, dependency/build directories, unsupported extensions, empty or unreadable files and ordinary files above `VECTOR_MAX_FILE_SIZE_KB` (default 500 KB) remain outside discovery. Invalid UTF-8 is skipped with an explicit warning rather than replaced with invented source characters; original newline sequences are preserved. Notebook coverage remains code-cell-only. Use `preview_index` to inspect the selected files before indexing.
 
 ## Storage
 

@@ -10,11 +10,6 @@ from .treesitter import Chunk, chunk_with_treesitter
 from .treesitter import is_supported as treesitter_supported
 
 
-def truncate_chunk_content(content: str) -> str:
-    """Bound chunk content to the exact text stored in the payload."""
-    return content[: settings.max_payload_content_chars]
-
-
 def build_chunk_vocabulary_text(content: str, imports: list[str] | None) -> str:
     """Add imports to chunk content for embedding or vocabulary accounting."""
     if imports:
@@ -41,11 +36,12 @@ def _chunk_fixed_size(
         ValueError: If overlap >= chunk_size (would cause infinite loop)
     """
     if overlap >= chunk_size:
-        raise ValueError(
-            f"overlap ({overlap}) must be less than chunk_size ({chunk_size})"
-        )
+        raise ValueError(f"overlap ({overlap}) must be less than chunk_size ({chunk_size})")
 
     lines = content.split("\n")
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line.encode("utf-8")) + 1)
     chunks = []
 
     if len(lines) <= chunk_size:
@@ -58,6 +54,8 @@ def _chunk_fixed_size(
                 start_line=1,
                 end_line=len(lines),
                 context=None,
+                start_byte=0,
+                end_byte=len(content.encode("utf-8")),
             )
         ]
 
@@ -75,6 +73,8 @@ def _chunk_fixed_size(
                 start_line=start + 1,  # 1-indexed
                 end_line=end,
                 context=None,
+                start_byte=offsets[start],
+                end_byte=offsets[end] - 1,
             )
         )
 
@@ -90,7 +90,9 @@ def _chunk_fixed_size(
     return chunks
 
 
-def _merge_small_chunks(chunks: list[Chunk], min_lines: int = 10) -> list[Chunk]:
+def _merge_small_chunks(
+    chunks: list[Chunk], min_lines: int = 10, source: bytes | None = None
+) -> list[Chunk]:
     """Merge adjacent small FALLBACK chunks only.
 
     Only merges "block" type chunks (from line-based fallback chunking).
@@ -125,12 +127,18 @@ def _merge_small_chunks(chunks: list[Chunk], min_lines: int = 10) -> list[Chunk]
         ):
             # Merge into current (preserve original chunk type)
             current = Chunk(
-                content=current.content + "\n" + chunk.content,
+                content=(
+                    source[current.start_byte : chunk.end_byte].decode("utf-8")
+                    if source is not None
+                    else current.content + "\n" + chunk.content
+                ),
                 chunk_type=current.chunk_type,
                 name=current.name,
                 start_line=current.start_line,
                 end_line=chunk.end_line,
                 context=current.context,
+                start_byte=current.start_byte,
+                end_byte=chunk.end_byte,
             )
         else:
             merged.append(current)
@@ -172,7 +180,9 @@ def chunk_file(content: str, language: str) -> list[Chunk]:
         )
 
     # Merge small chunks
-    chunks = _merge_small_chunks(chunks, min_lines=settings.chunk_min_lines)
+    source = content.encode("utf-8")
+    chunks = _merge_small_chunks(chunks, min_lines=settings.chunk_min_lines, source=source)
+    chunks = _cover_source_gaps(source, chunks)
 
     # Extract file-level imports and attach to all chunks
     imports = _extract_imports(content, language)
@@ -181,6 +191,65 @@ def chunk_file(content: str, language: str) -> list[Chunk]:
             chunk.imports = imports
 
     return chunks
+
+
+def _cover_source_gaps(source: bytes, chunks: list[Chunk]) -> list[Chunk]:
+    """Index every source byte, including statements outside AST definitions."""
+    spans = sorted(
+        (chunk.start_byte, chunk.end_byte)
+        for chunk in chunks
+        if chunk.source_coverage and chunk.start_byte is not None and chunk.end_byte is not None
+    )
+    covered = 0
+    gaps = []
+    containers = [
+        chunk
+        for chunk in chunks
+        if not chunk.source_coverage and chunk.start_byte is not None and chunk.end_byte is not None
+    ]
+    for start, end in [*spans, (len(source), len(source))]:
+        if start > covered:
+            boundaries = sorted(
+                {
+                    covered,
+                    start,
+                    *(
+                        offset
+                        for chunk in containers
+                        for offset in (chunk.start_byte, chunk.end_byte)
+                        if offset is not None and covered < offset < start
+                    ),
+                }
+            )
+            for gap_start, gap_end in zip(boundaries, boundaries[1:], strict=False):
+                container = min(
+                    (
+                        chunk
+                        for chunk in containers
+                        if chunk.start_byte is not None
+                        and chunk.end_byte is not None
+                        and chunk.start_byte <= gap_start
+                        and chunk.end_byte >= gap_end
+                    ),
+                    key=lambda chunk: (chunk.end_byte or 0) - (chunk.start_byte or 0),
+                    default=None,
+                )
+                gaps.append(
+                    Chunk(
+                        content=source[gap_start:gap_end].decode("utf-8"),
+                        chunk_type=(container.source_chunk_type or "class")
+                        if container
+                        else "block",
+                        name=container.name if container else None,
+                        start_line=source[:gap_start].count(b"\n") + 1,
+                        end_line=source[:gap_end].count(b"\n") + 1,
+                        context=container.context if container else None,
+                        start_byte=gap_start,
+                        end_byte=gap_end,
+                    )
+                )
+        covered = max(covered, end)
+    return sorted([*chunks, *gaps], key=lambda chunk: (chunk.start_byte or 0, chunk.end_byte or 0))
 
 
 def _extract_module_docstring(  # noqa: PLR0912, PLR0915
@@ -225,11 +294,11 @@ def _extract_module_docstring(  # noqa: PLR0912, PLR0915
 
     elif language in ("javascript", "typescript"):
         # JSDoc: /** ... */ at file start
-        match = re.search(r'^\s*/\*\*(.*?)\*/', remaining, re.DOTALL)
+        match = re.search(r"^\s*/\*\*(.*?)\*/", remaining, re.DOTALL)
         if match:
             # Clean up JSDoc formatting: remove leading * from each line
             docstring = match.group(1)
-            docstring = re.sub(r'^\s*\*\s?', '', docstring, flags=re.MULTILINE)
+            docstring = re.sub(r"^\s*\*\s?", "", docstring, flags=re.MULTILINE)
             docstring = docstring.strip()
             return docstring[:300] if docstring else None
 
@@ -240,7 +309,7 @@ def _extract_module_docstring(  # noqa: PLR0912, PLR0915
             stripped = line.strip()
             if stripped.startswith("//!") or stripped.startswith("///"):
                 # Remove doc comment prefix and leading space
-                doc_content = re.sub(r'^//[!/]\s?', '', stripped)
+                doc_content = re.sub(r"^//[!/]\s?", "", stripped)
                 doc_lines.append(doc_content)
             elif stripped.startswith("//"):
                 continue  # Regular comment, skip
@@ -267,10 +336,10 @@ def _extract_module_docstring(  # noqa: PLR0912, PLR0915
     elif language == "java":
         # Javadoc: /** ... */ at file start (after package/import)
         # Look for first /** that comes before a class
-        match = re.search(r'/\*\*(.*?)\*/', remaining, re.DOTALL)
+        match = re.search(r"/\*\*(.*?)\*/", remaining, re.DOTALL)
         if match:
             docstring = match.group(1)
-            docstring = re.sub(r'^\s*\*\s?', '', docstring, flags=re.MULTILINE)
+            docstring = re.sub(r"^\s*\*\s?", "", docstring, flags=re.MULTILINE)
             docstring = docstring.strip()
             return docstring[:300] if docstring else None
 
@@ -283,7 +352,7 @@ def _extract_imports(content: str, language: str) -> list[str]:
 
     if language == "python":
         # Python: import X, from X import Y
-        for match in re.finditer(r'^(?:from\s+(\S+)|import\s+(\S+))', content, re.MULTILINE):
+        for match in re.finditer(r"^(?:from\s+(\S+)|import\s+(\S+))", content, re.MULTILINE):
             module = match.group(1) or match.group(2)
             if module:
                 # Get base module (before any dots or commas)
@@ -352,7 +421,9 @@ def generate_file_summary(content: str, chunks: list[Chunk], language: str) -> s
     for chunk in chunks:
         if chunk.name and chunk.context is None:  # Top-level only
             type_abbrev = TYPE_ABBREV.get(chunk.chunk_type, chunk.chunk_type[:3])
-            definitions.append(f"{type_abbrev}:{chunk.name}")
+            definition = f"{type_abbrev}:{chunk.name}"
+            if definition not in definitions:
+                definitions.append(definition)
 
     if definitions:
         parts.append(f"Defines: {', '.join(definitions[:15])}")

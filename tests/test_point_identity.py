@@ -145,7 +145,8 @@ class TestChunkPointsFromRealSources:
         the tool reported indexing every one of them.
         """
         prepared, chunks = _prepared(language, source)
-        assert len(chunks) == expected, "fixture no longer produces same-line chunks"
+        definitions = [chunk for chunk in chunks if chunk.name]
+        assert len(definitions) == expected, "fixture no longer produces same-line definitions"
         assert len({chunk.start_line for chunk in chunks}) == 1
 
         points, counted = await _upserted_points(service, prepared)

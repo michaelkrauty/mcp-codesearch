@@ -24,6 +24,7 @@ from mcp_codesearch.storage.qdrant import (
     EmbeddingDeploymentMismatchError,
     EmbeddingModelMismatchError,
     QdrantStorage,
+    index_identity,
 )
 
 
@@ -32,6 +33,14 @@ class FakeEmbedder:
 
     def __init__(self, identity: EmbeddingIdentity):
         self.identity = identity
+        self.split_text = EmbeddingClient(
+            model=identity.model,
+            dim=identity.dimension,
+            profile=identity.profile,
+            query_prefix=identity.query_prefix,
+            document_prefix=identity.document_prefix,
+            max_text_chars=identity.max_text_chars,
+        ).split_text
 
     async def embed_all(self, texts: list[str], *, role: str) -> list[list[float]]:
         assert role == "document"
@@ -67,7 +76,7 @@ async def generations(tmp_path, monkeypatch):
         storage = QdrantStorage(url="http://offline.invalid", identity=identity)
         storage._core._get_client = AsyncMock(return_value=client)
         storage._core.get_client = AsyncMock(return_value=client)
-        key = identity.fingerprint
+        key = storage.identity.fingerprint
         if key not in vocabularies:
             vocabularies[key] = GlobalVocabulary(tmp_path / f"vocab_{key}.db")
         vocab = vocabularies[key]
@@ -134,7 +143,10 @@ def test_collection_names_cover_full_identity_and_freeze_configuration(
     storage = QdrantStorage(identity=identity)
     other = QdrantStorage(identity=replace(identity, **changes))
     original = storage.collection_name("/repo/")
-    assert original == f"csg_{identity.fingerprint}_{hashlib.sha256(b'/repo').hexdigest()[:12]}"
+    assert (
+        original
+        == f"csg_{storage.identity.fingerprint}_{hashlib.sha256(b'/repo').hexdigest()[:12]}"
+    )
     assert original != other.collection_name("/repo")
     assert storage.owns_collection(original)
     assert not other.owns_collection(original)
@@ -143,7 +155,7 @@ def test_collection_names_cover_full_identity_and_freeze_configuration(
     monkeypatch.setattr(core_settings, "embedding_dim", 32)
     monkeypatch.setattr(core_settings, "embedding_cache_namespace", "mutated-global-revision")
     assert storage.collection_name("/repo") == original
-    assert storage.identity == identity
+    assert storage.identity == index_identity(identity)
 
 
 async def test_same_width_migration_reindexes_without_modifying_old_points(
@@ -368,12 +380,13 @@ async def test_singletons_resolve_identity_before_storage_and_isolate_vocabulary
             monkeypatch.setattr(singletons, "get_embedder", AsyncMock(return_value=embedder))
             storage = await singletons.get_storage()
             embedder.resolve_identity.assert_awaited_once()
-            assert storage.identity == current
+            assert storage.identity == index_identity(current)
             resolved.append(storage.identity)
             vocab = await singletons.get_global_vocab()
             vocabularies.append(vocab)
             assert (
-                Path(vocab.db_path) == tmp_path / f"codesearch_vocabulary_{current.fingerprint}.db"
+                Path(vocab.db_path)
+                == tmp_path / f"codesearch_vocabulary_{storage.identity.fingerprint}.db"
             )
             assert await singletons.get_global_vocab() is vocab
         assert resolved[0] != resolved[1]
@@ -394,7 +407,7 @@ async def test_explicit_dimension_inventory_survives_embedding_outage(monkeypatc
         storage = await singletons.get_storage()
         storage._core.get_client = AsyncMock(return_value=client)
         storage._core._get_client = AsyncMock(return_value=client)
-        assert storage.identity == embedder.configured_identity()
+        assert storage.identity == index_identity(embedder.configured_identity())
         assert await storage.list_collections() == []
         probe.assert_not_awaited()
     finally:
