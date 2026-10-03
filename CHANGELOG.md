@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.1] - 2026-10-02
+
+### Changed
+
+- Pin vector-core to v1.8.0 for opt-in tokenizer-derived integer embedding inputs via `VECTOR_EMBEDDING_INPUT_ENCODING=token_ids`, exact serialized request batching, and encoding/tokenizer-scoped identities and caches. Text remains the default input encoding.
+
 ## [1.10.0] - 2026-10-02
 
 ### Fixed
