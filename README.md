@@ -29,6 +29,8 @@ pip install -e vector-core/
 pip install -e mcp-codesearch/
 ```
 
+The opt-in `VECTOR_EMBEDDING_INPUT_ENCODING=token_ids` mode requires the `tokenizer` extra: install it with `pip install 'vector-core[tokenizer] @ git+https://github.com/michaelkrauty/vector-core.git@v1.8.0'` or `uv sync --extra tokenizer` in a checkout, and configure the matching local tokenizer. Text remains the default input encoding.
+
 ## Quick Start
 
 ```bash
