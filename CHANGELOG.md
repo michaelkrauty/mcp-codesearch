@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.10.2] - 2026-10-04
+
+### Changed
+
+- Pin vector-core to v1.8.1 for embedding gateway retry fixes.
+
+### Fixed
+
+- Isolate test caches and shared stores before application imports, and require explicit endpoints for tests that access running services.
+
 ## [1.10.1] - 2026-10-02
 
 ### Changed
