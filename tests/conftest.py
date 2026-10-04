@@ -1,6 +1,22 @@
 """Shared pytest fixtures for mcp-codesearch tests."""
 
+import atexit
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+# Isolate persistence before settings imports; live services require explicit opt-in.
+_TEST_DATA = TemporaryDirectory(prefix="mcp-codesearch-tests-")
+TEST_DATA_DIR = Path(_TEST_DATA.name)
+atexit.register(_TEST_DATA.cleanup)
+for variable, directory in (
+    ("VECTOR_CACHE_DIR", "cache"),
+    ("VECTOR_SHARED_DATA_DIR", "shared"),
+    ("NOTES_DIR", "notes"),
+):
+    os.environ[variable] = str(TEST_DATA_DIR / directory)
+os.environ.setdefault("VECTOR_EMBEDDING_URL", "http://127.0.0.1:1")
+os.environ.setdefault("VECTOR_QDRANT_URL", "http://127.0.0.1:1")
 
 # Settings read the environment once, at import, and an unset embedding
 # dimension leaves collection creation raising "embedding_dim not yet
