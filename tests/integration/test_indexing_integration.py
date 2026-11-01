@@ -10,7 +10,6 @@ from mcp_codesearch.server import (
     delete_collection,
     force_reindex,
     index_status,
-    list_collections,
 )
 from mcp_codesearch.storage.qdrant import collection_name
 
@@ -253,9 +252,14 @@ def main(): print("modified_marker_xyz")
 
 
 class TestCleanupOrphans:
-    """Tests for cleanup_orphans functionality."""
+    """Tests for cleanup_orphans functionality.
 
-    async def test_cleanup_no_orphans(self, tmp_path):
+    ``cleanup_scope`` limits cleanup to the collections each test creates, so a
+    run against a real Qdrant never deletes anything else.
+    """
+
+    @requires_full_stack
+    async def test_cleanup_no_orphans(self, tmp_path, cleanup_scope):
         """Cleanup with no orphans reports correctly."""
         # Create and index a codebase
         src = tmp_path / "src"
@@ -263,23 +267,19 @@ class TestCleanupOrphans:
         (src / "test.py").write_text("def test(): pass")
 
         await code_search(query="test", path=str(tmp_path))
+        cleanup_scope.add(collection_name(str(tmp_path.resolve())))
 
-        # Cleanup should find no orphans
+        try:
+            result = await cleanup_orphans()
+            assert "No orphaned collections found" in result
+        finally:
+            # Cleanup the collection we created
+            await delete_collection(path=str(tmp_path))
+
+    async def test_cleanup_empty_database(self, cleanup_scope):
+        """Cleanup with no collections in scope reports that."""
         result = await cleanup_orphans()
-
-        assert "orphan" in result.lower() or "valid" in result.lower()
-
-        # Cleanup the collection we created
-        await delete_collection(path=str(tmp_path))
-
-    async def test_cleanup_empty_database(self):
-        """Cleanup with no collections."""
-        # First delete all test collections
-        await list_collections()  # Ensure we can list (may be empty)
-
-        # If there are no collections at all
-        result = await cleanup_orphans()
-        assert isinstance(result, str)
+        assert result == "No collections found."
 
 
 class TestSearchChanged:

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.4] - 2026-11-01
+
+### Fixed
+
+- The `cleanup_orphans` integration tests no longer act on every collection in the Qdrant they run against. They called `cleanup_orphans()` unscoped, so a full-stack run deleted the server's own orphaned collections along with the test's. A `cleanup_scope` fixture now limits what cleanup can list to the collections each test creates, and the tests assert which collections are kept and which are deleted instead of only that a string came back. (#90)
+- Integration tests that need Qdrant or the full stack are gated on it, so the suite skips them instead of failing when the services are not running. The not-found case for deleting by collection ID uses a current-format ID.
+
 ## [1.10.3] - 2026-10-31
 
 ### Changed
