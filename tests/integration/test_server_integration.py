@@ -1,5 +1,6 @@
 """Integration tests for MCP server with real Qdrant and embedding service."""
 
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -17,6 +18,7 @@ from mcp_codesearch.server import (
     search_changed,
     search_multiple,
 )
+from mcp_codesearch.storage.qdrant import collection_name
 
 
 def is_error_result(result) -> bool:
@@ -411,14 +413,17 @@ class TestSearchChangedEdgeCases:
 class TestCleanupOrphansIntegration:
     """Integration tests for cleanup_orphans tool."""
 
-    async def test_cleanup_orphans_no_orphans(self):
-        """cleanup_orphans works when no orphans exist."""
+    async def test_cleanup_orphans_no_orphans(self, temp_codebase, cleanup_scope):
+        """cleanup_orphans keeps a collection whose codebase still exists."""
         from mcp_codesearch.server import cleanup_orphans
 
-        result = await cleanup_orphans()
-        assert isinstance(result, str)
-        # Should report 0 or some number of orphans
-        assert "orphan" in result.lower() or "collection" in result.lower()
+        await code_search(query="test", path=str(temp_codebase))
+        cleanup_scope.add(collection_name(str(Path(temp_codebase).resolve())))
+        try:
+            result = await cleanup_orphans()
+            assert "No orphaned collections found" in result
+        finally:
+            await delete_collection(path=str(temp_codebase))
 
 
 @requires_full_stack

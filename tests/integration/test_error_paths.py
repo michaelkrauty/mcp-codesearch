@@ -1,5 +1,6 @@
 """Tests for error paths and edge cases in MCP server tools."""
 
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,9 +11,10 @@ from mcp_codesearch.server import (
     find_references,
     find_similar,
 )
+from mcp_codesearch.singletons import get_storage
 from mcp_codesearch.storage.qdrant import collection_name
 
-from .conftest import requires_full_stack
+from .conftest import requires_full_stack, requires_qdrant
 
 
 def is_error_result(result) -> bool:
@@ -224,6 +226,7 @@ class TestFindReferencesErrorPaths:
 class TestDeleteCollectionEdgeCases:
     """Tests for delete_collection edge cases."""
 
+    @requires_qdrant
     async def test_delete_nonexistent_collection_by_path(self, tmp_path):
         """Deleting non-existent collection returns error."""
         new_path = tmp_path / f"never_indexed_{uuid4().hex[:8]}"
@@ -242,13 +245,12 @@ class TestDeleteCollectionEdgeCases:
         assert is_error_result(result)
         assert error_contains(result, "invalid") or error_contains(result, "format")
 
+    @requires_qdrant
     async def test_delete_by_nonexistent_collection_id(self, tmp_path):
         """Non-existent collection ID returns error."""
-        # Use valid format (12 hex chars) but non-existent collection
-        result = await delete_collection(
-            path="",
-            collection_id="codesearch_000000000000"
-        )
+        # A well-formed ID of the current identity for a path never indexed
+        never_indexed = collection_name(str((tmp_path / f"never_{uuid4().hex[:8]}").resolve()))
+        result = await delete_collection(path="", collection_id=never_indexed)
         assert "not found" in result.lower() or "Collection not found" in result
 
     @requires_full_stack
@@ -266,44 +268,58 @@ class TestDeleteCollectionEdgeCases:
 
 
 class TestCleanupOrphansEdgeCases:
-    """Tests for cleanup_orphans edge cases."""
+    """Tests for cleanup_orphans edge cases.
 
-    async def test_cleanup_with_no_orphans(self, temp_codebase):
-        """No orphans returns appropriate message."""
-        # First index a valid codebase
+    Each test lists the collections cleanup may see through ``cleanup_scope``,
+    so a run against a real Qdrant never deletes collections it did not create.
+    """
+
+    @requires_full_stack
+    async def test_cleanup_with_no_orphans(self, temp_codebase, cleanup_scope):
+        """A collection whose codebase still exists is kept."""
         await code_search(query="test", path=str(temp_codebase))
+        indexed = collection_name(str(Path(temp_codebase).resolve()))
+        cleanup_scope.add(indexed)
+        try:
+            result = await cleanup_orphans()
+            assert "No orphaned collections found" in result
+            assert "1 collection(s) have valid paths" in result
+        finally:
+            await delete_collection(collection_id=indexed)
 
-        result = await cleanup_orphans()
-        # Should either find no orphans or successfully clean
-        assert "orphan" in result.lower() or "valid" in result.lower()
-
-    async def test_cleanup_finds_orphaned_collection(self, temp_codebase, tmp_path):
-        """Cleanup finds and removes orphaned collections."""
-        # Create a temporary codebase
+    @requires_full_stack
+    async def test_cleanup_finds_orphaned_collection(self, temp_codebase, tmp_path, cleanup_scope):
+        """Cleanup removes the collection of a deleted codebase and keeps a live one."""
         orphan_path = tmp_path / f"orphan_test_{uuid4().hex[:8]}"
         orphan_path.mkdir()
         (orphan_path / "test.py").write_text("def test(): pass")
-
-        # Index it
         await code_search(query="test", path=str(orphan_path))
+        await code_search(query="test", path=str(temp_codebase))
+        orphan = collection_name(str(orphan_path.resolve()))
+        valid = collection_name(str(Path(temp_codebase).resolve()))
+        cleanup_scope.update({orphan, valid})
 
-        # Now delete the directory (making the collection orphaned)
-        import shutil
         shutil.rmtree(orphan_path)
+        try:
+            result = await cleanup_orphans()
+            assert orphan in result
+            assert await list_collections_named(orphan) == []
+            assert await list_collections_named(valid) == [valid]
+        finally:
+            await delete_collection(collection_id=orphan)
+            await delete_collection(collection_id=valid)
 
-        # Run cleanup - should find the orphan
+    async def test_cleanup_no_collections(self, cleanup_scope):
+        """With nothing in scope, cleanup reports that and touches nothing."""
         result = await cleanup_orphans()
+        assert result == "No collections found."
 
-        # Should mention orphans or cleanup
-        # (May or may not find it depending on timing, but shouldn't error)
-        assert isinstance(result, str)
 
-    async def test_cleanup_no_collections(self):
-        """Cleanup with no collections at all."""
-        # This test relies on database state
-        # Just verify it doesn't crash
-        result = await cleanup_orphans()
-        assert isinstance(result, str)
+async def list_collections_named(name: str) -> list[str]:
+    """Collections of the current identity with exactly this name."""
+    storage = await get_storage()
+    # Unscoped on purpose: cleanup_scope only filters what cleanup can see.
+    return [found for found in await type(storage).list_collections(storage) if found == name]
 
 
 class TestCodeSearchErrorPaths:

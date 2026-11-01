@@ -6,6 +6,7 @@ import pytest
 from vector_core.embeddings.sparse import SparseVector
 
 from mcp_codesearch.settings import settings
+from mcp_codesearch.singletons import get_storage
 
 from mcp_codesearch.storage.qdrant import (
     ChunkPoint,
@@ -65,6 +66,28 @@ def qdrant_and_embeddings_available() -> bool:
 requires_full_stack = pytest.mark.skipif(
     not qdrant_and_embeddings_available(), reason="Qdrant and/or embedding service not available"
 )
+
+
+@pytest.fixture
+async def cleanup_scope(monkeypatch):
+    """Limit what cleanup_orphans can see to the collections a test names.
+
+    cleanup_orphans deletes every orphaned collection in the configured Qdrant.
+    Against a real server that includes collections these tests did not create,
+    such as indexes of since-deleted checkouts, so each cleanup test adds the
+    collections it may touch and nothing else is listed or deleted.
+    """
+    storage = await get_storage()
+    real_list = storage.list_collections
+    visible: set[str] = set()
+
+    async def scoped_list() -> list[str]:
+        if not visible:
+            return []
+        return [name for name in await real_list() if name in visible]
+
+    monkeypatch.setattr(storage, "list_collections", scoped_list)
+    return visible
 
 
 @pytest.fixture
