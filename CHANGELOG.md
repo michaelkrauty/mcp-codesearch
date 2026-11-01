@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.3] - 2026-10-31
+
+### Changed
+
+- Pin vector-core to v1.10.0. Its changes (an `on_commit` hook for fragment-group writes, full-text payload index declarations, and the facts vocabulary fix) are additive for code search and change no indexing or search behavior here.
+
 ## [1.10.2] - 2026-10-04
 
 ### Changed
