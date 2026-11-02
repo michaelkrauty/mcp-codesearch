@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.8] - 2026-11-02
+
+### Changed
+
+- Pin vector-core to v1.12.0. Its change lets an already-bound client confirm its embedding-collection binding without the collection lock, which code search does not use; no indexing or search behavior changes here.
+
 ## [1.10.7] - 2026-11-01
 
 ### Changed
