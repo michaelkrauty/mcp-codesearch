@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.9] - 2026-11-02
+
+### Changed
+
+- Pin vector-core to v1.12.1. Its fix concerns glossary searches, which code search does not use; no behavior changes here.
+
 ## [1.10.8] - 2026-11-02
 
 ### Changed
