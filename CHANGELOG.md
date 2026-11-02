@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.6] - 2026-11-01
+
+### Changed
+
+- Pin vector-core to v1.10.2, which makes fuzzy matching of query terms that are not in the vocabulary about a hundred times faster and stops it from resolving a term to one that no indexed chunk contains any more. Code search builds the sparse query while it holds the lock that index commits wait for, so each misspelled or unfamiliar identifier in a search used to hold up indexing for about half a second; it now takes a few milliseconds. Search results are otherwise unchanged. vector-core now depends on `rapidfuzz`.
+
 ## [1.10.5] - 2026-11-01
 
 ### Changed
