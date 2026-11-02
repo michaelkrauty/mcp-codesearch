@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.10.7] - 2026-11-01
+
+### Changed
+
+- Pin vector-core to v1.11.0. With `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` set, query embeddings now go ahead of document embeddings at the cross-process limit, so a code search no longer waits behind the queued batches of a bulk re-index in another process sharing the embedding backend; it waits only for requests already in flight. Code search's own indexing embeds documents and yields to waiting searches in other servers. Restart every server process that shares the backend so all of them observe the new priority.
+
 ## [1.10.6] - 2026-11-01
 
 ### Changed
